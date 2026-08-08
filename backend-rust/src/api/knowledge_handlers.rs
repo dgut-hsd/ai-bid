@@ -200,6 +200,87 @@ pub async fn ingest_knowledge(
     Ok(Json(IngestResponse::from_result(&result)))
 }
 
+// ─── 知识库搜索 ──────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub struct KnowledgeSearchRequest {
+    pub query: String,
+    #[serde(default = "default_top_k")]
+    pub top_k: u64,
+    pub category: Option<String>,
+    pub applicable_scope: Option<String>,
+}
+
+fn default_top_k() -> u64 { 10 }
+
+#[derive(Debug, serde::Serialize)]
+pub struct KnowledgeEvidence {
+    pub document_id: String,
+    pub document_name: String,
+    pub chunk_id: String,
+    pub relevance_score: f32,
+    pub text: String,
+    pub category: String,
+    pub section_path: Vec<String>,
+    pub page_start: usize,
+    pub page_end: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct KnowledgeSearchResponse {
+    pub evidences: Vec<KnowledgeEvidence>,
+    pub total_candidates: usize,
+    pub query_ms: u64,
+}
+
+/// POST /api/v1/knowledge/search
+pub async fn search_knowledge(
+    State(_state): State<AppState>,
+    Json(req): Json<KnowledgeSearchRequest>,
+) -> Result<Json<KnowledgeSearchResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if req.query.trim().is_empty() {
+        return Err(bad_request("query 不能为空"));
+    }
+    let top_k = req.top_k.min(50);
+    let t0 = std::time::Instant::now();
+
+    let embed_client = crate::services::embedding_api_client::EmbeddingApiClient::from_env()
+        .map_err(|e| server_error("Embedding API 初始化失败", e))?;
+    let query_embeddings = embed_client
+        .encode_batch(&[req.query.clone()])
+        .map_err(|e| server_error("查询向量化失败", e))?;
+    let query_vec = query_embeddings.into_iter().next().unwrap_or_default();
+
+    let store = crate::services::qdrant_store::QdrantStore::from_env()
+        .map_err(|e| server_error("Qdrant 连接失败", e))?;
+    let results = store
+        .search(query_vec, top_k, req.category.clone(), req.applicable_scope.clone())
+        .await
+        .map_err(|e| server_error("知识库搜索失败", e))?;
+
+    let evidences: Vec<KnowledgeEvidence> = results
+        .into_iter()
+        .map(|(score, payload)| KnowledgeEvidence {
+            document_id: payload.document_id,
+            document_name: payload.document_name,
+            chunk_id: payload.chunk_id,
+            relevance_score: score,
+            text: payload.embed_text,
+            category: payload.category,
+            section_path: payload.section_path,
+            page_start: payload.page_start,
+            page_end: payload.page_end,
+        })
+        .collect();
+
+    let total = evidences.len();
+    Ok(Json(KnowledgeSearchResponse {
+        evidences,
+        total_candidates: total,
+        query_ms: t0.elapsed().as_millis() as u64,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

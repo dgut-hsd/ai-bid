@@ -417,6 +417,11 @@ pub fn build(state: AppState) -> Router {
             "/knowledge/ingest",
             post(knowledge_handlers::ingest_knowledge),
         )
+        // 知识库检索（检索组）
+        .route(
+            "/knowledge/search",
+            post(knowledge_handlers::search_knowledge),
+        )
         // SSE 实时推送 + 异步审查结果
         .route(
             "/review/:doc_id/stream",

@@ -60,6 +60,7 @@ pub mod read_section;
 pub mod search_contradiction;
 pub mod search_document;
 pub mod search_knowledge;
+pub mod search_knowledge_base;
 pub mod validate_calculation;
 pub mod verify_announcement_period;
 pub mod verify_bid_deposit;
