@@ -663,6 +663,8 @@ impl ReActLoop {
         let mut seen_law_refs: std::collections::HashSet<String> = std::collections::HashSet::new(); // 已见过的法规引用（用于判断搜索是否带来新信息）
         // ★ 优化：法规证据充分后，下一轮强制锁定 output_finding，避免 Auto 模式下 LLM 继续调用工具空转
         let mut force_output_next = false;
+        // ★ 强化强制收尾（AIBID_STALL_FORCE_OUTPUT）：连续 N 轮仅请求探索类工具且未产出 finding → 下一轮强制 output_finding
+        let mut consecutive_stall: u32 = 0;
 
         // ── 条款头日志 ──
         let _print_lock = self.print_lock.as_ref().map(|l| l.lock().unwrap());
@@ -922,6 +924,42 @@ impl ReActLoop {
                             produced_finding: r.has_output_finding(),
                             finding_parsed_ok: false, // 由后续 output_finding 解析更新
                         });
+                    }
+
+                    // ★ 强化强制收尾（AIBID_STALL_FORCE_OUTPUT=N）：
+                    // 连续 N 轮 LLM 只请求探索类工具（read_section/search_*）且未产出 finding → 视为空转，
+                    // 下一轮强制锁定 output_finding，避免在多 agent 协作 / 复杂条款场景下无限探索。
+                    let stall_threshold: u32 = std::env::var("AIBID_STALL_FORCE_OUTPUT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if stall_threshold > 0 {
+                        let produced = r.has_output_finding();
+                        let explore_only = !r.tool_calls.is_empty()
+                            && r.tool_calls.iter().all(|tc| {
+                                matches!(
+                                    tc.name.as_str(),
+                                    "read_section"
+                                        | "search_document"
+                                        | "search_knowledge"
+                                        | "web_search"
+                                )
+                            });
+                        if produced {
+                            consecutive_stall = 0;
+                        } else if explore_only {
+                            consecutive_stall += 1;
+                            if consecutive_stall >= stall_threshold {
+                                force_output_next = true;
+                                eprintln!(
+                                    "[STALL-FORCE] 条款 {} 连续 {} 轮仅探索未产出 → 强制 output_finding",
+                                    clause.chunk_id, consecutive_stall
+                                );
+                                consecutive_stall = 0;
+                            }
+                        } else {
+                            consecutive_stall = 0;
+                        }
                     }
 
                     // SSE: call_log — 每次 LLM 调用的统计信息
