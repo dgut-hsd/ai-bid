@@ -1,0 +1,611 @@
+﻿# Rule library v0.1 — 28 rules covering DISC/QUAL/EXPR/PRIC/TIME/SAFE/PROC.
+#
+# Migration note: these rules encode the same keyword-AND logic as the original
+# `category_from_evidence` in risk_taxonomy.rs (migrated to rules/engine.rs),
+# and add new regex / field_compare capabilities for dates and deposit ratios.
+# TDD requirement: every rule below is accompanied by +/- test cases in
+# tests/fixtures/rules_fixtures.json (Day 3 golden standard).
+
+rules:
+
+  # ===== DISC 排斥性条款 ==========================================
+
+  - id: DISC_LOCAL_REG_CITY
+    category: LOCAL_REGISTRATION
+    industry: GENERAL
+    severity: Critical
+    source:
+      law: 中华人民共和国政府采购法实施条例
+      article: 第二十条
+      excerpt: 采购人或者采购代理机构不得以不合理的条件对供应商实行差别待遇或者歧视待遇。
+    conditions:
+      document_type: 招标文件
+      trigger:
+        chapter_keywords: ["投标人资格", "资格条件", "投标人须知"]
+    patterns:
+      - type: keyword
+        value: ["本市", "本区", "本县", "本省", "当地", "所在地", "采购人所在地", "所在区县"]
+        mode: any
+      - type: keyword
+        value: ["注册", "分公司", "分支机构", "经营满", "设立"]
+        mode: any
+      - type: keyword
+        value: ["须", "必须", "仅限", "不接受", "资格", "应当", "需要"]
+        mode: any
+    check: all_match
+    enabled: true
+    law_ref: "《政府采购法实施条例》第二十条"
+
+  - id: DISC_LOCAL_REG_ALIAS
+    category: LOCAL_REGISTRATION
+    industry: GOVERNMENT
+    severity: Critical
+    source:
+      law: 中华人民共和国招标投标法
+      article: 第十八条
+      excerpt: 招标人不得以不合理的条件限制或者排斥潜在投标人。
+    conditions:
+      document_type: 招标文件
+      trigger:
+        chapter_keywords: ["资格审查", "合格供应商条件"]
+    patterns:
+      - type: keyword
+        value: ["本地", "本省", "所在省份", "采购人辖区"]
+        mode: any
+      - type: keyword
+        value: ["注册地要求", "常驻机构", "经营场所所在地"]
+        mode: any
+    check: any_match
+    enabled: true
+    law_ref: "《招标投标法》第十八条"
+
+  - id: DISC_REGIONAL_PERF
+    category: REGIONAL_PERFORMANCE
+    industry: CONSTRUCTION
+    severity: Critical
+    source:
+      law: 中华人民共和国招标投标法实施条例
+      article: 第三十二条
+    conditions:
+      document_type: 招标文件
+      trigger:
+        chapter_keywords: ["类似项目业绩", "业绩要求", "同类项目案例"]
+    patterns:
+      - type: keyword
+        value: ["本市", "本区", "本县", "本省", "当地", "所在地", "所在区县", "采购人所在地"]
+        mode: any
+      - type: keyword
+        value: ["业绩", "案例", "合同", "中标通知书", "竣工验收"]
+        mode: any
+      - type: keyword
+        value: ["须", "必须", "仅限", "不认可", "不予认可", "不得作为", "不能作为"]
+        mode: any
+    check: all_match
+    enabled: true
+    law_ref: "《招标投标法实施条例》第三十二条"
+
+  - id: DISC_REGIONAL_PERF_ALIAS
+    category: REGIONAL_PERFORMANCE
+    industry: GENERAL
+    severity: Critical
+    conditions:
+      trigger:
+        chapter_keywords: ["评分办法", "综合打分", "商务标评分"]
+    patterns:
+      - type: keyword
+        value: ["本地业绩", "省内业绩", "区域内业绩", "本地区经验"]
+        mode: any
+      - type: keyword
+        value: ["加分", "得分", "评分", "项"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  - id: DISC_BRAND_LOCK
+    category: BRAND_LOCK
+    industry: GENERAL
+    severity: Critical
+    source:
+      law: 中华人民共和国政府采购法实施条例
+      article: 第二十条
+    conditions:
+      document_type: 招标文件
+      trigger:
+        chapter_keywords: ["技术要求", "货物清单", "参数配置", "品牌"]
+    patterns:
+      - type: keyword
+        value: ["品牌", "商标", "型号", "厂牌", "指定产品", "系列"]
+        mode: any
+      - type: keyword
+        value: ["仅", "只能", "唯一", "指定", "不接受", "不得偏离", "仅限于"]
+        mode: any
+    check: all_match
+    enabled: true
+    law_ref: "《政府采购法实施条例》第二十条第(六)项"
+
+  - id: DISC_BRAND_ALIAS
+    category: BRAND_LOCK
+    industry: IT
+    severity: Critical
+    patterns:
+      - type: regex
+        value: "[指定限定][一二三四五六七八九十]?选?(品牌|厂牌|厂商|型号)"
+    enabled: true
+
+  - id: DISC_LOCAL_AWARD
+    category: LOCAL_AWARD
+    industry: GENERAL
+    severity: Medium
+    conditions:
+      trigger:
+        chapter_keywords: ["评分细则", "加分项", "综合评分"]
+    patterns:
+      - type: keyword
+        value: ["本市", "本区", "本省", "本地", "所在地"]
+        mode: any
+      - type: keyword
+        value: ["奖项", "荣誉", "获奖证书", "诚信企业", "著名商标"]
+        mode: any
+      - type: keyword
+        value: ["加分", "得分", "评分", "分"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  # ===== QUAL 资质条件 =============================================
+
+  - id: QUAL_UNRELATED_CERT
+    category: UNRELATED_CERT
+    industry: GENERAL
+    severity: Critical
+    source:
+      law: 中华人民共和国招标投标法
+      article: 第十八条
+    conditions:
+      document_type: 招标文件
+      trigger:
+        chapter_keywords: ["资质要求", "资格要求", "供应商资格"]
+    patterns:
+      - type: keyword
+        value: ["认证", "证书", "荣誉", "示范企业", "名牌产品", "驰名商标"]
+        mode: any
+      - type: keyword
+        value: ["资格", "无效", "废标", "不通过", "必须", "须提供", "作为资格"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  - id: QUAL_UNRELATED_AWARD
+    category: UNRELATED_CERT
+    industry: GOVERNMENT
+    severity: High
+    patterns:
+      - type: keyword
+        value: ["守合同重信用", "AAA 级信用", "政府质量奖", "明星企业"]
+        mode: any
+      - type: keyword
+        value: ["投标资格", "入门条件", "符合性审查", "合格条件"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  - id: QUAL_SCALE_CAPITAL
+    category: SCALE_THRESHOLD
+    industry: CONSTRUCTION
+    severity: Critical
+    source:
+      law: 中华人民共和国招标投标法实施条例
+      article: 第三十二条
+    conditions:
+      trigger:
+        chapter_keywords: ["投标人资格", "资质", "准入条件"]
+    patterns:
+      - type: keyword
+        value: ["注册资本", "实收资本", "实缴资本", "净资产", "总资产"]
+        mode: any
+      - type: keyword
+        value: ["不得低于", "不少于", "以上", "达到", "门槛", "资格", "不低于"]
+        mode: any
+    check: all_match
+    enabled: true
+    law_ref: "《招标投标法实施条例》第三十二条第(二)项"
+
+  - id: QUAL_SCALE_REVENUE
+    category: SCALE_THRESHOLD
+    industry: GENERAL
+    severity: High
+    patterns:
+      - type: keyword
+        value: ["年营业收入", "年销售额", "年经营额", "近三年产值"]
+        mode: any
+      - type: keyword
+        value: ["不得低于", "不少于", "以上", "达到"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  - id: QUAL_SCALE_FIGURE
+    category: SCALE_THRESHOLD
+    industry: GENERAL
+    severity: Medium
+    patterns:
+      - type: regex
+        value: "(注册|营业|资产|产值).{0,8}?(不低|不少|达).{0,8}?(万元|亿)"
+    enabled: true
+
+  - id: QUAL_OEM_AUTH
+    category: OEM_AUTHORIZATION
+    industry: GENERAL
+    severity: Critical
+    source:
+      law: 政府采购货物和服务招标投标管理办法
+      article: 第十七条
+    conditions:
+      document_type: 招标文件
+      trigger:
+        chapter_keywords: ["资格", "符合性", "报名条件"]
+    patterns:
+      - type: keyword
+        value: ["原厂", "厂家", "制造商", "总代理商", "原厂商"]
+        mode: any
+      - type: keyword
+        value: ["授权", "承诺函", "专项授权书", "项目授权书", "代理证明"]
+        mode: any
+      - type: keyword
+        value: ["资格", "无效", "废标", "必须", "须提供", "作为资格条件"]
+        mode: any
+    check: all_match
+    enabled: true
+    law_ref: "财政部 87 号令第十七条"
+
+  - id: QUAL_OEM_ALIAS
+    category: OEM_AUTHORIZATION
+    industry: GENERAL
+    severity: High
+    patterns:
+      - type: regex
+        value: "(未|无|没有|缺).{0,4}(原厂|厂家|制造商).{0,6}(授权|承诺|证明).{0,8}(无效|废标|拒绝)"
+    enabled: true
+
+  # ===== EXPR 合同表达 ===========================================
+
+  - id: EXPR_UNBOUNDED_IP
+    category: UNBOUNDED_IP
+    industry: GENERAL
+    severity: High
+    source:
+      law: 民法典 合同编
+      article: 第八百四十七条
+    patterns:
+      - type: keyword
+        value: ["知识产权", "侵权责任", "专利", "著作权", "软件著作权"]
+        mode: any
+      - type: keyword
+        value: ["全部责任", "一切责任", "无限", "无上限", "永久归采购人所有"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  - id: EXPR_UNILATERAL
+    category: UNILATERAL_CHANGE
+    industry: CONSTRUCTION
+    severity: High
+    patterns:
+      - type: keyword
+        value: ["单方", "采购人有权变更", "任意调整需求", "新增需求由供应商"]
+        mode: any
+      - type: keyword
+        value: ["不调整", "不得调整", "无条件", "原合同范围", "费用不变", "工期不变"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  - id: EXPR_UNCLEAR_PENALTY
+    category: UNCLEAR_PENALTY
+    industry: GENERAL
+    severity: Medium
+    patterns:
+      - type: keyword
+        value: ["违约金", "违约责任", "逾期责任", "赔偿"]
+        mode: any
+      - type: keyword
+        value: ["重复计算", "累计计算", "无上限", "自行决定", "不明确", "视情况而定"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  - id: EXPR_VAGUE_ACCEPT
+    category: VAGUE_ACCEPTANCE
+    industry: CONSTRUCTION
+    severity: Medium
+    patterns:
+      - type: keyword
+        value: ["验收", "交工", "竣工验收"]
+        mode: any
+      - type: keyword
+        value: ["满意", "自行判断", "无异议", "未明确标准", "不明确", "无需说明理由"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  # ===== PRIC 价格 / 评分 =========================================
+
+  - id: PRIC_EXCESSIVE_DEPOSIT_RATIO
+    category: EXCESSIVE_DEPOSIT
+    industry: GENERAL
+    severity: Medium
+    conditions:
+      trigger:
+        chapter_keywords: ["投标保证金", "保证金"]
+    patterns:
+      - type: field_compare
+        left: deposit_ratio
+        operator: ">"
+        right: "0.02"
+    check: any_match
+    enabled: true
+    law_ref: "《招标投标法实施条例》第二十六条 2% 上限"
+
+  - id: PRIC_EXCESSIVE_DEPOSIT_AMOUNT
+    category: EXCESSIVE_DEPOSIT
+    industry: GENERAL
+    severity: Medium
+    patterns:
+      - type: field_compare
+        left: deposit_amount
+        operator: ">"
+        right: "estimate_price * 0.02"
+    check: any_match
+    enabled: true
+
+  - id: PRIC_EXCESSIVE_DEPOSIT_RE
+    category: EXCESSIVE_DEPOSIT
+    industry: GENERAL
+    severity: Medium
+    patterns:
+      - type: regex
+        value: "投标保证金[^。]{0,15}?[3-9][0-9]?%"
+    enabled: true
+
+  - id: PRIC_SUBJECTIVE_SCORE
+    category: SUBJECTIVE_SCORING
+    industry: GENERAL
+    severity: Medium
+    conditions:
+      trigger:
+        chapter_keywords: ["评分办法", "打分表", "评分标准"]
+    patterns:
+      - type: keyword
+        value: ["酌情", "自行掌握", "主观", "综合印象", "优良中差", "优秀良好", "满意程度", "评委酌情"]
+        mode: any
+    check: any_match
+    enabled: true
+
+  - id: PRIC_SUBJECTIVE_RE
+    category: SUBJECTIVE_SCORING
+    industry: GENERAL
+    severity: Low
+    patterns:
+      - type: regex
+        value: "(技术|商务|服务)方案.{0,10}?(综合判断|酌情打分|优劣情况)"
+    enabled: true
+
+  # ===== TIME 时间类 =============================================
+
+  - id: TIME_SHORT_DEADLINE
+    category: SHORT_DEADLINE
+    industry: GENERAL
+    severity: Medium
+    source:
+      law: 中华人民共和国招标投标法
+      article: 第二十四条
+    patterns:
+      - type: keyword
+        value: ["投标截止", "开标", "投标准备", "提交投标文件", "获取招标文件"]
+        mode: any
+      - type: keyword
+        value: ["不足", "少于", "仅有", "只有", "不满"]
+        mode: any
+      - type: regex
+        value: '[1-9]\s*日.{0,6}(内|以内|之后|前)'
+    check: any_match
+    enabled: true
+    law_ref: "《招标投标法》第二十四条 ≥20 日"
+
+  - id: TIME_SHORT_CLAUSE
+    category: SHORT_DEADLINE
+    industry: GENERAL
+    severity: Medium
+    patterns:
+      - type: regex
+        value: "仅.{0,6}([1-9]|十)[日天].{0,6}(递交|投标|响应)"
+    enabled: true
+
+  - id: TIME_CONFLICT_DATES
+    category: CONFLICTING_DATES
+    industry: GENERAL
+    severity: Medium
+    patterns:
+      - type: keyword
+        value: ["日期矛盾", "日期不一致", "两处分别", "另有规定", "同时约定"]
+        mode: any
+      - type: keyword
+        value: ["投标截止", "开标时间", "保证金到账", "资格审查"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  # ===== SAFE 安全 / 验收 ========================================
+
+  - id: SAFE_ACCEPTANCE_ABSENCE
+    category: VAGUE_ACCEPTANCE
+    industry: CONSTRUCTION
+    severity: Medium
+    patterns:
+      - type: keyword
+        value: ["安全生产许可证"]
+        mode: any
+        match_mode: absence
+    check: any_match
+    enabled: true
+    # absence 模式：资质章节若"未提及安全生产许可证"即命中
+    # chapter_keywords 约束：只在资质/资格章节内生效，避免对邀请函等无关章节误报
+    conditions:
+      trigger:
+        chapter_keywords: ["资格", "资质", "供应商资格", "合格供应商", "准入条件"]
+
+  # ===== PROC 程序类 =============================================
+
+  - id: PROC_OEM_QUAL_GATE
+    category: OEM_AUTHORIZATION
+    industry: GENERAL
+    severity: High
+    patterns:
+      - type: regex
+        value: "[将把].{0,6}(原厂|厂家).{0,6}(授权|承诺).{0,10}(资格|合格|符合性)"
+    enabled: true
+
+  - id: PROC_SHORT_DEADLINE_GOVERN
+    category: SHORT_DEADLINE
+    industry: GOVERNMENT
+    severity: High
+    patterns:
+      - type: keyword
+        value: ["竞争性谈判", "竞争性磋商", "单一来源"]
+        mode: any
+      - type: regex
+        value: '[3-5]\s*个?工作日.{0,6}(内|以内|截止)'
+    check: all_match
+    enabled: true
+
+  # ===== P3 补充规则 —— 覆盖 blind-v2 11 个 FN 条款 ================
+  # 依据：llm_fn_annotations.json 中 LLM 预标注（一致率 100%）提取的
+  # evidence_quote / reasoning 关键词。每条规则对应一类 FN，保留原规则
+  # 不动以避免回归，新增规则以 any/all 互补命中。
+
+  # --- EXCESSIVE_DEPOSIT 补充（BLIND-007-F02: "6%的保证金"）---
+  - id: PRIC_EXCESSIVE_DEPOSIT_PCT_RE
+    category: EXCESSIVE_DEPOSIT
+    industry: GENERAL
+    severity: High
+    source:
+      law: 中华人民共和国招标投标法实施条例
+      article: 第二十六条
+    patterns:
+      # 百分比前置写法 "X%的保证金"，X≥3% 即超 2% 上限
+      - type: regex
+        value: '([3-9]|[1-9]\d)\s*%[^。]{0,12}?保证金'
+    check: any_match
+    enabled: true
+    law_ref: "《招标投标法实施条例》第二十六条 2% 上限"
+
+  # --- UNBOUNDED_IP 补充（BLIND-002-F03: "永久无偿转让...软件组件"）---
+  - id: EXPR_UNBOUNDED_IP_TRANSFER
+    category: UNBOUNDED_IP
+    industry: GENERAL
+    severity: High
+    source:
+      law: 民法典 合同编
+      article: 第八百四十七条
+    patterns:
+      - type: keyword
+        value: ["永久无偿转让", "永久无偿", "无偿转让", "永久归", "无限额索赔", "全部无限额"]
+        mode: any
+      - type: keyword
+        value: ["软件组件", "算法", "工具", "承接项目前", "背景知识产权", "知识产权"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  # --- UNILATERAL_CHANGE 补充（BLIND-003-F03 / BLIND-008-F03）---
+  - id: EXPR_UNILATERAL_INCREASE
+    category: UNILATERAL_CHANGE
+    industry: GENERAL
+    severity: High
+    patterns:
+      - type: keyword
+        value: ["随时增加", "任意数量", "随时", "新增功能", "新增需求", "后续新增"]
+        mode: any
+      - type: keyword
+        value: ["不得增加费用", "不得延长", "不得申请延长", "自动包含", "原合同价", "原价内", "单方决定", "费用不变"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  # --- SUBJECTIVE_SCORING 补充（BLIND-004-F02 / BLIND-009-F02）---
+  - id: PRIC_SUBJECTIVE_GRADE
+    category: SUBJECTIVE_SCORING
+    industry: GENERAL
+    severity: High
+    patterns:
+      - type: keyword
+        value: ["非常好", "较好", "普通", "优良", "一般", "美观性", "感染力", "总体感觉", "总体印象", "评委认为"]
+        mode: any
+      - type: keyword
+        value: ["没有列明", "可核验", "不设置", "未设置", "自由给分", "评分刻度", "无刻度", "不列明"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  # --- CONFLICTING_DATES 补充（BLIND-004-F03 / BLIND-009-F03）---
+  - id: TIME_CONFLICT_DUAL_DATES
+    category: CONFLICTING_DATES
+    industry: GENERAL
+    severity: Medium
+    patterns:
+      # 模式1：同一条款出现两个完整日期时间（年月日时分）
+      - type: regex
+        value: '\d{4}年\d{1,2}月\d{1,2}日\s*\d{1,2}时[^。]{0,40}\d{4}年\d{1,2}月\d{1,2}日\s*\d{1,2}时'
+      # 模式2：一个完整日期时间 + "当日/同时/又称" + 另一个时点
+      - type: regex
+        value: '\d{4}年\d{1,2}月\d{1,2}日\s*\d{1,2}时[^。]{0,30}(当日|同时|又称)[^。]{0,10}\d{1,2}时'
+    check: any_match
+    enabled: true
+
+  # --- SHORT_DEADLINE 补充（BLIND-006-F02: "十二个自然日...不顺延"）---
+  - id: TIME_SHORT_CN_DAYS
+    category: SHORT_DEADLINE
+    industry: GENERAL
+    severity: High
+    source:
+      law: 中华人民共和国招标投标法
+      article: 第二十四条
+    patterns:
+      # 中文数字 1~19 个自然/工作日（"十X" 覆盖 11~19，单字覆盖 1~9，"十" 覆盖 10）
+      - type: regex
+        value: '(十[一二三四五六七八九]?|[一二三四五六七八九])个?(自然|工作)日'
+      - type: keyword
+        value: ["截止", "投标", "收件", "下载招标文件", "递交", "响应"]
+        mode: any
+    check: all_match
+    enabled: true
+    law_ref: "《招标投标法》第二十四条 ≥20 日"
+
+  - id: TIME_SHORT_NO_EXTEND
+    category: SHORT_DEADLINE
+    industry: GENERAL
+    severity: Medium
+    patterns:
+      # "不因...顺延" / "不予以顺延" —— 明确排除节假日顺延
+      - type: regex
+        value: '不(因|予).{0,8}顺延'
+      - type: keyword
+        value: ["截止", "投标", "收件", "递交", "响应"]
+        mode: any
+    check: all_match
+    enabled: true
+
+  # --- VAGUE_ACCEPTANCE 补充（BLIND-006-F03: "口头确认...不说明拒绝验收"）---
+  - id: EXPR_VAGUE_ORAL
+    category: VAGUE_ACCEPTANCE
+    industry: GENERAL
+    severity: Medium
+    patterns:
+      - type: keyword
+        value: ["完成标准", "口头确认", "口头", "现场确认", "现场口头"]
+        mode: any
+      - type: keyword
+        value: ["不说明", "拒绝验收", "不说明理由", "无需说明理由", "不说明拒绝", "不说明具体理由"]
+        mode: any
+    check: all_match
+    enabled: true

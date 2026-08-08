@@ -36,7 +36,7 @@ tmp/
 logs/
 .pnpm-store/
 .runtime-data/
-data/
+/data/
 
 # ── Python 缓存 ──
 __pycache__/
