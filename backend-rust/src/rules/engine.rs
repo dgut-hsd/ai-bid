@@ -8,6 +8,10 @@
 
 use crate::agents::types::{RiskFinding, RiskSeverity};
 use crate::rules::catalog::{owner_agent, CATEGORIES};
+use crate::rules::metrics::DocumentMetrics;
+use crate::rules::schema::RuleBook;
+use crate::rules::validator::{evaluate_rulebook, load_rulebook};
+use std::sync::OnceLock;
 
 /// 关键词 OR 匹配（从 risk_taxonomy.rs 迁入）。
 fn contains_any(text: &str, words: &[&str]) -> bool {
@@ -253,6 +257,71 @@ fn critical_evidence(code: &str, quote: &str) -> bool {
     }
 }
 
+// ── YAML 规则库接入（离线缓存 + 主链路集成）─────────────────────────────
+
+const RULEBOOK_PATH: &str = "src/rules/data/conditions.yaml";
+
+/// 惰性加载规则库，加载失败时使用空规则库（静默降级）。
+fn get_rulebook() -> &'static RuleBook {
+    static RULEBOOK: OnceLock<RuleBook> = OnceLock::new();
+    RULEBOOK.get_or_init(|| match load_rulebook(RULEBOOK_PATH) {
+        Ok((book, warnings)) => {
+            if !warnings.is_empty() {
+                eprintln!("[rules] Rulebook warnings: {}", warnings.len());
+            }
+            book
+        }
+        Err(e) => {
+            eprintln!("[rules] Warning: YAML rulebook not loaded ({e}), continuing without YAML.");
+            RuleBook { rules: vec![] }
+        }
+    })
+}
+
+/// 将 YAML category String 映射回 `&'static str` canonical code。
+fn category_to_static(cat: &str) -> Option<&'static str> {
+    CATEGORIES
+        .iter()
+        .find_map(|(code, _)| (*code == cat).then_some(*code))
+}
+
+/// 对条款文本执行 YAML 规则求值，返回去重后的 canonical category 列表。
+fn yaml_candidate_categories(text: &str) -> Vec<&'static str> {
+    let book = get_rulebook();
+    if book.rules.is_empty() {
+        return vec![];
+    }
+    let metrics = DocumentMetrics::extract_from_clause_text(text);
+    let hits = evaluate_rulebook(book, text, &metrics);
+    let mut result: Vec<&'static str> = Vec::new();
+    for (_, category) in hits {
+        if let Some(static_cat) = category_to_static(&category) {
+            if !result.contains(&static_cat) {
+                result.push(static_cat);
+            }
+        }
+    }
+    result
+}
+
+/// 检查文本是否匹配 YAML 中 severity=Critical 的规则。
+fn yaml_is_critical(quote: &str) -> bool {
+    let book = get_rulebook();
+    if book.rules.is_empty() {
+        return false;
+    }
+    let metrics = DocumentMetrics::extract_from_clause_text(quote);
+    let hits = evaluate_rulebook(book, quote, &metrics);
+    if hits.is_empty() {
+        return false;
+    }
+    hits.iter().any(|(rule_id, _)| {
+        book.rules
+            .iter()
+            .any(|r| r.id == *rule_id && r.severity == "Critical")
+    })
+}
+
 // ── Public API（被 risk_taxonomy.rs facade 委托）──────────────────────
 
 /// 对应 risk_taxonomy::canonical_category —— 签名不变。
@@ -274,6 +343,7 @@ pub fn canonical_category(finding: &RiskFinding) -> String {
 /// 对应 risk_taxonomy::candidate_categories —— 签名不变。
 pub fn candidate_categories(text: &str) -> Vec<&'static str> {
     let mut result = Vec::new();
+    // ── 硬编码分支（已有，行为兼容） ──
     for segment in text.split(['\n', '。', '；']) {
         if let Some(category) = category_from_evidence(segment)
             && !result.contains(&category)
@@ -285,6 +355,12 @@ pub fn candidate_categories(text: &str) -> Vec<&'static str> {
         && !result.contains(&category)
     {
         result.push(category);
+    }
+    // ── YAML 分支（新增，取并集） ──
+    for category in yaml_candidate_categories(text) {
+        if !result.contains(&category) {
+            result.push(category);
+        }
     }
     result
 }
@@ -350,7 +426,8 @@ pub fn normalize_finding(finding: &mut RiskFinding) {
 
     let is_critical = !finding.no_risk
         && !finding.source_quote.trim().is_empty()
-        && critical_evidence(&category, finding.source_quote.trim());
+        && (critical_evidence(&category, finding.source_quote.trim())
+            || yaml_is_critical(finding.source_quote.trim()));
     finding.is_critical = is_critical;
     if is_critical {
         finding.severity = RiskSeverity::High;
@@ -564,8 +641,155 @@ mod tests {
         }
     }
 
+    /// 集成测试：模拟完整审核流程，验证 YAML 规则在 candidate_categories
+    /// 和 normalize_finding 两个主链路接入点的行为。
+    #[test]
+    fn yaml_integration_full_pipeline_simulation() {
+        // ── Stage 1: 条款级候选检测（candidate_categories） ──
+        // 模拟 react_loop 对每个条款调用 review_candidates_for_agent。
+        // 每条 clause 的预期候选集来自 YAML ∪ 硬编码。
+
+        #[track_caller]
+        fn check_candidates(clauses: &[(&str, &[&str])]) {
+            for (i, (text, expected)) in clauses.iter().enumerate() {
+                let candidates = crate::rules::engine::candidate_categories(text);
+                for cat in *expected {
+                    assert!(
+                        candidates.contains(cat),
+                        "Clause {}: 应包含 `{}`，实际候选集: {:?}",
+                        i + 1,
+                        cat,
+                        candidates
+                    );
+                }
+            }
+        }
+
+        // (clause_text, expected_candidates)
+        check_candidates(&[
+            // YAML-only: PRIC_EXCESSIVE_DEPOSIT_PCT_RE（regex 匹配 "6%的保证金"）
+            ("投标人应缴纳采购预算总额6%的保证金", &["EXCESSIVE_DEPOSIT"]),
+            // 硬编码: LOCAL_REGISTRATION（"本市注册须"）
+            ("投标人须在本市注册成立三年以上，且在本市设有分支机构。", &["LOCAL_REGISTRATION"]),
+            // YAML-only: TIME_SHORT_CLAUSE（regex 匹配 "仅5日递交投标文件"）
+            ("仅5日递交投标文件", &["SHORT_DEADLINE"]),
+            // YAML-only: DISC_BRAND_ALIAS（regex 匹配 "指定品牌"）
+            ("指定品牌XYZ型号", &["BRAND_LOCK"]),
+            // 硬编码: REGIONAL_PERFORMANCE + OEM_AUTHORIZATION（多条款文本）
+            (
+                "供应商须提供采购人所在区县的同类服务案例，跨区域案例不作为有效业绩。\n\
+                 投标人必须提交生产厂家针对本项目出具的授权函，否则投标无效。",
+                &["REGIONAL_PERFORMANCE", "OEM_AUTHORIZATION"],
+            ),
+            // YAML + 硬编码并集: PRIC_SUBJECTIVE_RE（regex）+ 硬编码关键词
+            ("技术方案由评委综合判断优劣情况", &["SUBJECTIVE_SCORING"]),
+            // ── 边界：空条款 → 无候选 ──
+            ("", &[]),
+            // ── 边界：无匹配条款 → 无候选 ──
+            ("这是一般商务条款，不涉及风险。", &[]),
+            // ── 边界：YAML chapter_keywords + all_match（DISC_LOCAL_REG_CITY）──
+            ("投标人资格：须在本市注册的企业", &["LOCAL_REGISTRATION"]),
+            // ── 边界：YAML absence 模式（SAFE_ACCEPTANCE_ABSENCE → VAGUE_ACCEPTANCE）──
+            // 施工资质章节中未提及"安全生产许可证"即触发 absence
+            (
+                "安全生产施工资质要求：施工单位须具备相关施工资质。",
+                &["VAGUE_ACCEPTANCE"],
+            ),
+            // ── 边界：YAML field_compare（PRIC_EXCESSIVE_DEPOSIT_RATIO: deposit_ratio > 0.02）──
+            ("投标保证金不得超过估算价的5%", &["EXCESSIVE_DEPOSIT"]),
+        ]);
+
+        // ── Stage 2: 证据分类 + Critical 判定（normalize_finding） ──
+        // 模拟 coordinator 对每条 finding 的归一化处理。
+
+        #[track_caller]
+        fn check_findings(cases: &[(&str, &str, &str, bool)]) {
+            for (i, (code, quote, expected_cat, expected_crit)) in cases.iter().enumerate() {
+                let mut f = finding(code, quote);
+                crate::rules::engine::normalize_finding(&mut f);
+                assert_eq!(
+                    &f.category_code, expected_cat,
+                    "Finding {}: category_code 不符合预期（quote={}）",
+                    i + 1, quote
+                );
+                assert_eq!(
+                    f.is_critical, *expected_crit,
+                    "Finding {}: is_critical={} 不符合预期（category={}, quote={}）",
+                    i + 1, f.is_critical, f.category_code, quote
+                );
+            }
+        }
+
+        // (category_code, source_quote, expected_normalized_category, expected_critical)
+        check_findings(&[
+            // YAML Critical: DISC_BRAND_ALIAS（severity=Critical）+ 硬编码也命中
+            ("BRAND_LOCK", "指定品牌XYZ型号的投标", "BRAND_LOCK", true),
+            // YAML Medium: TIME_SHORT_CLAUSE（severity=Medium）
+            ("SHORT_DEADLINE", "仅5日递交投标文件", "SHORT_DEADLINE", false),
+            // YAML High: PRIC_EXCESSIVE_DEPOSIT_PCT_RE（severity=High, not Critical）
+            ("EXCESSIVE_DEPOSIT", "投标人应缴纳采购预算总额6%的保证金", "EXCESSIVE_DEPOSIT", false),
+            // 硬编码 critical_evidence: LOCAL_REGISTRATION
+            ("LOCAL_REGISTRATION", "投标人须在本市注册成立三年以上，且在本市设有分支机构。", "LOCAL_REGISTRATION", true),
+            // YAML 无匹配 + 硬编码也无匹配：回退到 alias 归一化
+            ("DATE_CONFLICT", "投标截止时间为[日期]9时，同时规定[日期]17时后提交的文件一律拒收。", "CONFLICTING_DATES", false),
+        ]);
+
+        // ── Stage 3: 边界情况（normalize_finding 需要特殊构造） ──
+
+        // Edge: no_risk=true → 不应标记 Critical
+        let mut f = finding("SHORT_DEADLINE", "仅5日递交投标文件");
+        f.no_risk = true;
+        crate::rules::engine::normalize_finding(&mut f);
+        assert!(!f.is_critical, "no_risk=true 不应标记为 Critical");
+
+        // Edge: 空 source_quote → 不应标记 Critical
+        let mut f = finding("SHORT_DEADLINE", "");
+        crate::rules::engine::normalize_finding(&mut f);
+        assert!(!f.is_critical, "空 source_quote 不应标记为 Critical");
+    }
+
     /// 汇总报告：输出 15 类的覆盖矩阵，供 bin/test_rules 离线查看。
     /// 这个测试本身就是模拟数据集的"快照"。
+    // ── YAML 接入主链路（TDD 测试用例）────────────────────────────────
+
+    #[test]
+    fn yaml_candidate_catches_excessive_deposit_without_投标保证金_keyword() {
+        // YAML rule PRIC_EXCESSIVE_DEPOSIT_PCT_RE 匹配 "6%的保证金"（regex）
+        // 硬编码 category_from_evidence 要求 "投标保证金" 关键词，不存在时不命中
+        let text = "投标人应缴纳采购预算总额6%的保证金";
+        let candidates = candidate_categories(text);
+        assert!(
+            candidates.contains(&"EXCESSIVE_DEPOSIT"),
+            "YAML 应捕获 EXCESSIVE_DEPOSIT（6%的保证金，硬编码需要投标保证金）"
+        );
+    }
+
+    #[test]
+    fn yaml_candidate_preserves_hardcoded_results() {
+        // 硬编码应仍然捕获 LOCAL_REGISTRATION（回归测试）
+        let text = "投标人须在本市注册成立三年以上，且在本市设有分支机构。";
+        let candidates = candidate_categories(text);
+        assert!(candidates.contains(&"LOCAL_REGISTRATION"));
+    }
+
+    #[test]
+    fn normalize_finding_yaml_critical_supplements_hardcoded() {
+        // DISC_BRAND_ALIAS（severity=Critical, no chapter_keywords）
+        // 应通过 YAML 路径标记为 Critical
+        let mut f = finding("BRAND_LOCK", "指定品牌XYZ型号的投标");
+        normalize_finding(&mut f);
+        assert_eq!(f.category_code, "BRAND_LOCK");
+        assert!(f.is_critical, "YAML rule DISC_BRAND_ALIAS severity=Critical 应标记为 Critical");
+    }
+
+    #[test]
+    fn normalize_finding_yaml_does_not_cause_false_critical_for_non_critical() {
+        // SHORT_DEADLINE YAML 规则 severity=Medium，不应误标 Critical
+        let mut f = finding("SHORT_DEADLINE", "投标人须在3日内递交投标文件。");
+        normalize_finding(&mut f);
+        assert!(!f.is_critical, "SHORT_DEADLINE YAML severity=Medium 不应标记为 Critical");
+    }
+
     #[test]
     fn critical_coverage_summary_report() {
         let critical_cases = vec![

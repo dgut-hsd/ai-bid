@@ -1,0 +1,94 @@
+# Classification catalog — 15 canonical categories (byte-identical to risk_taxonomy CATEGORIES)
+# Keeps category code / display name / owner_agent in one place.
+# Day 3 syncs this file with Python benchmark/risk_policy.py.
+
+categories:
+  - code: LOCAL_REGISTRATION
+    name: 地域注册限制
+    owner_agent: SemanticRiskAgent
+    severity: High
+    critical_default: true
+
+  - code: BRAND_LOCK
+    name: 指定品牌且不接受同等产品
+    owner_agent: DemandAgent
+    severity: High
+    critical_default: true
+
+  - code: UNRELATED_CERT
+    name: 设置与履约无关的资格条件
+    owner_agent: DemandAgent
+    severity: High
+    critical_default: true
+
+  - code: REGIONAL_PERFORMANCE
+    name: 特定区域业绩限制
+    owner_agent: SemanticRiskAgent
+    severity: High
+    critical_default: true
+
+  - code: SCALE_THRESHOLD
+    name: 以经营规模设置资格门槛
+    owner_agent: DemandAgent
+    severity: High
+    critical_default: true
+
+  - code: SHORT_DEADLINE
+    name: 投标准备期不足
+    owner_agent: ProcedureAgent
+    severity: Medium
+    critical_default: false
+
+  - code: EXCESSIVE_DEPOSIT
+    name: 投标保证金比例过高
+    owner_agent: ProcedureAgent
+    severity: Medium
+    critical_default: false
+
+  - code: OEM_AUTHORIZATION
+    name: 将厂家授权作为资格条件
+    owner_agent: ProcedureAgent
+    severity: High
+    critical_default: true
+
+  - code: SUBJECTIVE_SCORING
+    name: 主观评分未细化量化
+    owner_agent: ScoringAgent
+    severity: Medium
+    critical_default: false
+
+  - code: LOCAL_AWARD
+    name: 本地奖项加分
+    owner_agent: ScoringAgent
+    severity: Medium
+    critical_default: false
+
+  - code: VAGUE_ACCEPTANCE
+    name: 验收标准模糊
+    owner_agent: ContractAgent
+    severity: Medium
+    critical_default: false
+
+  - code: UNBOUNDED_IP
+    name: 知识产权责任无限扩大
+    owner_agent: ContractAgent
+    severity: High
+    critical_default: true
+
+  - code: UNILATERAL_CHANGE
+    name: 采购人可单方无限变更需求
+    owner_agent: ContractAgent
+    severity: High
+    critical_default: true
+
+  - code: CONFLICTING_DATES
+    name: 关键日期相互矛盾
+    owner_agent: FactCheckAgent
+    severity: Medium
+    critical_default: false
+
+  - code: UNCLEAR_PENALTY
+    name: 违约责任口径不清
+    owner_agent: ContractAgent
+    severity: Medium
+    critical_default: false
