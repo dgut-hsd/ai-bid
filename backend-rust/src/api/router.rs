@@ -299,6 +299,7 @@ fn hex_nibble(value: u8) -> Option<u8> {
             handlers::ReviewAccepted,
             handlers::ReviewResponse,
             handlers::ReviewResultResponse,
+            handlers::ReviewUsage,
             handlers::SearchResponse,
             handlers::SearchResultGroup,
             handlers::SearchHitDto,
