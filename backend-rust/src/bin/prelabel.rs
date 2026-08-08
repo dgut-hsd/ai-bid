@@ -105,7 +105,7 @@ fn extract_clauses(sections: &[GoldenSection]) -> Vec<(String, String, String)> 
 
 // ── Main ────────────────────────────────────────────────────────
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv::dotenv().ok();
     if let Some(parent) = std::env::current_dir().ok().and_then(|d| d.parent().map(|p| p.join(".env"))) {
         if parent.exists() {
@@ -116,14 +116,14 @@ fn main() {
     // 1. Load golden fixture
     let fixture_path = "tests/fixtures/golden_sections.json";
     let data = std::fs::read_to_string(fixture_path)
-        .expect("Failed to read golden_sections.json");
+        .map_err(|e| format!("Failed to read {fixture_path}: {e}. Run from backend-rust/ dir."))?;
     let doc: GoldenDocument = serde_json::from_str(&data)
-        .expect("Failed to parse golden_sections.json");
+        .map_err(|e| format!("Failed to parse {fixture_path}: {e}"))?;
 
     // 2. Load YAML rulebook
     let rulebook_path = "src/rules/data/conditions.yaml";
     let (rulebook, warnings) = load_rulebook(Path::new(rulebook_path))
-        .expect("Failed to load conditions.yaml");
+        .map_err(|e| format!("Failed to load {rulebook_path}: {e}. Run from backend-rust/ dir."))?;
     if !warnings.is_empty() {
         eprintln!("??  Rulebook warnings:");
         for w in &warnings {
@@ -352,5 +352,7 @@ fn main() {
     }
 
     // Print JSON to stdout for piping
-    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    Ok(())
 }

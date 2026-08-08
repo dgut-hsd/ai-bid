@@ -41,7 +41,7 @@ fn canonical_from_blind(code: &str) -> &str {
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv::dotenv().ok();
     if let Some(parent) = std::env::current_dir()
         .ok()
@@ -55,7 +55,7 @@ fn main() {
     // 1. Load rulebook
     let rulebook_path = "src/rules/data/conditions.yaml";
     let (book, warnings) = load_rulebook(Path::new(rulebook_path))
-        .expect("Failed to load conditions.yaml");
+        .map_err(|e| format!("Failed to load {rulebook_path}: {e}. Run from backend-rust/ dir."))?;
     if !warnings.is_empty() {
         eprintln!("??  Rulebook warnings: {}", warnings.len());
     }
@@ -64,12 +64,13 @@ fn main() {
     // 2. Load annotations
     let ann_path = "../benchmark/blind-v2/data/annotations.jsonl";
     let raw = std::fs::read_to_string(ann_path)
-        .expect("Failed to read annotations.jsonl");
-    let annotations: Vec<Annotation> = raw
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).expect("Failed to parse annotation"))
-        .collect();
+        .map_err(|e| format!("Failed to read {ann_path}: {e}. Run from backend-rust/ dir."))?;
+    let mut annotations: Vec<Annotation> = Vec::new();
+    for (i, l) in raw.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+        let ann: Annotation = serde_json::from_str(l)
+            .map_err(|e| format!("Failed to parse annotation on line {}: {e}", i + 1))?;
+        annotations.push(ann);
+    }
     eprintln!("Loaded {} ground truth annotations", annotations.len());
 
     // 3. Evaluate each annotation
@@ -254,5 +255,7 @@ fn main() {
         "baseline": { "recall": 0.70, "precision": 0.568, "f1": 0.627, "critical_recall": 0.30 },
         "per_category": per_category,
     });
-    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    Ok(())
 }
