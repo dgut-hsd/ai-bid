@@ -683,6 +683,20 @@ mod tests {
             ),
             // YAML + 硬编码并集: PRIC_SUBJECTIVE_RE（regex）+ 硬编码关键词
             ("技术方案由评委综合判断优劣情况", &["SUBJECTIVE_SCORING"]),
+            // ── 边界：空条款 → 无候选 ──
+            ("", &[]),
+            // ── 边界：无匹配条款 → 无候选 ──
+            ("这是一般商务条款，不涉及风险。", &[]),
+            // ── 边界：YAML chapter_keywords + all_match（DISC_LOCAL_REG_CITY）──
+            ("投标人资格：须在本市注册的企业", &["LOCAL_REGISTRATION"]),
+            // ── 边界：YAML absence 模式（SAFE_ACCEPTANCE_ABSENCE → VAGUE_ACCEPTANCE）──
+            // 施工资质章节中未提及"安全生产许可证"即触发 absence
+            (
+                "安全生产施工资质要求：施工单位须具备相关施工资质。",
+                &["VAGUE_ACCEPTANCE"],
+            ),
+            // ── 边界：YAML field_compare（PRIC_EXCESSIVE_DEPOSIT_RATIO: deposit_ratio > 0.02）──
+            ("投标保证金不得超过估算价的5%", &["EXCESSIVE_DEPOSIT"]),
         ]);
 
         // ── Stage 2: 证据分类 + Critical 判定（normalize_finding） ──
@@ -719,6 +733,19 @@ mod tests {
             // YAML 无匹配 + 硬编码也无匹配：回退到 alias 归一化
             ("DATE_CONFLICT", "投标截止时间为[日期]9时，同时规定[日期]17时后提交的文件一律拒收。", "CONFLICTING_DATES", false),
         ]);
+
+        // ── Stage 3: 边界情况（normalize_finding 需要特殊构造） ──
+
+        // Edge: no_risk=true → 不应标记 Critical
+        let mut f = finding("SHORT_DEADLINE", "仅5日递交投标文件");
+        f.no_risk = true;
+        crate::rules::engine::normalize_finding(&mut f);
+        assert!(!f.is_critical, "no_risk=true 不应标记为 Critical");
+
+        // Edge: 空 source_quote → 不应标记 Critical
+        let mut f = finding("SHORT_DEADLINE", "");
+        crate::rules::engine::normalize_finding(&mut f);
+        assert!(!f.is_critical, "空 source_quote 不应标记为 Critical");
     }
 
     /// 汇总报告：输出 15 类的覆盖矩阵，供 bin/test_rules 离线查看。
