@@ -7,6 +7,7 @@ use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
 
 use super::handlers::{self, AppState};
+use super::knowledge_handlers;
 use crate::agents::types::{
     BlockRef, ChatResponse, Citation, CoordinatorOutput, GraphSnapshot, KnowledgeRef, RiskFinding,
     RiskSeverity, RiskTier, RoutingSummary, SuggestedAgent, TextSelection,
@@ -159,6 +160,16 @@ pub fn build(state: AppState) -> Router {
         )
         .route("/documents/:id/search", post(handlers::search_document))
         .route("/documents/:id/blocks", get(handlers::get_block_bboxes))
+        // 知识库导入（法规/标准库，入库组）
+        .route(
+            "/knowledge/ingest",
+            post(knowledge_handlers::ingest_knowledge),
+        )
+        // 知识库检索（检索组）
+        .route(
+            "/knowledge/search",
+            post(knowledge_handlers::search_knowledge),
+        )
         // SSE 实时推送 + 异步审查结果
         .route(
             "/review/:doc_id/stream",

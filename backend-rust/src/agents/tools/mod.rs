@@ -43,6 +43,7 @@ pub mod read_section;
 pub mod search_contradiction;
 pub mod search_document;
 pub mod search_knowledge;
+pub mod search_knowledge_base;
 pub mod validate_calculation;
 
 // ─── AgentTool trait ──────────────────────────────────────────
