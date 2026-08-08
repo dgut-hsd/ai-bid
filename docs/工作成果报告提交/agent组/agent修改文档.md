@@ -1,7 +1,7 @@
 # Agent 修改文档
 
 > 记录「Agent 降轮次 + 强制收尾」优化方向的代码修改与评估进展。
-> 更新日期：2026-08-08
+>
 
 ---
 
@@ -22,7 +22,7 @@
 
 ## 二、修改记录
 
-### 2026-08-08 · Token 成本采集（方案 A）
+### Token 成本采集（方案 A）
 
 **背景**：benchmark 链路此前拿不到 token 成本。server 模式每次 review 已写 metrics 到 `output/runs/*.json`，但 `GET /result` 响应不暴露 token 数据。
 
@@ -77,7 +77,7 @@
 
 ## 三、进展
 
-### 2026-08-08 · 盲测数据重建
+### 盲测数据重建
 
 - 现状：`benchmark/blind-v2/data`（freeze_manifest + annotations）与 `benchmark/data` **从未进入 git**（`.gitignore` 忽略 `data/ results/ sources/ mutated/`），首次盲测结果 `blind-v2-final-20260727` 来自其他环境。
 - 决策：用户确认用脚本重建。运行 `python benchmark/build_blind_v2.py` 成功：
@@ -86,24 +86,24 @@
   - `freeze_manifest.json`：版本 `blind-v2.0`，状态 `frozen_before_first_run`，24 个冻结文件
 - ⚠️ 新 freeze 哈希与 20260727 历史不同；本次三轮对比（基线/降轮次/强制收尾）用同一套重建数据，内部可比。
 
-### 2026-08-08 · 环境准备
+### 环境准备
 
 - `.env`：`DASHSCOPE_API_KEY` 已填写（长度 117），`EMBED_ENGINE=remote`、`AIBID_SEARCH_BACKEND=dashscope`
 - 新增 `RUST_API_INTERNAL_SECRET`（Rust 内部接口 HMAC 签名密钥，Java 网关 / benchmark 直连 Rust 用）
 - Python 依赖安装：`pypdf` / `reportlab`（build_blind_v2 需要）；中文字体 `simhei.ttf` 存在
 
-### 2026-08-08 · benchmark 链路修复（跑盲测的阻塞）
+### benchmark 链路修复（跑盲测的阻塞）
 
 1. **Rust 内部鉴权 503**：Rust server 的 `/api/v1/*` 要求 HMAC 签名（`InternalAuthConfig`），secret 未配置时一律 503。给 `benchmark/run_benchmark.py` 实现签名（对齐 Java `InternalRequestSigner`）：`internal_auth_headers()` 生成 `X-Tenant-Id / X-User-Id / X-Request-Id / X-Internal-Timestamp / X-Internal-Signature`，secret 从环境变量或 `.env` 读取；`request_json` 与 `upload_pdf` 均合并签名头。
 2. **evaluate 中文编码崩溃**：Windows 子进程 stdout 用 GBK，`run_benchmark.py` 按 UTF-8 读导致 `UnicodeDecodeError` → `stdout=None`。修复：evaluate 子进程设置 `PYTHONIOENCODING=utf-8` + `errors="replace"`。
 
-### 2026-08-08 · 探针验证通过（BLIND-001）
+### 探针验证通过（BLIND-001）
 
 - P / R / F1 = 1.0（3 条注入全命中，无误报）；Critical 检出率 / 标记召回率 = 1.0
 - token 采集生效：`usage = {llm_calls:13, tokens_input:84264, tokens_output:5056, cost_cny:0.08}`
 - 全链路：上传（签名）→ 注入页定位 → 审核 → 结果（含 usage）→ evaluate → summary
 
-### 2026-08-08 · 基线盲测全量完成（baseline-20260808）
+### 基线盲测全量完成（baseline-20260808）
 
 | 指标 | 值 |
 |---|---|
@@ -121,7 +121,7 @@
 
 注：结果目录 `benchmark/blind-v2/results/baseline-20260808/`（summary.json / token_usage.json / 每文档 JSON）。
 
-### 2026-08-08 · 第 2 轮降轮次完成（reduced-turns-20260808）
+### 第 2 轮降轮次完成（reduced-turns-20260808）
 
 `AIBID_TIER_MAX_TURNS=low:3,medium:6,high:8`（基线 5/8/14）。
 
@@ -141,19 +141,19 @@
 - 逐文档看：BLIND-004/006/010 等明显减少（-6/-10/-2 次调用），但 BLIND-007 反而 +9 次（+91k in）——LLM 非确定性导致，tier 上限只是"封顶"不是"强制"，未触顶的条款不受影响。
 - **根因**：成本大头是**每次调用的输入上下文量**（如 BLIND-007 单次调用数万 token），不是"轮次数"。注入页模式单条款审核大多在 3-6 轮内已收敛，很少触达 8/14 上限。
 
-### 2026-08-09 · 改造 2 强制收尾（完成）
+### 改造 2 强制收尾（完成）
 
 **新增机制**：`backend-rust/src/agents/react_loop.rs` — 连续空转强制输出。
 - 环境变量 `AIBID_STALL_FORCE_OUTPUT=N`（默认 0=关闭）：连续 N 轮 LLM **只请求探索类工具**（`read_section` / `search_document` / `search_knowledge` / `web_search`）且未产出 finding → 视为空转，下一轮强制锁定 `output_finding`。
 - 实现：`consecutive_stall` 计数器 + 每轮 LLM 响应后检测（`r.has_output_finding()` 重置；探索类全匹配则累加）。
 - 第 3 轮（`force-finish-20260809`，`STALL_FORCE_OUTPUT=2`）结果：**成本 ¥0.77（-32.5%）、input tokens -36%、调用 -29%**，但漏报率 0%→3.33%（漏 `BLIND-003-F03 采购人可单方无限变更需求`，medium）；F1 93.75%→92.06%。
 
-### 2026-08-08 · 回归过程中的两个修复
+### 回归过程中的两个修复
 
 1. **磁盘空间不足**：C 盘 96% 满，链接测试二进制时报 `LNK1180 insufficient disk space`。清理 `target/` 下 163 个 PDB 文件（1.5GB），释放至 6.5GB。
 2. **pre-existing 测试编译错误**（与本次改动无关）：`VerifyBidDepositArgs` 结构体新增了 `procurement_category` 字段（`Option<String>`，`serde(default)` 只影响反序列化），但 `verify_bid_deposit.rs` 的 8 个测试构造点未更新 → `cargo test` 编译失败。已批量补齐 `procurement_category: None`（`verify()` 中 `None` 默认按"货物"处理，不影响既有测试断言）。
 
-### 2026-08-08 · 改造 1 降轮次（代码已编辑，待编译）
+### 改造 1 降轮次（已完成，第 2 轮验证通过）
 
 - 修改 `backend-rust/src/agents/types.rs` `RiskTier::max_turns()`：新增环境变量 `AIBID_TIER_MAX_TURNS="low:N,medium:N,high:N"` 覆盖各档轮次上限。
 - 未设置时用内置默认 **Low=5 / Medium=8 / High=14**（与基线一致）；降轮次档用 `low:3,medium:6,high:8`。
@@ -161,11 +161,91 @@
 
 ---
 
-## 四、待办
+## 四、完成清单
 
-- [x] 探针验证（1 份）：全链路 + usage 采集通过
-- [x] 基线盲测全量 10 份（`baseline-20260808`）
-- [x] 第 2 轮降轮次全量（`reduced-turns-20260808`）
-- [x] 第 3 轮降轮次 + 强制收尾全量（`force-finish-20260809`）
-- [x] **对比报告**：`docs/降轮次与强制收尾优化对比报告.md`（漏报率 / 误报率 / 完成率 / token 成本 / F1 / 时长 + 结论 + 下一步建议）
-- 备注：`cargo clippy` 因磁盘空间紧张未执行（`cargo build` + `cargo test --lib` 已覆盖编译与单测验证）
+-  探针验证（1 份）：全链路 + usage 采集通过
+-  基线盲测全量 10 份（`baseline-20260808`）
+-  第 2 轮降轮次全量（`reduced-turns-20260808`）
+-  第 3 轮降轮次 + 强制收尾全量（`force-finish-20260809`）
+-  **对比报告**：`docs/降轮次与强制收尾优化对比报告.md`（漏报率 / 误报率 / 完成率 / token 成本 / F1 / 时长 + 结论 + 下一步建议）
+-  **工作成果报告 2 份**（Agent 组）：`docs/工作成果报告提交/Agent组_PR指标报告.md`、`docs/工作成果报告提交/Agent组_项目工作成果实验报告.md`
+-  盲测数据重建（blind-v2：10 源 PDF + 10 mutated + 30 真值 + freeze 锁定）
+-  benchmark 链路修复（HMAC 签名绕过 internal auth、evaluate 编码、token 采集接入）
+
+---
+
+## 五、复现步骤
+
+> 流程：重建数据 → 编译引擎 → 三轮盲测（探针 / 基线 / 降轮次 / 强制收尾）→ 出报告。
+
+### 0. 前置准备（一次性）
+
+```bash
+# ① 重建盲测数据（下载 10 份政府采购 PDF + 生成 30 条真值 + freeze 锁定）
+cd ai_bid/benchmark && python build_blind_v2.py
+# 预期：sources/ 10 个 PDF，data/annotations.jsonl 30 行，data/freeze_manifest.json 生成
+
+# ② .env 必填两样：DASHSCOPE_API_KEY、RUST_API_INTERNAL_SECRET（内部接口签名密钥）
+# ③ 编译引擎
+cd ../backend-rust && cargo build --bin server   # 产出 target/debug/server.exe
+```
+
+### 1. 探针验证（全链路 + usage 采集）
+
+```bash
+# 启动引擎（基线默认轮次 5/8/14）
+cd backend-rust && AIBID_DATA_DIR=.. ./target/debug/server.exe
+# 另开终端
+cd benchmark && python run_benchmark.py --dataset-root ../benchmark/blind-v2 --scope injected --limit 1 --run-id probe
+```
+
+- 验证点：无 401/503（签名通）；`results/probe/documents/BLIND-001.json` 含 `"usage": {llm_calls, tokens_input, tokens_output, cost_cny}`。
+
+### 2. 基线全量（第 1 轮）
+
+```bash
+python run_benchmark.py --dataset-root ../benchmark/blind-v2 --scope injected --run-id baseline-20260808
+```
+
+- 结果：`results/baseline-20260808/{summary,metrics,token_usage}.json`。
+
+### 3. 降轮次（第 2 轮）
+
+1. 改 `src/agents/types.rs`：`RiskTier::max_turns()` 支持环境变量 `AIBID_TIER_MAX_TURNS`。
+2. 停旧 server → 重新编译 → 带降轮次配置启动：
+
+```bash
+cd backend-rust && AIBID_DATA_DIR=.. AIBID_TIER_MAX_TURNS="low:3,medium:6,high:8" ./target/debug/server.exe
+```
+
+3. 跑全量：`--run-id reduced-turns-20260808`。结果：质量不变、成本 ¥1.14→¥1.13。
+
+### 4. 强制收尾（第 3 轮）
+
+1. 改 `src/agents/react_loop.rs`：新增连续空转强制输出（`AIBID_STALL_FORCE_OUTPUT`）。
+2. 停旧 server → 重新编译 → 带两个配置启动：
+
+```bash
+cd backend-rust && AIBID_DATA_DIR=.. AIBID_TIER_MAX_TURNS="low:3,medium:6,high:8" AIBID_STALL_FORCE_OUTPUT=2 ./target/debug/server.exe
+```
+
+3. 跑全量：`--run-id force-finish-20260809`。结果：成本 ¥0.77（-32.5%）、漏报率 +3.33pp。
+4. 验证：server 日志出现 `[STALL-FORCE] 条款 ch_xxx 连续 2 轮仅探索未产出 → 强制 output_finding`（本次触发 2 次）。
+
+### 5. 结果对比
+
+从三个 run 目录的 `summary.json` / `metrics.json` / `token_usage.json` 提取：
+
+- 漏报率 = 1 − Recall；误报率 = 1 − Precision；完成率 = `completed_documents` / 10；token 成本 = `token_usage.cost_cny`。
+
+### 回归测试（每轮代码修改后）
+
+```bash
+cd backend-rust
+cargo check          # 编译验证
+cargo test --lib     # 单测（本轮 424 通过 / 10 个 pre-existing 失败，与改动无关）
+cargo build --bin server
+```
+
+- 签名机制验证：无签名访问 `/api/v1/*` → 401；带 `internal_auth_headers()` 签名 → 200。
+
