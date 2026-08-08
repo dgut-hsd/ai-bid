@@ -8,6 +8,10 @@
 
 use crate::agents::types::{RiskFinding, RiskSeverity};
 use crate::rules::catalog::{owner_agent, CATEGORIES};
+use crate::rules::metrics::DocumentMetrics;
+use crate::rules::schema::RuleBook;
+use crate::rules::validator::{evaluate_rulebook, load_rulebook};
+use std::sync::OnceLock;
 
 /// 关键词 OR 匹配（从 risk_taxonomy.rs 迁入）。
 fn contains_any(text: &str, words: &[&str]) -> bool {
@@ -253,6 +257,71 @@ fn critical_evidence(code: &str, quote: &str) -> bool {
     }
 }
 
+// ── YAML 规则库接入（离线缓存 + 主链路集成）─────────────────────────────
+
+const RULEBOOK_PATH: &str = "src/rules/data/conditions.yaml";
+
+/// 惰性加载规则库，加载失败时使用空规则库（静默降级）。
+fn get_rulebook() -> &'static RuleBook {
+    static RULEBOOK: OnceLock<RuleBook> = OnceLock::new();
+    RULEBOOK.get_or_init(|| match load_rulebook(RULEBOOK_PATH) {
+        Ok((book, warnings)) => {
+            if !warnings.is_empty() {
+                eprintln!("[rules] Rulebook warnings: {}", warnings.len());
+            }
+            book
+        }
+        Err(e) => {
+            eprintln!("[rules] Warning: YAML rulebook not loaded ({e}), continuing without YAML.");
+            RuleBook { rules: vec![] }
+        }
+    })
+}
+
+/// 将 YAML category String 映射回 `&'static str` canonical code。
+fn category_to_static(cat: &str) -> Option<&'static str> {
+    CATEGORIES
+        .iter()
+        .find_map(|(code, _)| (*code == cat).then_some(*code))
+}
+
+/// 对条款文本执行 YAML 规则求值，返回去重后的 canonical category 列表。
+fn yaml_candidate_categories(text: &str) -> Vec<&'static str> {
+    let book = get_rulebook();
+    if book.rules.is_empty() {
+        return vec![];
+    }
+    let metrics = DocumentMetrics::extract_from_clause_text(text);
+    let hits = evaluate_rulebook(book, text, &metrics);
+    let mut result: Vec<&'static str> = Vec::new();
+    for (_, category) in hits {
+        if let Some(static_cat) = category_to_static(&category) {
+            if !result.contains(&static_cat) {
+                result.push(static_cat);
+            }
+        }
+    }
+    result
+}
+
+/// 检查文本是否匹配 YAML 中 severity=Critical 的规则。
+fn yaml_is_critical(quote: &str) -> bool {
+    let book = get_rulebook();
+    if book.rules.is_empty() {
+        return false;
+    }
+    let metrics = DocumentMetrics::extract_from_clause_text(quote);
+    let hits = evaluate_rulebook(book, quote, &metrics);
+    if hits.is_empty() {
+        return false;
+    }
+    hits.iter().any(|(rule_id, _)| {
+        book.rules
+            .iter()
+            .any(|r| r.id == *rule_id && r.severity == "Critical")
+    })
+}
+
 // ── Public API（被 risk_taxonomy.rs facade 委托）──────────────────────
 
 /// 对应 risk_taxonomy::canonical_category —— 签名不变。
@@ -274,6 +343,7 @@ pub fn canonical_category(finding: &RiskFinding) -> String {
 /// 对应 risk_taxonomy::candidate_categories —— 签名不变。
 pub fn candidate_categories(text: &str) -> Vec<&'static str> {
     let mut result = Vec::new();
+    // ── 硬编码分支（已有，行为兼容） ──
     for segment in text.split(['\n', '。', '；']) {
         if let Some(category) = category_from_evidence(segment)
             && !result.contains(&category)
@@ -285,6 +355,12 @@ pub fn candidate_categories(text: &str) -> Vec<&'static str> {
         && !result.contains(&category)
     {
         result.push(category);
+    }
+    // ── YAML 分支（新增，取并集） ──
+    for category in yaml_candidate_categories(text) {
+        if !result.contains(&category) {
+            result.push(category);
+        }
     }
     result
 }
@@ -350,7 +426,8 @@ pub fn normalize_finding(finding: &mut RiskFinding) {
 
     let is_critical = !finding.no_risk
         && !finding.source_quote.trim().is_empty()
-        && critical_evidence(&category, finding.source_quote.trim());
+        && (critical_evidence(&category, finding.source_quote.trim())
+            || yaml_is_critical(finding.source_quote.trim()));
     finding.is_critical = is_critical;
     if is_critical {
         finding.severity = RiskSeverity::High;
@@ -566,6 +643,46 @@ mod tests {
 
     /// 汇总报告：输出 15 类的覆盖矩阵，供 bin/test_rules 离线查看。
     /// 这个测试本身就是模拟数据集的"快照"。
+    // ── YAML 接入主链路（TDD 测试用例）────────────────────────────────
+
+    #[test]
+    fn yaml_candidate_catches_excessive_deposit_without_投标保证金_keyword() {
+        // YAML rule PRIC_EXCESSIVE_DEPOSIT_PCT_RE 匹配 "6%的保证金"（regex）
+        // 硬编码 category_from_evidence 要求 "投标保证金" 关键词，不存在时不命中
+        let text = "投标人应缴纳采购预算总额6%的保证金";
+        let candidates = candidate_categories(text);
+        assert!(
+            candidates.contains(&"EXCESSIVE_DEPOSIT"),
+            "YAML 应捕获 EXCESSIVE_DEPOSIT（6%的保证金，硬编码需要投标保证金）"
+        );
+    }
+
+    #[test]
+    fn yaml_candidate_preserves_hardcoded_results() {
+        // 硬编码应仍然捕获 LOCAL_REGISTRATION（回归测试）
+        let text = "投标人须在本市注册成立三年以上，且在本市设有分支机构。";
+        let candidates = candidate_categories(text);
+        assert!(candidates.contains(&"LOCAL_REGISTRATION"));
+    }
+
+    #[test]
+    fn normalize_finding_yaml_critical_supplements_hardcoded() {
+        // DISC_BRAND_ALIAS（severity=Critical, no chapter_keywords）
+        // 应通过 YAML 路径标记为 Critical
+        let mut f = finding("BRAND_LOCK", "指定品牌XYZ型号的投标");
+        normalize_finding(&mut f);
+        assert_eq!(f.category_code, "BRAND_LOCK");
+        assert!(f.is_critical, "YAML rule DISC_BRAND_ALIAS severity=Critical 应标记为 Critical");
+    }
+
+    #[test]
+    fn normalize_finding_yaml_does_not_cause_false_critical_for_non_critical() {
+        // SHORT_DEADLINE YAML 规则 severity=Medium，不应误标 Critical
+        let mut f = finding("SHORT_DEADLINE", "投标人须在3日内递交投标文件。");
+        normalize_finding(&mut f);
+        assert!(!f.is_critical, "SHORT_DEADLINE YAML severity=Medium 不应标记为 Critical");
+    }
+
     #[test]
     fn critical_coverage_summary_report() {
         let critical_cases = vec![
