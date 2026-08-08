@@ -1,4 +1,4 @@
-//! Pre-labeling binary ¡ª extracts clauses from golden fixtures, runs them
+//! Pre-labeling binary â€” extracts clauses from golden fixtures, runs them
 //! through the YAML rule engine + legacy keyword engine, and outputs a
 //! structured JSON report for Golden Standard construction.
 //!
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
 
-// ©¤©¤ Fixture data model ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ Fixture data model â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Deserialize)]
 struct GoldenDocument {
@@ -39,7 +39,7 @@ struct GoldenSection {
     page_end: u32,
 }
 
-// ©¤©¤ Output schema ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ Output schema â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Debug, Serialize)]
 struct ClauseAnnotation {
@@ -80,7 +80,7 @@ struct ReportSummary {
     rulebook_path: String,
 }
 
-// ©¤©¤ Recursive clause extraction ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ Recursive clause extraction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn extract_clauses(sections: &[GoldenSection]) -> Vec<(String, String, String)> {
     let mut clauses = Vec::new();
@@ -103,9 +103,9 @@ fn extract_clauses(sections: &[GoldenSection]) -> Vec<(String, String, String)> 
     clauses
 }
 
-// ©¤©¤ Main ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+// â”€â”€ Main â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     dotenv::dotenv().ok();
     if let Some(parent) = std::env::current_dir().ok().and_then(|d| d.parent().map(|p| p.join(".env"))) {
         if parent.exists() {
@@ -116,14 +116,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load golden fixture
     let fixture_path = "tests/fixtures/golden_sections.json";
     let data = std::fs::read_to_string(fixture_path)
-        .map_err(|e| format!("Failed to read {fixture_path}: {e}. Run from backend-rust/ dir."))?;
+        .expect("Failed to read golden_sections.json");
     let doc: GoldenDocument = serde_json::from_str(&data)
-        .map_err(|e| format!("Failed to parse {fixture_path}: {e}"))?;
+        .expect("Failed to parse golden_sections.json");
 
     // 2. Load YAML rulebook
     let rulebook_path = "src/rules/data/conditions.yaml";
     let (rulebook, warnings) = load_rulebook(Path::new(rulebook_path))
-        .map_err(|e| format!("Failed to load {rulebook_path}: {e}. Run from backend-rust/ dir."))?;
+        .expect("Failed to load conditions.yaml");
     if !warnings.is_empty() {
         eprintln!("??  Rulebook warnings:");
         for w in &warnings {
@@ -228,11 +228,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
 
         let note = if raw_hits.is_empty() {
-            "ÎŞ¹æÔòÃüÖĞ".into()
+            "æ— è§„åˆ™å‘½ä¸­".into()
         } else if finding.is_critical {
             format!("??  Critical: {}", finding.critical_reason)
         } else {
-            format!("ÃüÖĞ {} Ìõ¹æÔò£¬·Ç Critical", raw_hits.len())
+            format!("å‘½ä¸­ {} æ¡è§„åˆ™ï¼Œé Critical", raw_hits.len())
         };
 
         if !raw_hits.is_empty() {
@@ -310,25 +310,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Print summary to stderr
-    eprintln!("\n¨X¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨[");
-    eprintln!("¨U  Pre-labeling Report ¡ª Golden Fixture      ¨U");
-    eprintln!("¨^¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨a");
+    eprintln!("\nâ•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
+    eprintln!("â•‘  Pre-labeling Report â€” Golden Fixture      â•‘");
+    eprintln!("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
     eprintln!("  Document: {}", doc.source_path);
     eprintln!("  Fixture:  {fixture_path}");
     eprintln!("  Rulebook: {rulebook_path}");
-    eprintln!("  ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤");
+    eprintln!("  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€");
     eprintln!("  Total clauses:        {}", summary.total_clauses);
     eprintln!("  Clauses with hits:    {}", summary.clauses_with_hits);
     eprintln!("  Total rule hits:      {}", summary.total_hits);
     eprintln!("  Critical clauses:     {}", summary.critical_clauses);
     eprintln!("  Critical rate:        {:.1}%", summary.critical_rate * 100.0);
-    eprintln!("  ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤");
+    eprintln!("  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€");
     eprintln!("  Category distribution:");
     for (cat, count) in &summary.category_distribution {
-        let display = display_name(cat).unwrap_or("¡ª");
+        let display = display_name(cat).unwrap_or("â€”");
         eprintln!("    {:<25} {:>3}  ({})", cat, count, display);
     }
-    eprintln!("  ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤");
+    eprintln!("  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€");
     eprintln!("  Top clauses:");
     for ann in annotations.iter().filter(|a| a.is_critical).take(5) {
         let title_short: String = ann.section_title.chars().take(28).collect();
@@ -352,6 +352,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Print JSON to stdout for piping
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
 }

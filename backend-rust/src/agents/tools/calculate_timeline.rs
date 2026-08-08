@@ -18,7 +18,7 @@
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::AgentTool;
 
@@ -182,7 +182,6 @@ impl CalculateTimelineTool {
     /// 通过 lazy_static 初始化为 HashSet，避免每次调用重新分配。
     /// 每年需根据国务院办公厅最新通知更新。最后更新: 2025 年公告(2024-2026)。
     fn cn_holidays() -> &'static HashSet<(i32, u32, u32)> {
-        use std::collections::HashSet;
         use std::sync::OnceLock;
         static HOLIDAYS: OnceLock<HashSet<(i32, u32, u32)>> = OnceLock::new();
         HOLIDAYS.get_or_init(|| {
@@ -712,7 +711,7 @@ impl AgentTool for CalculateTimelineTool {
             .filter(|c| matches!(c.status, TimelineStatus::Pass))
             .count();
         let summary = if contradictions.is_empty() && fail_count == 0 {
-            format!("✅ 时间线合规：{} 项校验全部通过，无逻辑矛盾。", pass_count)
+            format!("? 时间线合规：{} 项校验全部通过，无逻辑矛盾。", pass_count)
         } else {
             let mut parts = Vec::new();
             if fail_count > 0 {
@@ -724,7 +723,7 @@ impl AgentTool for CalculateTimelineTool {
             if !parse_errors.is_empty() {
                 parts.push(format!("{} 个日期解析失败", parse_errors.len()));
             }
-            format!("⚠️ {}", parts.join("，"))
+            format!("?? {}", parts.join("，"))
         };
 
         let result = TimelineResult {

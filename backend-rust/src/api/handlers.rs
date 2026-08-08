@@ -900,8 +900,14 @@ async fn run_review_pipeline(
         }
         registry.register(Box::new(OutputFindingTool));
         // V2+ 工具
-        registry.register(Box::new(CompareVersionsTool));
-        registry.register(Box::new(DetectBoilerplateTool));
+        registry.register(Box::new(CompareVersionsTool::new(
+            chunk_map_for_tools.clone(),
+            chunk_order_for_tools.clone(),
+        )));
+        registry.register(Box::new(DetectBoilerplateTool::new(
+            chunk_map_for_tools.clone(),
+            chunk_order_for_tools.clone(),
+        )));
         // V3 采购程序合规审查
         registry.register(Box::new(VerifyProcurementMethodTool));
         registry.register(Box::new(VerifyBidDepositTool));
