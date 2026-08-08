@@ -10,7 +10,14 @@
  * 前端 AuditIssue 类型定义在 @/types/audit.ts。
  */
 
-import type { AuditIssue, Citation, SuggestedAgent, RiskTier, Severity } from '@/types/audit';
+import type {
+  AuditIssue,
+  Citation,
+  SuggestedAgent,
+  RiskTier,
+  Severity,
+  FindingAddedEvent,
+} from '@/types/audit';
 
 // ─── 后端原始类型 ───
 
@@ -181,3 +188,55 @@ export const ensureAuditIssue = (item: Record<string, unknown>): AuditIssue =>
   isBackendFormat(item)
     ? mapBackendFinding(item as unknown as BackendFinding)
     : (item as unknown as AuditIssue);
+
+/**
+ * SSE `finding_added` 事件 → 前端 AuditIssue。
+ *
+ * 与 mapBackendFinding 的区别：SSE 事件是「流式阶段的轻量快照」，
+ * 字段比最终 result 少（无 case_refs / citations / suggested_agent / _tier 系列 / context）。
+ *
+ * 注意 blockIds 固定为空数组：Rust 的 ReviewEvent::FindingAdded 目前不下发 block_ids
+ * （仅最终 /result 才带坐标），所以流式阶段的卡片只能走文本匹配定位，画不出 BBox 框；
+ * 待审核完成、拉取 /result 后由 mapBackendFinding 覆盖为带 blockIds 的完整版。
+ */
+export const mapFindingAddedEvent = (event: FindingAddedEvent): AuditIssue => {
+  const severity: Severity = isValidSeverity(event.severity)
+    ? event.severity
+    : 'info';
+
+  const sectionPath = Array.isArray(event.section_path) ? event.section_path : [];
+  const sectionName =
+    sectionPath.length > 0 ? sectionPath.join(' > ') : undefined;
+
+  return {
+    issueNo: event.risk_id,
+    riskId: event.risk_id,
+    severity,
+    isCritical: event.is_critical ?? false,
+    criticalReason: event.critical_reason,
+    category: event.risk_type || '未分类',
+    agentName: event.agent,
+    agent: event.agent,
+    noRisk: false,
+    description: event.reason || '',
+    suggestion: event.suggestion || '',
+    sourceQuote: event.source_quote,
+    legalBasis: Array.isArray(event.legal_basis) ? event.legal_basis : [],
+    caseRefs: [],
+    citations: [],
+    confidence: typeof event.confidence === 'number' ? event.confidence : undefined,
+    anchorPage:
+      typeof event.page_number === 'number' && event.page_number >= 0
+        ? event.page_number
+        : undefined,
+    anchorSection: sectionName,
+    anchorQuote: event.source_quote,
+    location: {
+      pageNumber: event.page_number ?? 0,
+      sectionName: sectionName || '',
+      context: event.source_quote || '',
+    },
+    clauseIds: Array.isArray(event.clause_ids) ? event.clause_ids : [],
+    blockIds: [],
+  };
+};

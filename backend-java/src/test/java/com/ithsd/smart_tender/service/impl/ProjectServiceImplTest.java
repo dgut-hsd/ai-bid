@@ -3,6 +3,9 @@ package com.ithsd.smart_tender.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.ithsd.smart_tender.common.BaseContext;
+import com.ithsd.smart_tender.common.TenantContext;
+import com.ithsd.smart_tender.common.TenantAuthException;
+import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.mapper.AuditReportMapper;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
@@ -71,15 +74,22 @@ class ProjectServiceImplTest {
     private ArgumentCaptor<LambdaQueryWrapper<AuditReport>> auditReportWrapperCaptor;
 
     private static final Long TEST_USER_ID = 10001L;
+    private static final Long TEST_TENANT_ID = 20001L;
+    private static final Long ANOTHER_TENANT_ID = 20002L;
     private static final Long TEST_PROJECT_ID = 20001L;
 
     @BeforeEach
     void setUp() {
         BaseContext.setCurrentId(TEST_USER_ID);
+        TenantContext.set(new TenantRequestContext(
+                TEST_USER_ID, TEST_TENANT_ID, "OWNER", 1L, "project-test"));
+        lenient().when(projectMapper.selectOne(any()))
+                .thenReturn(Project.builder().tenantId(TEST_TENANT_ID).build());
     }
 
     @AfterEach
     void tearDown() {
+        TenantContext.clear();
         BaseContext.removeCurrentId();
     }
 
@@ -93,6 +103,7 @@ class ProjectServiceImplTest {
         ProjectDTO dto = new ProjectDTO();
         dto.setProjectName("XX项目招标书审核");
         dto.setSupplierName("XX建设集团有限公司");
+        dto.setTenantId(ANOTHER_TENANT_ID);
 
         doAnswer(invocation -> {
             Project p = invocation.getArgument(0);
@@ -119,6 +130,7 @@ class ProjectServiceImplTest {
         assertEquals("XX项目招标书审核", captured.getProjectName());
         assertEquals("XX建设集团有限公司", captured.getSupplierName());
         assertEquals(TEST_USER_ID, captured.getUserId());
+        assertEquals(TEST_TENANT_ID, captured.getTenantId());
         assertEquals(0, captured.getParseStatus());
         assertEquals(0, captured.getLatestVersion());
         assertNotNull(captured.getCreateTime());
@@ -146,6 +158,60 @@ class ProjectServiceImplTest {
         assertEquals("最小化项目", result.getProjectName());
         assertNull(result.getSupplierName());
         assertEquals(TEST_USER_ID, result.getUserId());
+    }
+
+    @Test
+    void tenantIsolation_IgnoresClientTenantAndBlocksOtherTenantProject() {
+        TenantContext.set(new TenantRequestContext(
+                TEST_USER_ID, ANOTHER_TENANT_ID, "OWNER", 1L, "project-test-b"));
+
+        ProjectDTO createDto = new ProjectDTO();
+        createDto.setProjectName("租户B项目");
+        createDto.setTenantId(TEST_TENANT_ID);
+        doAnswer(invocation -> {
+            Project project = invocation.getArgument(0);
+            project.setId(TEST_PROJECT_ID);
+            return 1;
+        }).when(projectMapper).insert(any(Project.class));
+
+        projectService.create(createDto);
+
+        verify(projectMapper).insert(projectCaptor.capture());
+        assertEquals(ANOTHER_TENANT_ID, projectCaptor.getValue().getTenantId());
+
+        reset(projectMapper);
+        TenantContext.set(new TenantRequestContext(
+                TEST_USER_ID, TEST_TENANT_ID, "OWNER", 1L, "project-test-a"));
+        when(projectMapper.selectList(any())).thenReturn(Collections.emptyList());
+        assertTrue(projectService.listAll().isEmpty());
+
+        when(projectMapper.selectOne(any())).thenReturn(null);
+        ProjectDTO updateDto = new ProjectDTO();
+        updateDto.setId(TEST_PROJECT_ID);
+        updateDto.setProjectName("越权修改");
+
+        TenantAuthException updateError = assertThrows(TenantAuthException.class,
+                () -> projectService.update(updateDto));
+        TenantAuthException deleteError = assertThrows(TenantAuthException.class,
+                () -> projectService.delete(TEST_PROJECT_ID));
+        assertEquals(404, updateError.getStatus());
+        assertEquals("RESOURCE_NOT_FOUND", updateError.getErrorCode());
+        assertEquals(404, deleteError.getStatus());
+        assertEquals("RESOURCE_NOT_FOUND", deleteError.getErrorCode());
+        verify(projectMapper, never()).update(any(), any());
+        verify(projectMapper, never()).delete(any());
+    }
+
+    @Test
+    void tenantScopeRequired_whenContextMissing() {
+        TenantContext.clear();
+
+        TenantAuthException error = assertThrows(TenantAuthException.class,
+                () -> projectService.listAll());
+
+        assertEquals(400, error.getStatus());
+        assertEquals("TENANT_REQUIRED", error.getErrorCode());
+        assertNotNull(error.getRequestId());
     }
 
     // ----------------------------------------------------------------
@@ -185,7 +251,7 @@ class ProjectServiceImplTest {
         // Note: tenderMapper.deleteById(201L) and deleteById(202L) ARE called
         // (confirmed by mock interaction log), but Mockito's any() matcher
         // has type inference issues with MyBatis-Plus BaseMapper generics.
-        verify(projectMapper).deleteById(projectId);
+        verify(projectMapper).delete(any());
 
         // Verify the auditIssue wrapper filters by the correct audit IDs
         verify(auditIssueMapper).delete(argThat(wrapper ->
@@ -209,8 +275,8 @@ class ProjectServiceImplTest {
         verify(auditIssueMapper, never()).delete(any());
         verify(auditReportMapper, never()).delete(any());
         verify(auditTaskMapper, never()).delete(any());
-        verify(tenderMapper, never()).deleteById(any());
-        verify(projectMapper).deleteById(projectId);
+        verify(tenderMapper, never()).delete(any());
+        verify(projectMapper).delete(any());
     }
 
     @Test
@@ -232,8 +298,8 @@ class ProjectServiceImplTest {
         verify(auditIssueMapper, never()).delete(any());
         verify(auditReportMapper, never()).delete(any());
         verify(auditTaskMapper, never()).delete(any());
-        verify(tenderMapper).deleteById(tenderId);
-        verify(projectMapper).deleteById(projectId);
+        verify(tenderMapper).delete(any());
+        verify(projectMapper).delete(any());
     }
 
     @Test
@@ -258,8 +324,8 @@ class ProjectServiceImplTest {
 
         // Assert — file should be deleted
         assertFalse(tempFile.exists(), "Tender file should be deleted");
-        verify(tenderMapper).deleteById(tenderId);
-        verify(projectMapper).deleteById(projectId);
+        verify(tenderMapper).delete(any());
+        verify(projectMapper).delete(any());
     }
 
     // ----------------------------------------------------------------
@@ -280,7 +346,7 @@ class ProjectServiceImplTest {
                 .updateTime(LocalDateTime.of(2025, 1, 1, 0, 0))
                 .build();
 
-        when(projectMapper.selectById(TEST_PROJECT_ID)).thenReturn(existing);
+        when(projectMapper.selectOne(any())).thenReturn(existing);
 
         ProjectDTO dto = new ProjectDTO();
         dto.setId(TEST_PROJECT_ID);
@@ -296,7 +362,7 @@ class ProjectServiceImplTest {
         assertEquals("新项目名称", result.getProjectName());
         assertEquals("新供应商", result.getSupplierName());
 
-        verify(projectMapper).updateById(projectCaptor.capture());
+        verify(projectMapper).update(projectCaptor.capture(), any());
         Project updated = projectCaptor.getValue();
         assertEquals("新项目名称", updated.getProjectName());
         assertEquals("新供应商", updated.getSupplierName());
@@ -315,7 +381,7 @@ class ProjectServiceImplTest {
                 .supplierName("旧供应商")
                 .build();
 
-        when(projectMapper.selectById(TEST_PROJECT_ID)).thenReturn(existing);
+        when(projectMapper.selectOne(any())).thenReturn(existing);
 
         ProjectDTO dto = new ProjectDTO();
         dto.setId(TEST_PROJECT_ID);
@@ -330,7 +396,7 @@ class ProjectServiceImplTest {
         assertEquals("仅更新名称", result.getProjectName());
         assertEquals("旧供应商", result.getSupplierName());
 
-        verify(projectMapper).updateById(projectCaptor.capture());
+        verify(projectMapper).update(projectCaptor.capture(), any());
         assertEquals("仅更新名称", projectCaptor.getValue().getProjectName());
         assertEquals("旧供应商", projectCaptor.getValue().getSupplierName());
     }
@@ -338,18 +404,18 @@ class ProjectServiceImplTest {
     @Test
     void updateProject_NotExists_ReturnsNull() {
         // Arrange
-        when(projectMapper.selectById(99999L)).thenReturn(null);
+        when(projectMapper.selectOne(any())).thenReturn(null);
 
         ProjectDTO dto = new ProjectDTO();
         dto.setId(99999L);
         dto.setProjectName("不存在的项目");
 
-        // Act
-        ProjectVO result = projectService.update(dto);
-
-        // Assert
-        assertNull(result);
-        verify(projectMapper, never()).updateById(any());
+        // Act / Assert: missing and cross-tenant resources share the 404 contract.
+        TenantAuthException error = assertThrows(TenantAuthException.class,
+                () -> projectService.update(dto));
+        assertEquals(404, error.getStatus());
+        assertEquals("RESOURCE_NOT_FOUND", error.getErrorCode());
+        verify(projectMapper, never()).update(any(), any());
     }
 
     // ----------------------------------------------------------------

@@ -83,6 +83,17 @@ fn review_event_capacity() -> usize {
 }
 use crate::services::sectionize_service::{self, Section};
 
+/// Authenticated Java → Rust request identity made available to handlers via
+/// request extensions by the internal API middleware.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalRequestContext {
+    pub tenant_id: String,
+    pub user_id: String,
+    pub request_id: String,
+    pub timestamp: i64,
+    pub body_sha256: String,
+}
+
 // ─── 应用状态 ───────────────────────────────────────────────────────
 
 /// 服务全局共享状态。

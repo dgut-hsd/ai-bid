@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS `knowledge_chunk` (
   `chunk_index` int(11) NOT NULL COMMENT '块序号',
   `chunk_text` text COMMENT '文本内容',
   `chunk_length` int(11) DEFAULT NULL COMMENT '文本长度',
-  `vector_id` varchar(100) DEFAULT NULL COMMENT 'Milvus中的向量ID',
+  `vector_id` varchar(100) DEFAULT NULL COMMENT 'Qdrant中的向量ID',
   `page_number` int(11) DEFAULT NULL COMMENT '所在页码',
   `section_name` varchar(200) DEFAULT NULL COMMENT '所在章节',
   `create_time` datetime DEFAULT NULL COMMENT '创建时间',

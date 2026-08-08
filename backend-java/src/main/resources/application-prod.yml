@@ -2,6 +2,12 @@
 server:
   port: 3000
 
+security:
+  jwt:
+    secret: ${ST_JWT_SECRET:}
+    ttl-millis: ${ST_JWT_TTL_MILLIS:86400000}
+    accept-legacy-user-id: false
+
 file:
   storage:
     path: /opt/smart-tender/data/uploads

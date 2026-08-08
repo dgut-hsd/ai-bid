@@ -26,7 +26,7 @@ public interface AuditTaskMapper extends BaseMapper<AuditTask> {
             COUNT(*) AS count
         FROM audit_task
         WHERE
-            1 = 1
+            tenant_id = #{tenantId}
             <if test="bidIds != null and bidIds.size() > 0">
                 AND bid_id IN
                 <foreach item="item" collection="bidIds" open="(" separator="," close=")">
@@ -40,7 +40,9 @@ public interface AuditTaskMapper extends BaseMapper<AuditTask> {
         </script>
         """)
     @org.apache.ibatis.annotations.ResultType(java.util.Map.class)
-    List<Map<String, Object>> countByWeek(@Param("bidIds") List<Long> bidIds);
+    List<Map<String, Object>> countByWeek(
+            @Param("tenantId") Long tenantId,
+            @Param("bidIds") List<Long> bidIds);
 
     /**
      * 审核阶段事件只做单调进度推进，不参与实体乐观锁，避免多个 SSE 回调
@@ -53,10 +55,12 @@ public interface AuditTaskMapper extends BaseMapper<AuditTask> {
             progress = GREATEST(COALESCE(progress, 0), #{progress}),
             updated_at = #{updatedAt}
         WHERE task_id = #{taskId}
+          AND tenant_id = #{tenantId}
           AND task_status IN (0, 1)
         """)
     int advanceReviewProgress(
             @Param("taskId") String taskId,
+            @Param("tenantId") Long tenantId,
             @Param("progress") int progress,
             @Param("updatedAt") LocalDateTime updatedAt);
 
@@ -68,10 +72,12 @@ public interface AuditTaskMapper extends BaseMapper<AuditTask> {
             updated_at = #{endTime},
             version = version + 1
         WHERE task_id = #{taskId}
+          AND tenant_id = #{tenantId}
           AND task_status <> 2
         """)
     int markFailed(
             @Param("taskId") String taskId,
+            @Param("tenantId") Long tenantId,
             @Param("errorMsg") String errorMsg,
             @Param("endTime") LocalDateTime endTime);
 
@@ -85,9 +91,11 @@ public interface AuditTaskMapper extends BaseMapper<AuditTask> {
             updated_at = #{endTime},
             version = version + 1
         WHERE task_id = #{taskId}
+          AND tenant_id = #{tenantId}
           AND task_status <> 2
         """)
     int markCompleted(
             @Param("taskId") String taskId,
+            @Param("tenantId") Long tenantId,
             @Param("endTime") LocalDateTime endTime);
 }

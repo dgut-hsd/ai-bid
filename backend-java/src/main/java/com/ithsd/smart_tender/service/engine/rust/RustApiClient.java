@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.ithsd.smart_tender.config.RustApiProperties;
 import com.ithsd.smart_tender.common.BizException;
+import com.ithsd.smart_tender.common.TenantContext;
 import com.ithsd.smart_tender.model.dto.rust.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -49,9 +50,11 @@ public class RustApiClient {
     private final RustApiProperties properties;
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
+    private final InternalRequestSigner requestSigner;
 
     public RustApiClient(RustApiProperties properties) {
         this.properties = properties;
+        this.requestSigner = new InternalRequestSigner(properties);
         this.objectMapper = new ObjectMapper()
                 .setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
         this.httpClient = HttpClient.newBuilder()
@@ -77,8 +80,8 @@ public class RustApiClient {
                     fileBytes,
                     properties.getDesensitizationMode());
 
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(properties.apiUrl("/api/v1/documents")))
+            URI uri = URI.create(properties.apiUrl("/api/v1/documents"));
+            HttpRequest request = signedRequestBuilder("POST", uri, body)
                     .timeout(Duration.ofMillis(properties.getReadTimeoutMs()))
                     .header("Content-Type", "multipart/form-data; boundary=" + MULTIPART_BOUNDARY)
                     .POST(HttpRequest.BodyPublishers.ofByteArray(body))
@@ -113,8 +116,8 @@ public class RustApiClient {
      */
     public RustDocumentInfo getDocument(String documentId) {
         try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(properties.apiUrl("/api/v1/documents/" + documentId)))
+            URI uri = URI.create(properties.apiUrl("/api/v1/documents/" + documentId));
+            HttpRequest request = signedRequestBuilder("GET", uri, new byte[0])
                     .timeout(Duration.ofMillis(properties.getReadTimeoutMs()))
                     .GET()
                     .build();
@@ -149,13 +152,13 @@ public class RustApiClient {
      */
     public RustReviewAcceptedResponse startReview(String documentId, RustReviewRequest reviewReq) {
         try {
-            String body = objectMapper.writeValueAsString(reviewReq);
+            byte[] body = objectMapper.writeValueAsString(reviewReq).getBytes(StandardCharsets.UTF_8);
 
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(properties.apiUrl("/api/v1/documents/" + documentId + "/review")))
+            URI uri = URI.create(properties.apiUrl("/api/v1/documents/" + documentId + "/review"));
+            HttpRequest request = signedRequestBuilder("POST", uri, body)
                     .timeout(Duration.ofMillis(properties.getConnectTimeoutMs()))  // 仅连接超时，不设读超时
                     .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .POST(HttpRequest.BodyPublishers.ofByteArray(body))
                     .build();
 
             log.info("Rust review start (async): docId={}, maxClauses={}", documentId, reviewReq.getMaxClauses());
@@ -201,8 +204,8 @@ public class RustApiClient {
      */
     public RustReviewResultResponse getReviewResult(String documentId) {
         try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(properties.apiUrl("/api/v1/review/" + documentId + "/result")))
+            URI uri = URI.create(properties.apiUrl("/api/v1/review/" + documentId + "/result"));
+            HttpRequest request = signedRequestBuilder("GET", uri, new byte[0])
                     .timeout(Duration.ofMillis(properties.getReadTimeoutMs()))
                     .GET()
                     .build();
@@ -235,13 +238,13 @@ public class RustApiClient {
      */
     public RustChatResponse chatWithDocument(String documentId, RustChatRequest chatReq) {
         try {
-            String body = objectMapper.writeValueAsString(chatReq);
+            byte[] body = objectMapper.writeValueAsString(chatReq).getBytes(StandardCharsets.UTF_8);
 
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(properties.apiUrl("/api/v1/documents/" + documentId + "/chat")))
+            URI uri = URI.create(properties.apiUrl("/api/v1/documents/" + documentId + "/chat"));
+            HttpRequest request = signedRequestBuilder("POST", uri, body)
                     .timeout(Duration.ofMillis(properties.getReadTimeoutMs()))
                     .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .POST(HttpRequest.BodyPublishers.ofByteArray(body))
                     .build();
 
             log.info("Rust chat: docId={}, inputLen={}", documentId, chatReq.getUserInput().length());
@@ -288,18 +291,18 @@ public class RustApiClient {
             return t;
         });
 
-        executor.execute(() -> {
+        Runnable task = TenantContext.wrap((Runnable) () -> {
             try {
-                String body = objectMapper.writeValueAsString(chatReq);
-                String url = properties.apiUrl("/api/v1/documents/" + docId + "/chat/stream");
+                byte[] body = objectMapper.writeValueAsString(chatReq).getBytes(StandardCharsets.UTF_8);
+                URI uri = URI.create(properties.apiUrl("/api/v1/documents/" + docId + "/chat/stream"));
+                String url = uri.toString();
                 log.info("Rust chat SSE connecting: {}", url);
 
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
+                HttpRequest request = signedRequestBuilder("POST", uri, body)
                         .timeout(Duration.ofMillis(properties.getReadTimeoutMs()))
                         .header("Content-Type", "application/json")
                         .header("Accept", "text/event-stream")
-                        .POST(HttpRequest.BodyPublishers.ofString(body))
+                        .POST(HttpRequest.BodyPublishers.ofByteArray(body))
                         .build();
 
                 HttpResponse<java.io.InputStream> response = httpClient.send(
@@ -350,6 +353,7 @@ public class RustApiClient {
                 connectedFuture.completeExceptionally(e);
             }
         });
+        executor.execute(task);
 
         return connectedFuture;
     }
@@ -361,13 +365,13 @@ public class RustApiClient {
      */
     public RustSearchResponse searchDocument(String documentId, RustSearchRequest searchReq) {
         try {
-            String body = objectMapper.writeValueAsString(searchReq);
+            byte[] body = objectMapper.writeValueAsString(searchReq).getBytes(StandardCharsets.UTF_8);
 
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(properties.apiUrl("/api/v1/documents/" + documentId + "/search")))
+            URI uri = URI.create(properties.apiUrl("/api/v1/documents/" + documentId + "/search"));
+            HttpRequest request = signedRequestBuilder("POST", uri, body)
                     .timeout(Duration.ofMillis(properties.getReadTimeoutMs()))
                     .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .POST(HttpRequest.BodyPublishers.ofByteArray(body))
                     .build();
 
             log.debug("Rust search: docId={}, queries={}", documentId, searchReq.getQueries());
@@ -403,9 +407,9 @@ public class RustApiClient {
     public List<RustBlockBBoxResponse> getBlockBboxes(String documentId, String blockIds) {
         try {
             String encodedIds = URLEncoder.encode(blockIds, StandardCharsets.UTF_8);
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(properties.apiUrl(
-                            "/api/v1/documents/" + documentId + "/blocks?ids=" + encodedIds)))
+            URI uri = URI.create(properties.apiUrl(
+                    "/api/v1/documents/" + documentId + "/blocks?ids=" + encodedIds));
+            HttpRequest request = signedRequestBuilder("GET", uri, new byte[0])
                     .timeout(Duration.ofMillis(properties.getReadTimeoutMs()))
                     .GET()
                     .build();
@@ -455,6 +459,10 @@ public class RustApiClient {
     }
 
     // ── 私有工具方法 ──────────────────────────────────────────────
+
+    private HttpRequest.Builder signedRequestBuilder(String method, URI uri, byte[] body) {
+        return requestSigner.sign(HttpRequest.newBuilder().uri(uri), method, uri, body);
+    }
 
     /**
      * 构建 multipart/form-data 请求体。

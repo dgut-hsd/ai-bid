@@ -11,10 +11,33 @@ import type {
   PhaseEvent, StatsEvent,
   FindingAddedEvent, FindingUpdatedEvent, FindingRemovedEvent,
 } from '@/types/audit';
-import { ensureAuditIssue } from '../../../utils/mapFinding';
+import { ensureAuditIssue, mapFindingAddedEvent } from '../../../utils/mapFinding';
 
 /** 连续轮询失败上限，超过则停止并清 stale 数据 */
 const MAX_POLL_FAILURES = 5;
+
+/**
+ * 按 riskId upsert 去重：已存在则整条替换（保留最新），不存在则追加。
+ * 后端 Java 会双发 finding_added + issue，两路都要走这里避免流式阶段出现重复卡。
+ */
+function upsertIssues(prev: AuditIssue[], mapped: AuditIssue): AuditIssue[] {
+  const exists = prev.some((i) => i.riskId === mapped.riskId);
+  if (exists) {
+    return prev.map((i) => (i.riskId === mapped.riskId ? { ...mapped } : i));
+  }
+  return [...prev, mapped];
+}
+
+/**
+ * 后端 GET /result 返回的 IssueVO 漏设 anchorQuote（Java toIssueVO 从未 setAnchorQuote），
+ * 导致审核完成后点击高亮退化成整面。这里兜底：anchorQuote 缺失时回退到 sourceQuote / description。
+ */
+function withAnchorFallback(i: AuditIssue): AuditIssue {
+  return {
+    ...i,
+    anchorQuote: i.anchorQuote || i.sourceQuote || i.description,
+  };
+}
 
 type StoredAuditTaskState = {
    taskId?: string;
@@ -160,7 +183,7 @@ export const useAuditTask = (bidId?: number) => {
             if (completed) {
                const result = await getAuditResult(taskId, { page: 1, size: 200 });
                if (cancelled) return;
-               setIssues(result.issues || []);
+               setIssues((result.issues || []).map(withAnchorFallback));
                updateFinalElapsed();
                setProgress(100);
                setCurrentStage('审核完成');
@@ -234,7 +257,8 @@ export const useAuditTask = (bidId?: number) => {
                const mapped = items.map((item) =>
                   ensureAuditIssue(item)
                );
-               setIssues((prev) => [...prev, ...mapped]);
+               // 去重：Java 双发 finding_added+issue，避免同一 risk 重复出现
+               setIssues((prev) => mapped.reduce((acc, m) => upsertIssues(acc, m), prev));
             }
             // 根据后端协议：event: progress
             else if (type === 'progress') {
@@ -270,9 +294,12 @@ export const useAuditTask = (bidId?: number) => {
             else if (type === 'stats') {
                setStatsEvent(payload as StatsEvent);
             }
-            // SSE §17.1: 稳定后的风险发现
+            // SSE §17.1: 实时发现（Java 双发为 issue，此处合并进 issues 并去重，打通流式结果）
             else if (type === 'finding_added') {
-               setLiveFindings(prev => [...prev, payload as FindingAddedEvent]);
+               const fe = payload as FindingAddedEvent;
+               setLiveFindings(prev => [...prev, fe]);
+               const mapped = mapFindingAddedEvent(fe);
+               setIssues(prev => upsertIssues(prev, mapped));
             }
             // SSE §17.1: finding 被更新
             else if (type === 'finding_updated') {
@@ -282,17 +309,69 @@ export const useAuditTask = (bidId?: number) => {
                      ? { ...f, ...fe.changes.reduce((acc, c) => ({ ...acc, [c.field]: c.new_value }), {}) as Partial<FindingAddedEvent> }
                      : f
                ));
+               setIssues(prev => prev.map(i => {
+                 if (i.riskId !== fe.risk_id) return i;
+                 const fieldMap: Record<string, string> = {
+                   'severity': 'severity',
+                   'confidence': 'confidence',
+                   'reason': 'description',
+                 };
+                 const patch: Partial<AuditIssue> = {};
+                 fe.changes.forEach(c => {
+                   const mappedKey = fieldMap[c.field];
+                   if (mappedKey) {
+                     (patch as Record<string, unknown>)[mappedKey] = c.new_value;
+                   }
+                 });
+                 return { ...i, ...patch };
+               }));
             }
             // SSE §17.1: finding 被移除
             else if (type === 'finding_removed') {
                const fr = payload as FindingRemovedEvent;
                setLiveFindings(prev => prev.filter(f => f.risk_id !== fr.risk_id));
+               setIssues(prev => prev.filter(i => i.riskId !== fr.risk_id));
             }
          },
-         // onComplete
+         // onComplete —— SSE 流闭合（可能由 Java emit complete、可能由网络断开）。
+         // 不再依赖每 3 秒轮询兜底：收到流结束立即主动查 status / result 并切完成态，
+         // 避免 Rust 已完成但前端一直卡在"等待结果确认…"
          () => {
             if (!isMounted) return;
-            setCurrentStage('审核流已结束，等待结果确认...');
+            (async () => {
+               try {
+                  const status = await getAuditStatus(taskId);
+                  if (!isMounted) return;
+                  const completed = status.status === 'completed';
+                  if (completed) {
+                     const result = await getAuditResult(taskId, { page: 1, size: 200 });
+                     if (!isMounted) return;
+                     setIssues((result.issues || []).map(withAnchorFallback));
+                     updateFinalElapsed();
+                     setProgress(100);
+                     setIsComplete(true);
+                     setCurrentStage('审核完成');
+                     setShouldConnectStream(false);
+                     setHasStartedAudit(false);
+                     setError(null);
+                     return;
+                  }
+                  if (status.status === 'failed') {
+                     setError('审核任务执行失败，请点击重新审核');
+                     setShouldConnectStream(false);
+                     setHasStartedAudit(false);
+                     if (storageKey) {
+                        try { localStorage.removeItem(storageKey); } catch { /* ignore */ }
+                     }
+                     setTaskId(null);
+                     return;
+                  }
+                  // 未完成就关流（理论上不会发生，落到这里保留原行为）
+                  setCurrentStage('审核流已结束，等待结果确认...');
+               } catch {
+                  setCurrentStage('审核流已结束，等待结果确认...');
+               }
+            })();
          },
          // onError
          (err) => {
@@ -323,7 +402,7 @@ export const useAuditTask = (bidId?: number) => {
             if (status.status === 'completed') {
                const result = await getAuditResult(taskId, { page: 1, size: 200 });
                if (stopped) return;
-               setIssues(result.issues || []);
+               setIssues((result.issues || []).map(withAnchorFallback));
                updateFinalElapsed();
                setIsComplete(true);
                setProgress(100);
@@ -344,7 +423,7 @@ export const useAuditTask = (bidId?: number) => {
                (fallbackResult.issues?.length || 0) > 0 ||
                (status.status === 'completed' && !!fallbackResult.auditResult);
             if (hasResult) {
-               setIssues(fallbackResult.issues || []);
+               setIssues((fallbackResult.issues || []).map(withAnchorFallback));
                updateFinalElapsed();
                setIsComplete(true);
                setProgress(100);

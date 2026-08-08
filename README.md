@@ -11,8 +11,10 @@
 └──────────────┘     └──────┬───────┘     └──────┬───────┘
                             │                    │
                       ┌─────┴─────┐        ┌─────┴─────┐
-                      │ MySQL 3306│        │  Milvus   │
-                      │ Redis 6379│        │  19530    │
+                      │ MySQL 3306│        │  Qdrant   │
+                      │ Redis 6379│        │  6333     │
+                      │  Neo4j    │
+                      │ 7474/7687 │
                       └───────────┘        └───────────┘
 ```
 
@@ -23,7 +25,8 @@
 | AI 引擎 | Rust + Tokio + Axum | 3001 |
 | 数据库 | MySQL 8.0 | 3306 |
 | 缓存 | Redis 7.2 | 6379 |
-| 向量库 | Milvus 2.6 | 19530 |
+| 图数据库 | Neo4j 5.21 | 7474/7687 |
+| 向量库 | Qdrant 1.7 | 6333 |
 | 文档转换 | JODConverter + LibreOffice | 8088 |
 
 ## 目录结构
@@ -54,7 +57,7 @@
 
 ### 2. 启动基础设施（Docker）
 
-MySQL、Redis、Milvus 等依赖服务通过 Docker Compose 一键启动：
+MySQL、Redis、Qdrant 等依赖服务通过 Docker Compose 一键启动：
 
 ```bash
 # 进入 Java 资源目录
@@ -73,13 +76,11 @@ docker compose ps
 |---|---|---|
 | smart-mysql | 3306 | MySQL 8.0（数据库 `smart_tender_system`） |
 | smart-redis | 6379 | Redis 7.2（缓存 / SSE / 任务队列） |
-| milvus-standalone | 19530 | Milvus 向量数据库 |
-| milvus-minio | 9000/9001 | Milvus 对象存储 |
-| milvus-etcd | 2379 | Milvus 配置中心 |
-| milvus-attu | 3000 | Milvus Web 管理界面 |
-| doc-converter | 8088 | DOCX → PDF 转换服务 |
+| smart-qdrant | 6333/6334 | Qdrant 向量数据库（6333 REST + Dashboard，6334 gRPC） |
+| doc-converter | 8088 | DOCX → PDF 转换服务（默认注释，见下方说明） |
+| my-neo4j | 7474/7687 | Neo4j 5.21 图数据库（凭据 `neo4j/b1234567`，APOC 插件） |
 
-> **注意**：Milvus Attu 占用 3000 端口，与 Java 后端冲突。如果不需要 Web 管理界面，可在 `docker-compose.yml` 中注释掉 `attu` 服务。
+> **注意**：Qdrant Web Dashboard 地址为 http://localhost:6333/dashboard，可直接在浏览器查看向量数据。doc-converter 镜像（ghcr.io）国内拉取较慢，默认在 `docker-compose.yml` 中注释，期间 DOCX 转换由 Rust 侧处理，PDF 文件不受影响。
 
 ### 3. 配置环境变量
 
@@ -87,7 +88,7 @@ docker compose ps
 
 ```bash
 # ==== 必填：LLM API 密钥 ====
-DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+DASHSCOPE_API_KEY=sk-ws-H.EIPLYIY.oH9a.MEUCIQD4TkLMZBXWRdaYiC8ZyfLTtR6iuz48RRj_3gXUUrMDiQIgX9TFgBQPR8xHkcZpDZ2KUCjuolnysol6GxKe_VSP7ho
 
 # ==== LLM 协议（dashscope / openai_compatible）====
 AIBID_LLM_PROTOCOL=dashscope
@@ -207,7 +208,7 @@ pnpm dev
 ## 启动顺序总结
 
 ```
-1. Docker 基础设施  →  MySQL + Redis + Milvus + MinIO + etcd
+1. Docker 基础设施  →  MySQL + Redis + Qdrant + Neo4j
 2. .env 配置        →  填写 API 密钥和环境变量
 3. Rust 引擎 :3001  →  AI 审核 / 嵌入 / LLM 调用
 4. Java 网关 :3000  →  认证 / CRUD / SSE 推送
@@ -219,6 +220,15 @@ pnpm dev
 ```bash
 # 终端 1：基础设施
 cd backend-java/src/main/resources && docker compose up -d
+
+#终端:先导入个mysql
+cmd /c "docker exec -i smart-mysql mysql -uroot -p1234 smart_tender_system < D:/github-remote/hsd/ai-bid/backend-java/src/main/resources/sql/smart_tender.sql"
+
+让 CMD 来执行 < 重定向（CMD 原生支持，不会搞坏编码），PowerShell 只是调用一下 CMD。
+
+预期输出：成功的标志是只出现一个 Warning，没有任何 ERROR
+mysql: [Warning] Using a password on the command line interface can be insecure.
+这个 Warning 是正常的（因为用了 -p1234 明文密码）。
 
 # 终端 2：Rust AI 引擎
 cd backend-rust
@@ -246,7 +256,7 @@ pnpm install && pnpm dev
 | LLM | DashScope (qwen-plus) 或 OpenAI 兼容接口 |
 | 嵌入 | BGE-M3 ONNX 本地推理 或 DashScope text-embedding-v4 |
 | 搜索 | DashScope 联网搜索 或 SearXNG 自托管 |
-| 数据库 | MySQL 8.0 + Redis 7.2 + Milvus 2.6 |
+| 数据库 | MySQL 8.0 + Redis 7.2 + Qdrant 1.7 + Neo4j 5.21 |
 | 文档转换 | JODConverter + LibreOffice |
 
 ## 前后端通信

@@ -39,8 +39,8 @@ impl RiskTier {
     /// 返回该级别的默认 max_turns。
     pub fn max_turns(&self) -> usize {
         match self {
-            RiskTier::Low => 8,
-            RiskTier::Medium => 12,
+            RiskTier::Low => 5,
+            RiskTier::Medium => 8,
             RiskTier::High => 14,
         }
     }
@@ -1434,8 +1434,8 @@ mod tests {
 
     #[test]
     fn test_risk_tier_max_turns() {
-        assert_eq!(RiskTier::Low.max_turns(), 8);
-        assert_eq!(RiskTier::Medium.max_turns(), 12);
+        assert_eq!(RiskTier::Low.max_turns(), 5);
+        assert_eq!(RiskTier::Medium.max_turns(), 8);
         assert_eq!(RiskTier::High.max_turns(), 14);
     }
 
