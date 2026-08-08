@@ -23,10 +23,10 @@ use utoipa::ToSchema;
 /// 审查过程中支持动态升降级（turn 2 检测）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 pub enum RiskTier {
-    /// L1：低风险，纯信息/格式条款。max_turns=8，仅 FactCheckAgent。
+    /// L1：低风险，纯信息/格式条款。max_turns=5，仅 FactCheckAgent。
     #[serde(rename = "L1")]
     Low,
-    /// L2：中等风险，标准审查。max_turns=12，按路由矩阵分配 Agent。
+    /// L2：中等风险，标准审查。max_turns=8，按路由矩阵分配 Agent。
     #[serde(rename = "L2")]
     #[default]
     Medium,
