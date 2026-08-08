@@ -1,4 +1,4 @@
-﻿# Rule library v0.1 — 28 rules covering DISC/QUAL/EXPR/PRIC/TIME/SAFE/PROC.
+# Rule library v0.1 — 28 rules covering DISC/QUAL/EXPR/PRIC/TIME/SAFE/PROC.
 #
 # Migration note: these rules encode the same keyword-AND logic as the original
 # `category_from_evidence` in risk_taxonomy.rs (migrated to rules/engine.rs),
@@ -401,13 +401,15 @@ rules:
       article: 第二十四条
     patterns:
       - type: keyword
-        value: ["投标截止", "开标", "投标准备", "提交投标文件", "获取招标文件"]
+        value: ["投标截止", "投标准备", "提交投标文件", "获取招标文件"]
         mode: any
       - type: keyword
         value: ["不足", "少于", "仅有", "只有", "不满"]
         mode: any
       - type: regex
         value: '[1-9]\s*日.{0,6}(内|以内|之后|前)'
+      - type: regex
+        value: '日.{0,6}前.{0,6}(递交|提交)'
     check: any_match
     enabled: true
     law_ref: "《招标投标法》第二十四条 ≥20 日"
@@ -448,11 +450,11 @@ rules:
         match_mode: absence
     check: any_match
     enabled: true
-    # absence 模式：资质章节若"未提及安全生产许可证"即命中
-    # chapter_keywords 约束：只在资质/资格章节内生效，避免对邀请函等无关章节误报
+    # absence 模式：施工资质章节若"未提及安全生产许可证"即命中
+    # chapter_keywords 约束：只在施工安全资质章节内生效，避免对普通资格条款误报
     conditions:
       trigger:
-        chapter_keywords: ["资格", "资质", "供应商资格", "合格供应商", "准入条件"]
+        chapter_keywords: ["安全生产", "施工资质", "工程施工", "建筑施工"]
 
   # ===== PROC 程序类 =============================================
 
