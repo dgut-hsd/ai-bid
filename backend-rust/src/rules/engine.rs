@@ -641,6 +641,86 @@ mod tests {
         }
     }
 
+    /// 集成测试：模拟完整审核流程，验证 YAML 规则在 candidate_categories
+    /// 和 normalize_finding 两个主链路接入点的行为。
+    #[test]
+    fn yaml_integration_full_pipeline_simulation() {
+        // ── Stage 1: 条款级候选检测（candidate_categories） ──
+        // 模拟 react_loop 对每个条款调用 review_candidates_for_agent。
+        // 每条 clause 的预期候选集来自 YAML ∪ 硬编码。
+
+        #[track_caller]
+        fn check_candidates(clauses: &[(&str, &[&str])]) {
+            for (i, (text, expected)) in clauses.iter().enumerate() {
+                let candidates = crate::rules::engine::candidate_categories(text);
+                for cat in *expected {
+                    assert!(
+                        candidates.contains(cat),
+                        "Clause {}: 应包含 `{}`，实际候选集: {:?}",
+                        i + 1,
+                        cat,
+                        candidates
+                    );
+                }
+            }
+        }
+
+        // (clause_text, expected_candidates)
+        check_candidates(&[
+            // YAML-only: PRIC_EXCESSIVE_DEPOSIT_PCT_RE（regex 匹配 "6%的保证金"）
+            ("投标人应缴纳采购预算总额6%的保证金", &["EXCESSIVE_DEPOSIT"]),
+            // 硬编码: LOCAL_REGISTRATION（"本市注册须"）
+            ("投标人须在本市注册成立三年以上，且在本市设有分支机构。", &["LOCAL_REGISTRATION"]),
+            // YAML-only: TIME_SHORT_CLAUSE（regex 匹配 "仅5日递交投标文件"）
+            ("仅5日递交投标文件", &["SHORT_DEADLINE"]),
+            // YAML-only: DISC_BRAND_ALIAS（regex 匹配 "指定品牌"）
+            ("指定品牌XYZ型号", &["BRAND_LOCK"]),
+            // 硬编码: REGIONAL_PERFORMANCE + OEM_AUTHORIZATION（多条款文本）
+            (
+                "供应商须提供采购人所在区县的同类服务案例，跨区域案例不作为有效业绩。\n\
+                 投标人必须提交生产厂家针对本项目出具的授权函，否则投标无效。",
+                &["REGIONAL_PERFORMANCE", "OEM_AUTHORIZATION"],
+            ),
+            // YAML + 硬编码并集: PRIC_SUBJECTIVE_RE（regex）+ 硬编码关键词
+            ("技术方案由评委综合判断优劣情况", &["SUBJECTIVE_SCORING"]),
+        ]);
+
+        // ── Stage 2: 证据分类 + Critical 判定（normalize_finding） ──
+        // 模拟 coordinator 对每条 finding 的归一化处理。
+
+        #[track_caller]
+        fn check_findings(cases: &[(&str, &str, &str, bool)]) {
+            for (i, (code, quote, expected_cat, expected_crit)) in cases.iter().enumerate() {
+                let mut f = finding(code, quote);
+                crate::rules::engine::normalize_finding(&mut f);
+                assert_eq!(
+                    &f.category_code, expected_cat,
+                    "Finding {}: category_code 不符合预期（quote={}）",
+                    i + 1, quote
+                );
+                assert_eq!(
+                    f.is_critical, *expected_crit,
+                    "Finding {}: is_critical={} 不符合预期（category={}, quote={}）",
+                    i + 1, f.is_critical, f.category_code, quote
+                );
+            }
+        }
+
+        // (category_code, source_quote, expected_normalized_category, expected_critical)
+        check_findings(&[
+            // YAML Critical: DISC_BRAND_ALIAS（severity=Critical）+ 硬编码也命中
+            ("BRAND_LOCK", "指定品牌XYZ型号的投标", "BRAND_LOCK", true),
+            // YAML Medium: TIME_SHORT_CLAUSE（severity=Medium）
+            ("SHORT_DEADLINE", "仅5日递交投标文件", "SHORT_DEADLINE", false),
+            // YAML High: PRIC_EXCESSIVE_DEPOSIT_PCT_RE（severity=High, not Critical）
+            ("EXCESSIVE_DEPOSIT", "投标人应缴纳采购预算总额6%的保证金", "EXCESSIVE_DEPOSIT", false),
+            // 硬编码 critical_evidence: LOCAL_REGISTRATION
+            ("LOCAL_REGISTRATION", "投标人须在本市注册成立三年以上，且在本市设有分支机构。", "LOCAL_REGISTRATION", true),
+            // YAML 无匹配 + 硬编码也无匹配：回退到 alias 归一化
+            ("DATE_CONFLICT", "投标截止时间为[日期]9时，同时规定[日期]17时后提交的文件一律拒收。", "CONFLICTING_DATES", false),
+        ]);
+    }
+
     /// 汇总报告：输出 15 类的覆盖矩阵，供 bin/test_rules 离线查看。
     /// 这个测试本身就是模拟数据集的"快照"。
     // ── YAML 接入主链路（TDD 测试用例）────────────────────────────────
