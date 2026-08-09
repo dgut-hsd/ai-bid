@@ -35,6 +35,29 @@ use ai_bid::agents::tools::read_section::ReadSectionTool;
 use ai_bid::agents::tools::search_knowledge::{
     DashScopeSearchBackend, SearchBuffer, SearchKnowledgeTool,
 };
+// V2+ 工具
+use ai_bid::agents::tools::compare_versions::CompareVersionsTool;
+use ai_bid::agents::tools::detect_boilerplate::DetectBoilerplateTool;
+// V3 采购程序合规审查
+use ai_bid::agents::tools::verify_procurement_method::VerifyProcurementMethodTool;
+use ai_bid::agents::tools::verify_bid_deposit::VerifyBidDepositTool;
+use ai_bid::agents::tools::verify_announcement_period::VerifyAnnouncementPeriodTool;
+use ai_bid::agents::tools::verify_bid_preparation_period::VerifyBidPreparationPeriodTool;
+// V4 评审标准审查
+use ai_bid::agents::tools::validate_scoring_formula::ValidateScoringFormulaTool;
+use ai_bid::agents::tools::validate_weight_distribution::ValidateWeightDistributionTool;
+use ai_bid::agents::tools::detect_subjective_scoring::DetectSubjectiveScoringTool;
+use ai_bid::agents::tools::check_scoring_completeness::CheckScoringCompletenessTool;
+use ai_bid::agents::tools::check_imported_products::CheckImportedProductsTool;
+use ai_bid::agents::tools::verify_consortium_rules::VerifyConsortiumRulesTool;
+// 零依赖计算工具
+use ai_bid::agents::tools::calculate_timeline::CalculateTimelineTool;
+// 依赖 chunk 数据的工具
+use ai_bid::agents::tools::check_cross_reference::CheckCrossReferenceTool;
+use ai_bid::agents::tools::extract_obligations::ExtractObligationsTool;
+use ai_bid::agents::tools::compare_with_template::{CompareWithTemplateTool, ChunkTextProvider, TemplateStore};
+use ai_bid::agents::tools::validate_calculation::ValidateCalculationTool;
+use ai_bid::agents::tools::search_contradiction::SearchContradictionTool;
 use ai_bid::agents::trace::TraceLog;
 use ai_bid::agents::types::*;
 use ai_bid::domain::chunk::{Chunk, ChunkType};
@@ -60,7 +83,7 @@ fn init_search_backend() -> (
         let searxng_url =
             env::var("SEARXNG_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
         eprintln!("  搜索后端: SearXNG ({})", searxng_url);
-        (None, Some(SearchBuffer::new(searxng_url)))
+        (None, Some(SearchBuffer::new(searxng_url, None)))
     } else {
         let ds = DashScopeSearchBackend::from_env()
             .expect("DashScope 搜索后端初始化失败。请设置 DASHSCOPE_API_KEY");
@@ -139,6 +162,7 @@ fn make_tools_factory(
     chunk_order: Arc<Vec<String>>,
 ) -> Arc<dyn Fn() -> ToolRegistry + Send + Sync> {
     Arc::new(move || {
+        eprintln!("[test_agents] ── 创建测试工具集 ToolRegistry ──");
         let mut registry = ToolRegistry::new();
         if let Some(ref ds) = ds_search {
             registry.register(Box::new(SearchKnowledgeTool::with_dashscope(ds.clone())));
@@ -153,6 +177,58 @@ fn make_tools_factory(
         )));
         registry.register(Box::new(MockSearchDocumentTool));
         registry.register(Box::new(OutputFindingTool));
+        // V2+ 工具
+        registry.register(Box::new(CompareVersionsTool {
+            current_chunks: chunks.clone(),
+            current_order: chunk_order.clone(),
+        }));
+        registry.register(Box::new(DetectBoilerplateTool {
+            chunks: chunks.clone(),
+            chunk_order: chunk_order.clone(),
+        }));
+        // V3 采购程序合规审查
+        registry.register(Box::new(VerifyProcurementMethodTool));
+        registry.register(Box::new(VerifyBidDepositTool));
+        registry.register(Box::new(VerifyAnnouncementPeriodTool));
+        registry.register(Box::new(VerifyBidPreparationPeriodTool));
+        // V4 评审标准审查
+        registry.register(Box::new(ValidateScoringFormulaTool));
+        registry.register(Box::new(ValidateWeightDistributionTool));
+        registry.register(Box::new(DetectSubjectiveScoringTool));
+        registry.register(Box::new(CheckScoringCompletenessTool));
+        registry.register(Box::new(CheckImportedProductsTool));
+        registry.register(Box::new(VerifyConsortiumRulesTool));
+        // 零依赖计算工具
+        registry.register(Box::new(CalculateTimelineTool));
+        // 依赖 chunk 数据的工具（测试环境有 chunks + chunk_order）
+        registry.register(Box::new(CheckCrossReferenceTool::new(
+            chunks.clone(),
+            chunk_order.clone(),
+        )));
+        registry.register(Box::new(ExtractObligationsTool::new(
+            chunks.clone(),
+            chunk_order.clone(),
+        )));
+        // 模板比对
+        let template_text_provider = Arc::new(ChunkTextProvider {
+            chunks: chunks.clone(),
+        });
+        registry.register(Box::new(CompareWithTemplateTool::new(
+            Arc::new(TemplateStore::with_builtin_templates()),
+            template_text_provider,
+        )));
+        // 数值计算校验
+        registry.register(Box::new(ValidateCalculationTool));
+        // 矛盾检测
+        registry.register(Box::new(SearchContradictionTool::new(
+            chunks.clone(),
+            chunk_order.clone(),
+            None,
+        )));
+        eprintln!(
+            "[test_agents] ── 测试工具集注册完成: 共 {} 个工具 ──",
+            registry.len()
+        );
         registry
     })
 }

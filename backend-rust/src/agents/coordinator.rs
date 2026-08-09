@@ -650,6 +650,9 @@ impl Coordinator {
     /// Scout 对每条 clause 产出 Hypothesis（finding_role=Hypothesis），
     /// 通过 `add_hypothesis()` 轻量写入 SessionGraph，供 Phase 2 Agent 使用。
     #[allow(dead_code)]
+    /// Scout 阶段 — 已被 review() 禁用（成本优化，见第 276 行 mark_scout_complete）。
+    /// 保留此函数供未来按需重新启用，当前为死代码。
+    #[allow(dead_code)]
     async fn scout_phase(&self, clauses: &[ReviewClause]) {
         let scout_def = match self.registry.get(AgentId::Scout) {
             Some(d) => d,
@@ -948,7 +951,8 @@ impl Coordinator {
             }
         }
 
-        // 确保每条条款至少分配给 FactCheckAgent
+        // 确保每条条款至少分配给一个已启用的 Agent（优先 FactCheck）
+        let has_factcheck = self.config.enabled_agents.contains(&AgentId::FactCheck);
         for clause in clauses {
             let mut assigned = false;
             for clauses_list in routing.values() {
@@ -957,11 +961,20 @@ impl Coordinator {
                     break;
                 }
             }
-            if !assigned {
+            if !assigned && has_factcheck {
                 routing
                     .entry(AgentId::FactCheck)
                     .or_default()
                     .push(clause.clone());
+            } else if !assigned {
+                // Fallback: 分配给第一个启用的 Agent
+                if let Some(first_enabled) = self.config.enabled_agents.first() {
+                    routing
+                        .entry(first_enabled.clone())
+                        .or_default()
+                        .push(clause.clone());
+                }
+                // 如果没有启用的 Agent,条款被静默丢弃(不会崩溃)
             }
         }
 

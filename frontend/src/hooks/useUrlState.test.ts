@@ -86,7 +86,7 @@ describe('useUrlState', () => {
   it('removes a parameter from the URL when its value is set to undefined, null, or empty string', () => {
     mockSearchParams.current = new URLSearchParams('page=1&keyword=test&tab=all');
 
-    const { result, rerender } = renderHook(() =>
+    const { result } = renderHook(() =>
       useUrlState({ page: 1, keyword: '', tab: 'all' }),
     );
 

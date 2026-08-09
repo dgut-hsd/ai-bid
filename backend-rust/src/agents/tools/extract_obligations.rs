@@ -34,6 +34,12 @@ pub struct ExtractObligationsArgs {
     /// 要提取的义务类型（空 = 全部）
     #[serde(default)]
     pub obligation_types: Vec<String>,
+    /// scope=part 时指定要扫描的 chunk_id 列表
+    #[serde(default)]
+    pub clause_ids: Vec<String>,
+    /// scope=agent_scope 时指定 Agent ID，按 Agent 职责范围过滤义务类型
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 fn default_scope() -> String {
@@ -51,6 +57,8 @@ struct ObligationsResult {
     star_marked_count: usize,
     /// 组合风险信号
     risk_signals: Vec<String>,
+    /// 覆盖率（已扫描 chunk 数 / 总 chunk 数）
+    coverage_ratio: f64,
     /// 总摘要
     summary: String,
 }
@@ -154,13 +162,11 @@ impl ExtractObligationsTool {
                 "质保金",
                 "支付",
                 "合同金额",
-                "报价",
             ],
             "售后" => vec![
                 "售后",
                 "保修",
                 "维护",
-                "服务",
                 "技术支持",
                 "培训",
                 "响应",
@@ -198,6 +204,19 @@ impl ExtractObligationsTool {
         ]
     }
 
+    /// Agent 职责范围 → 应关注的义务类型映射。
+    /// 用于 scope=agent_scope 时自动过滤义务类型。
+    fn agent_obligation_types(agent_id: &str) -> Vec<String> {
+        match agent_id {
+            "ProcedureAgent" => vec!["工期".into(), "付款条件".into(), "保险".into()],
+            "DemandAgent" => vec!["资质".into(), "业绩".into(), "人员".into(), "设备".into()],
+            "ContractAgent" => vec!["付款条件".into(), "保险".into(), "保密".into()],
+            "ScoringAgent" => vec!["资质".into(), "业绩".into()],
+            "SemanticRiskAgent" => vec!["资质".into(), "业绩".into(), "人员".into(), "设备".into(), "保险".into()],
+            _ => Self::all_types().iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
     /// 从文本中提取义务相关句子。
     fn extract_from_text(
         &self,
@@ -221,7 +240,7 @@ impl ExtractObligationsTool {
                     let sentences: Vec<&str> = text.split(['。', '；', '\n', '!']).collect();
 
                     for sent in &sentences {
-                        if sent.contains(kw) && sent.trim().len() > 10 {
+                        if sent.contains(kw) && sent.trim().len() > 6 {
                             let is_star = sent.contains('★')
                                 || sent.contains('*')
                                 || sent.contains("必须满足")
@@ -269,7 +288,7 @@ impl ExtractObligationsTool {
         if types.is_empty() || types.contains(&"其他".to_string()) {
             let mandatory_markers = ["必须", "须 ", "不得", "禁止", "强制性"];
             for sent in text.split(['。', '；', '\n']) {
-                if mandatory_markers.iter().any(|m| sent.contains(m)) && sent.trim().len() > 10 {
+                if mandatory_markers.iter().any(|m| sent.contains(m)) && sent.trim().len() > 6 {
                     // 检查是否已被其他类型覆盖
                     let already_covered = obligations
                         .iter()
@@ -315,14 +334,24 @@ impl ExtractObligationsTool {
             .map(|v| v.iter().map(|o| o.chunk_id.as_str()).collect())
             .unwrap_or_default();
 
-        let overlap: Vec<&&str> = qual_chunks
-            .iter()
-            .filter(|c| personnel_chunks.contains(c) && equipment_chunks.contains(c))
-            .collect();
-        if !overlap.is_empty() {
+        // 三合一排斥检测：资质+人员+设备三种类型均存在即触发
+        // 不要求同一 chunk——三种要求分散在不同章节同样构成排他性组合
+        let has_all_three = !qual_chunks.is_empty()
+            && !personnel_chunks.is_empty()
+            && !equipment_chunks.is_empty();
+        if has_all_three {
+            // 跨 chunk 检测: 三种类型分别分布在哪些 chunk 中
+            let total_clauses = by_type.values().flatten().count();
+            let three_type_clauses = qual_chunks.len() + personnel_chunks.len() + equipment_chunks.len();
             signals.push(format!(
-                "⚠️ 三合一排斥风险：{} 个条款同时要求特定资质+人员+设备，可能形成排他性组合",
-                overlap.len()
+                "⚠️ 三合一排斥风险：招标文件同时要求特定 资质（{}条）+ 人员（{}条）+ 设备（{}条），\
+                 共 {} 项义务，合计涉及 {} 个条款。这三种要求组合可能形成排他性条件，\
+                 建议评估是否有足够数量的潜在供应商满足全部要求。",
+                qual_chunks.len(),
+                personnel_chunks.len(),
+                equipment_chunks.len(),
+                three_type_clauses,
+                total_clauses
             ));
         }
 
@@ -376,7 +405,7 @@ impl AgentTool for ExtractObligationsTool {
                         "scope": {
                             "type": "string",
                             "enum": ["full_document", "part", "agent_scope"],
-                            "description": "提取范围：full_document=全文档, part=当前审查部分, agent_scope=当前Agent负责的条款"
+                            "description": "提取范围：full_document=全文档, part=指定条款范围, agent_scope=当前Agent负责的条款"
                         },
                         "obligation_types": {
                             "type": "array",
@@ -385,6 +414,15 @@ impl AgentTool for ExtractObligationsTool {
                                 "enum": ["资质", "业绩", "人员", "设备", "工期", "付款条件", "售后", "保密", "保险", "其他"]
                             },
                             "description": "要提取的义务类型，不指定则全部提取"
+                        },
+                        "clause_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "scope=part 时指定要扫描的 chunk_id 列表"
+                        },
+                        "agent_id": {
+                            "type": "string",
+                            "description": "scope=agent_scope 时指定 Agent ID，自动按职责过滤义务类型"
                         }
                     },
                     "required": []
@@ -398,34 +436,48 @@ impl AgentTool for ExtractObligationsTool {
 
         let mut all_obligations: Vec<Obligation> = Vec::new();
 
-        // 根据 scope 确定要扫描的 chunk 列表
-        match parsed.scope.as_str() {
-            "full_document" => {
-                for chunk_id in self.chunk_order.iter() {
-                    if let Some(chunk) = self.chunks.get(chunk_id) {
-                        let obs = self.extract_from_text(
-                            &chunk.text,
-                            &chunk.chunk_id,
-                            &chunk.section_path,
-                            &parsed.obligation_types,
-                        );
-                        all_obligations.extend(obs);
-                    }
-                }
+        // 确定要使用的 obligation_types（agent_scope 按 Agent 职责过滤）
+        let effective_types: Vec<String> = if parsed.scope == "agent_scope"
+            && let Some(ref agent_id) = parsed.agent_id
+        {
+            if parsed.obligation_types.is_empty() {
+                Self::agent_obligation_types(agent_id)
+            } else {
+                parsed.obligation_types.clone()
+            }
+        } else {
+            parsed.obligation_types.clone()
+        };
+
+        // 确定要扫描的 chunk 列表
+        let chunk_ids_to_scan: Vec<String> = match parsed.scope.as_str() {
+            "part" if !parsed.clause_ids.is_empty() => {
+                // 只扫描指定的 clause_ids
+                parsed.clause_ids.clone()
             }
             _ => {
-                // part / agent_scope：处理所有 chunk（当前实现无 part 信息）
-                for chunk_id in self.chunk_order.iter() {
-                    if let Some(chunk) = self.chunks.get(chunk_id) {
-                        let obs = self.extract_from_text(
-                            &chunk.text,
-                            &chunk.chunk_id,
-                            &chunk.section_path,
-                            &parsed.obligation_types,
-                        );
-                        all_obligations.extend(obs);
-                    }
-                }
+                // full_document / agent_scope / part(无 clause_ids) → 全量
+                self.chunk_order.iter().cloned().collect()
+            }
+        };
+
+        let scanned_count = chunk_ids_to_scan.len();
+        let total_chunks = self.chunk_order.len();
+        let coverage_ratio = if total_chunks > 0 {
+            scanned_count as f64 / total_chunks as f64
+        } else {
+            1.0
+        };
+
+        for chunk_id in &chunk_ids_to_scan {
+            if let Some(chunk) = self.chunks.get(chunk_id) {
+                let obs = self.extract_from_text(
+                    &chunk.text,
+                    &chunk.chunk_id,
+                    &chunk.section_path,
+                    &effective_types,
+                );
+                all_obligations.extend(obs);
             }
         }
 
@@ -460,6 +512,7 @@ impl AgentTool for ExtractObligationsTool {
             by_type,
             star_marked_count: star_count,
             risk_signals,
+            coverage_ratio,
             summary,
         };
 

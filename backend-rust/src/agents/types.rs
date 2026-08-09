@@ -847,7 +847,8 @@ impl AgentId {
             AgentId::FactCheck,
             AgentId::Procedure,
             AgentId::RuleEngine,
-            // SemanticRisk + Scoring 已禁用（成本优化：效率 < 0.16 findings/call）
+            AgentId::SemanticRisk,
+            AgentId::Scoring,
             AgentId::Demand,
             AgentId::Contract,
         ]

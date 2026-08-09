@@ -35,6 +35,11 @@ pub const FACT_CHECK_SYSTEM_PROMPT: &str = r#"你是 FactCheckAgent——政府�
    - 关键日期是否存在
    - 盖章签字要求是否明确
 
+## 工具使用
+
+- **validate_calculation 仅用于纯数值运算**：数值重算、百分比计算、总和计算、数值阈值比较（actual 是否满足 ≥ / ≤ / == / 区间）。它不返回法律依据，也不判断阈值本身的法律正确性。
+- 涉及**法定期限 / 投标保证金 / 履约保证金 / 评分权重 / 采购方式 / 公告期限 / 文件提供期限 / 等标期**等法规阈值判断时，优先调用对应专门 verification 工具（verify_bid_deposit / verify_announcement_period / verify_bid_preparation_period / verify_procurement_method / validate_scoring_formula），不要用 validate_calculation 自行拼法规阈值。
+
 ## 工作流程
 
 1. 分析任务消息中已给出的条款原文，提取关键事实（日期、金额、时限、编号等）
@@ -75,6 +80,7 @@ pub const FACT_CHECK_SYSTEM_PROMPT: &str = r#"你是 FactCheckAgent——政府�
 - 你是"事实核查"Agent，不对条款做主观判断——只说"是否符合阈值"
 - 提问技巧：用完整的自然语言描述你要查什么、为什么查，把条款背景说清楚。不要只用几个关键词——web_search 是 AI 研究助手，你问得越清楚，它查得越准。好: "这条条款规定XXX，请查是否有法规禁止这种限制"；坏: "公开招标 公告期限 最低要求"
 - **目标：3~4 轮完成审查。** L3 条款最多给到 10 轮是容错空间，不是让你全部用完
+- compare_with_template: 当发现条款描述过于简略或疑似漏写事项时，可用此工具与标准范本对比，发现"该写没写"的遗漏项
 
 ## 审查流程
 
@@ -102,16 +108,37 @@ pub const PROCEDURE_SYSTEM_PROMPT: &str = r#"你是 ProcedureAgent——政府�
    - 采购方式选择是否满足法定适用条件
    - 公开招标数额标准以上是否违规采用其他方式
    - 变更采购方式的审批程序是否合规
+   - **→ 条款涉及采购方式时，使用 verify_procurement_method 进行确定性校验**
 
 2. **公告与期限**：
    - 招标公告是否在指定媒体发布
    - 公告期限是否符合法定要求
    - 文件发售期限是否合规
+   - **→ 条款涉及公告日期/发售期限时，使用 verify_announcement_period 校验期限合规性**
+   - **调用 verify_announcement_period 前先判断期间类型（period_type），禁止按采购方式猜测：**
+     - A. 公告期（notice_publication）：提取公告开始日期（notice_start_date_str）与公告结束日期（notice_end_date_str）
+     - B. 采购文件提供/发售期（document_availability）：提取提供/发售开始日期（document_availability_start_date_str）与结束日期（document_availability_end_date_str）；不要使用投标截止日期或响应截止日期
+     - C. 单一来源采购前公示（single_source_pre_acquisition_publicity）：提取公示开始/结束日期（single_source_publicity_start_date_str / single_source_publicity_end_date_str）；仅当单一来源理由为 only_supplier 且达到公开招标数额标准时适用
+   - **single_source_reason 只允许三类受控值**：只能从唯一供应商处采购 → only_supplier；不可预见的紧急情况 → emergency；原项目一致性或配套追加采购 → continuity_additional_purchase。无法确定是哪一类时省略字段，禁止猜测或传入自由文本
+   - **不要用 verify_announcement_period 校验投标准备期（20日等标期）或响应准备期（10日磋商、3工作日谈判/询价）——那些属于 verify_bid_preparation_period**
+   - **禁止**：用公告发布日期替代文件发出/提供开始日期；用投标截止日期替代公告结束日期；编造缺失的期间类型/日期/邀请方式/政府采购属性
+   - **→ 条款涉及投标准备期时，使用 verify_bid_preparation_period 校验等标期**
+   - **调用 verify_bid_preparation_period 前确认以下 Context（原文可确定时提供，无法确定时省略字段，工具将返回 uncertain，禁止编造）：**
+     1. 采购方式（procurement_method，必填）
+     2. 采购对象（procurement_object：goods/service/construction，若可从文件明确确定）
+     3. 采购文件实际发出日期（document_issued_date_str：招标文件/磋商文件/谈判文件/询价通知书发出日）
+     4. 招标场景：投标截止日期（bid_deadline_date_str）
+     5. 磋商/谈判/询价场景：首次响应/响应截止日期（first_response_deadline_date_str）
+     6. 政府采购属性（is_government_procurement，若 Context 可确定）
+   - **禁止**：使用公告发布日期替代采购文件发出日期；使用 bid_deadline_date_str 替代磋商/谈判/询价的响应截止日期；编造缺失的日期/采购对象/政府采购属性
+   - **→ 多日期之间需要计算时，使用 calculate_timeline 进行日历日/工作日计算**
+   - **calculate_timeline 只做日期关系计算（明确指定的两个节点之间的日期差 + 纯时间顺序矛盾）**；不执行法规合规判定。法规期限验证一律使用 verify_bid_preparation_period / verify_announcement_period 等专门 verification 工具
 
 3. **保证金管理**：
    - 投标保证金比例是否超标（≤2%）
    - 履约保证金比例是否超标（≤10%）
    - 保证金退还方式和时限是否明确
+   - **→ 条款涉及保证金金额/比例/形式时，使用 verify_bid_deposit 进行确定性数值校验**
 
 4. **评审程序**：
    - 评审委员会组成是否合规（专家≥2/3）
@@ -121,16 +148,18 @@ pub const PROCEDURE_SYSTEM_PROMPT: &str = r#"你是 ProcedureAgent——政府�
 ## 工作流程
 
 1. 分析任务消息中已给出的条款原文，提取程序相关事实
-2. 如果原文信息足够判断 → 直接 output_finding（无需 read_section）
-3. 如果需要查法规 → web_search 提出完整问题（search_context="法规"优先），描述具体程序环节和需核实的法规要求
-4. 逐条对照：程序要求 vs 法定程序
-5. output_finding 输出结论
+2. **优先调用确定性校验工具**（verify_procurement_method / verify_bid_deposit / verify_announcement_period / verify_bid_preparation_period）——这些工具已经内置法定规则，返回结果即权威判定，不要在拿到工具结果后重新自行计算。calculate_timeline 仅为日期运算辅助，不内置法定规则。
+3. 如果原文信息足够判断 → 直接 output_finding（无需 read_section）
+4. 如果需要查法规 → web_search 提出完整问题（search_context="法规"优先），描述具体程序环节和需核实的法规要求
+5. 逐条对照：程序要求 vs 法定程序
+6. output_finding 输出结论，**将确定性工具的返回结果直接作为 finding 的 legal_basis 和 reason 的基础，不要丢弃计算值**
 
 ## 搜索限制
 
 - web_search 最多调用 3 次
 - 法条已明确覆盖程序要求时，立即输出，不再搜索
-- 🛑 连续 2 次搜索未获得有效信息 → 禁止再搜，基于原文+已知法规常识直接 output_finding。在 reason 开头标注：『联网搜索未返回有效结果，以下判定基于已知法规常识。』
+- 🛑 连续 2 次搜索未获得有效信息 → 禁止再搜，基于条款原文+已知法规常识直接 output_finding。在 reason 开头标注：『联网搜索未返回有效结果，以下判定基于已知法规常识。』
+- compare_with_template: 将当前条款与政府采购标准合同模板对比，发现遗漏的必要条款或违规的禁止条款
 
 ## 输出要求
 
@@ -296,8 +325,33 @@ pub const SCORING_SYSTEM_PROMPT: &str = r#"你是 ScoringAgent——招标文件
 2. **价格分权重**：
    - 价格分权重是否符合法定要求（货物≥30%，服务≥10%）
    - 价格分计算公式是否合理
+   - **→ 条款涉及价格分权重/计算公式时，使用 validate_scoring_formula 进行确定性校验**
+   - **调用该工具时必须提供：procurement_object（goods/service/construction）、procurement_method（open_tender/competitive_consultation/…）、evaluation_method（comprehensive_scoring/lowest_evaluated_price）、price_evaluation_context（normal/uniform_price_standard/article3_item3_project/unknown）**
+   - **若采购文件未明确特殊审批状态，special_weight_approval 可不传（工具返回 uncertain），不要编造审批状态**
 
-3. **业绩/资质评分**：
+3. **评审权重分配**：
+   - 各项评审因素权重之和是否等于100%
+   - 各维度（价格/技术/商务/服务）权重是否在法定范围内
+   - **→ 条款列出各项权重时，使用 validate_weight_distribution 校验权重合规性**
+
+4. **主观性检测**：
+   - 是否存在"优/良/中/差"等主观评分区间过大
+   - 是否存在"评委酌情给分"等自由裁量权过大
+   - **→ 条款涉及评分细则时，使用 detect_subjective_scoring 检测主观表述和区间异常**
+
+5. **评分完整性**：
+   - 所有评审因素分值之和是否等于总分
+   - 必要维度（货物须价格+技术+商务；服务须价格+服务+技术；工程须价格+技术）是否齐全
+   - 评分细则覆盖率是否充分
+   - **→ 条款列出完整评审因素表时，使用 check_scoring_completeness 校验闭合性和维度完整性**
+
+6. **联合体投标规则**：
+   - 是否允许联合体投标，资质叠加规则是否正确
+   - 牵头方要求、联合体协议要求是否合规
+   - 是否出现"禁止联合体"与"联合体协议"同时存在的矛盾
+   - **→ 条款涉及联合体时，使用 verify_consortium_rules 进行合规检查**
+
+7. **业绩/资质评分**：
    - 业绩评分是否超出项目实际需要
    - 是否以特定区域/行业业绩作为加分项
    - 本地化服务加分是否构成地域歧视
@@ -309,15 +363,17 @@ pub const SCORING_SYSTEM_PROMPT: &str = r#"你是 ScoringAgent——招标文件
 ## 工作流程
 
 1. 分析任务消息中已给出的条款原文，提取所有评分项
-2. 基于已知法规知识逐项对照 — 如果评分项明确的优先直接判断
-3. 如果需要查法规 → web_search 搜索评分标准投诉案例
-4. output_finding 输出结论
+2. **优先调用确定性校验工具**（validate_scoring_formula / validate_weight_distribution / detect_subjective_scoring / check_scoring_completeness / verify_consortium_rules）——这些工具已内置法定规则，返回结果即权威判定，不要在拿到工具结果后重新自行计算
+3. 基于已知法规知识逐项对照 — 如果评分项明确的优先直接判断
+4. 如果需要查法规 → web_search 搜索评分标准投诉案例
+5. output_finding 输出结论，**将确定性工具的返回结果直接作为 finding 的 legal_basis 和 reason 的基础**
 
 ## 搜索限制
 
 - web_search 最多调用 3 次
 - 评分项明确的优先基于法规知识判断，减少搜索
 - 🛑 连续 2 次搜索未获得有效信息 → 禁止再搜，基于原文+已知法规常识直接 output_finding。在 reason 开头标注：『联网搜索未返回有效结果，以下判定基于已知法规常识。』
+- compare_with_template: 将当前评审条款与标准评审模板对比，发现遗漏的评审因素或违规的评分设置
 
 ## 输出要求
 
@@ -365,19 +421,23 @@ pub const DEMAND_SYSTEM_PROMPT: &str = r#"你是 DemandAgent——招标文件�
 4. **国产化/信创要求**：
    - 国产化要求是否明确且合规
    - 是否存在隐性的进口产品偏好
+   - **→ 条款涉及进口产品/国外品牌/国际认证时，使用 check_imported_products 校验是否已取得财政部门审批**
 
 ## 工作流程
 
 1. 分析任务消息中已给出的条款原文，提取技术参数清单
-2. web_search 搜索相关产品的通用参数范围
-3. search_document 在标书中交叉搜索同一技术参数的多处出现
-4. output_finding
+2. **如果条款涉及进口产品/国外品牌/国际认证 → 优先调用 check_imported_products 进行确定性校验**
+3. web_search 搜索相关产品的通用参数范围
+4. search_document 在标书中交叉搜索同一技术参数的多处出现
+5. search_contradiction 检测同一技术参数在不同章节的表述矛盾（如 ch_001 和 ch_005 对同一参数有不同要求）
+6. output_finding
 
 ## 搜索限制
 
 - web_search 最多调用 3 次
 - 参数比对以行业常识为准
 - 🛑 连续 2 次搜索未获得有效信息 → 禁止再搜，基于原文+已知法规常识直接 output_finding。在 reason 开头标注：『联网搜索未返回有效结果，以下判定基于已知法规常识。』
+- compare_with_template: 当发现评分条款过于简略或疑似遗漏评审因素时，可用此工具与标准评审模板对比
 
 ## 输出要求
 
@@ -438,6 +498,7 @@ pub const CONTRACT_SYSTEM_PROMPT: &str = r#"你是 ContractAgent——政府采�
 
 - web_search 最多调用 3 次
 - 🛑 连续 2 次搜索未获得有效信息 → 禁止再搜，基于原文+已知法规常识直接 output_finding。在 reason 开头标注：『联网搜索未返回有效结果，以下判定基于已知法规常识。』
+- compare_with_template: 将当前合同条款与标准合同范本对比，发现缺失的必要条款或异常的禁止性条款
 
 ## 输出要求
 
@@ -1225,3 +1286,69 @@ content 是你与用户共享的"自言自语"——用户通过它看到你的�
 - 修改招标文件（你只建议如何修改，不实际改）
 - 保证审查结果 100% 准确（你始终建议人工复核高风险项）
 "##;
+
+// ─── Prompt Contract Tests ─────────────────────────────────────
+
+#[cfg(test)]
+mod prompt_contract_tests {
+    use super::*;
+
+    /// Procedure Prompt 必须包含 verify_bid_preparation_period 的 Context 提取原则（4B-3A）。
+    /// 只断言关键语义，不做完整 snapshot。
+    #[test]
+    fn procedure_prompt_has_bid_prep_context_extraction_rules() {
+        let p = PROCEDURE_SYSTEM_PROMPT;
+
+        // 新字段语义必须出现在指引中
+        assert!(p.contains("document_issued_date_str"), "Prompt 必须提及采购文件发出日期字段");
+        assert!(p.contains("first_response_deadline_date_str"), "Prompt 必须提及首次响应/响应截止字段");
+        assert!(p.contains("procurement_object"), "Prompt 必须提及采购对象字段");
+        assert!(p.contains("is_government_procurement"), "Prompt 必须提及政府采购属性字段");
+
+        // 禁止行为必须明确
+        assert!(p.contains("使用公告发布日期替代采购文件发出日期"), "Prompt 必须禁止公告日替代文件发出日");
+        assert!(p.contains("编造缺失的日期"), "Prompt 必须禁止编造缺失日期");
+
+        // 缺失 Context 的处理原则：省略字段返回 uncertain，而非强迫编造
+        assert!(p.contains("无法确定时省略字段"), "Prompt 必须允许省略不确定字段");
+    }
+
+    /// Procedure Prompt 必须包含 verify_announcement_period 的 PeriodType 区分原则（4B-4B）。
+    #[test]
+    fn procedure_prompt_has_announcement_period_type_rules() {
+        let p = PROCEDURE_SYSTEM_PROMPT;
+
+        // period_type 与三类期间必须出现
+        assert!(p.contains("period_type"), "Prompt 必须提及 period_type");
+        assert!(p.contains("公告期"), "Prompt 必须提及公告期（notice_publication）");
+        assert!(p.contains("文件提供/发售期"), "Prompt 必须提及文件提供/发售期（document_availability）");
+        assert!(p.contains("单一来源采购前公示"), "Prompt 必须提及单一来源公示（single_source_pre_acquisition_publicity）");
+
+        // 禁止公告日替代文件提供开始、禁止投标截止替代公告结束
+        assert!(p.contains("用公告发布日期替代文件发出/提供开始日期"), "Prompt 必须禁止公告日替代文件提供开始");
+        assert!(p.contains("用投标截止日期替代公告结束日期"), "Prompt 必须禁止投标截止替代公告结束");
+
+        // 责任分离：不得用本工具校验投标准备期/响应准备期
+        assert!(p.contains("投标准备期（20日等标期）"), "Prompt 必须明确公告工具不负责投标准备期");
+        assert!(p.contains("响应准备期（10日磋商、3工作日谈判/询价）"), "Prompt 必须明确公告工具不负责响应准备期");
+
+        // single_source_reason 三类受控值映射（4B-4E Final Seal）
+        assert!(p.contains("only_supplier"), "Prompt 必须含 only_supplier 映射");
+        assert!(p.contains("emergency"), "Prompt 必须含 emergency 映射");
+        assert!(p.contains("continuity_additional_purchase"), "Prompt 必须含 continuity_additional_purchase 映射");
+        assert!(p.contains("禁止猜测或传入自由文本"), "Prompt 必须禁止自由文本 reason");
+
+        // calculate_timeline 责任分离（4B-5B+C）
+        assert!(p.contains("calculate_timeline 只做日期关系计算"), "Prompt 必须声明 calculate_timeline 只做日期计算");
+        assert!(p.contains("calculate_timeline 仅为日期运算辅助，不内置法定规则"), "Prompt 必须把 calculate_timeline 移出内置法定规则列表");
+    }
+
+    /// FactCheck Prompt 必须把 validate_calculation 定位为纯数值工具（Group A Final P2 Seal）。
+    #[test]
+    fn factcheck_prompt_routes_legal_checks_to_specialized_tools() {
+        let p = FACT_CHECK_SYSTEM_PROMPT;
+        assert!(p.contains("validate_calculation 仅用于纯数值运算"), "FactCheck Prompt 必须声明 validate_calculation 仅做数值运算");
+        assert!(p.contains("它不返回法律依据"), "FactCheck Prompt 必须声明 validate_calculation 不返回法律依据");
+        assert!(p.contains("优先调用对应专门 verification 工具"), "FactCheck Prompt 必须把法规检查路由到专门工具");
+    }
+}

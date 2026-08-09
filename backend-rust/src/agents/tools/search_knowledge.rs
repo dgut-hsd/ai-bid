@@ -358,18 +358,25 @@ pub struct SearchBuffer {
     /// 等待中的查询：key → broadcast sender
     /// 多个 Agent 等待同一 key 时，worker 执行一次搜索，结果广播给所有人
     pending: Mutex<HashMap<String, broadcast::Sender<Vec<KnowledgeResult>>>>,
+    /// 跨 Session 法规缓存（可选）
+    law_cache: Option<Arc<Mutex<LawCache>>>,
 }
 
 impl SearchBuffer {
     /// 创建 SearchBuffer 并启动后台 worker。
     ///
     /// * `searxng_base_url` — SearXNG 服务地址，如 `"http://localhost:8080"`
-    pub fn new(searxng_base_url: String) -> Arc<Self> {
+    /// * `law_cache` — 可选的跨 Session 法规缓存，提供 `Arc<Mutex<LawCache>>` 以启用持久化缓存
+    pub fn new(
+        searxng_base_url: String,
+        law_cache: Option<Arc<Mutex<LawCache>>>,
+    ) -> Arc<Self> {
         let (tx, mut rx) = mpsc::unbounded_channel::<SearchTask>();
 
         let buf = Arc::new(Self {
             tx,
             pending: Mutex::new(HashMap::new()),
+            law_cache,
         });
 
         // 启动后台 worker（独立 spawned task）
@@ -383,33 +390,60 @@ impl SearchBuffer {
             );
 
             while let Some(task) = rx.recv().await {
-                // ★ 执行搜索
-                eprintln!(
-                    "  [SearchBuffer] 执行搜索: key={} query=\"{}\"",
-                    task.key, task.query
-                );
-                let mut results = client.search(&task.query, &task.category).await;
+                // ★ 先查缓存（跨 Session 持久化）
+                let mut results = if let Some(ref cache) = worker.law_cache {
+                    let c = cache.lock().await;
+                    c.get(&task.key)
+                } else {
+                    None
+                };
 
-                // ★ 空结果退避重试（冷却 2s 后重试一次）
-                if results.is_empty() {
-                    eprintln!("  [SearchBuffer] 空结果，2s 后退避重试: {}", task.key);
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    results = client.search(&task.query, &task.category).await;
-                    if results.is_empty() {
-                        eprintln!("  [SearchBuffer] 重试仍为空: {}", task.key);
-                    } else {
-                        eprintln!(
-                            "  [SearchBuffer] 重试成功: {} → {} 条结果",
-                            task.key,
-                            results.len()
-                        );
+                if let Some(ref cached_results) = results {
+                    eprintln!(
+                        "  [SearchBuffer] 缓存命中: key={} → {} 条结果",
+                        task.key,
+                        cached_results.len()
+                    );
+                } else {
+                    // ★ 执行搜索
+                    eprintln!(
+                        "  [SearchBuffer] 执行搜索: key={} query=\"{}\"",
+                        task.key, task.query
+                    );
+                    let mut search_results = client.search(&task.query, &task.category).await;
+
+                    // ★ 空结果退避重试（冷却 2s 后重试一次）
+                    if search_results.is_empty() {
+                        eprintln!("  [SearchBuffer] 空结果，2s 后退避重试: {}", task.key);
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        search_results = client.search(&task.query, &task.category).await;
+                        if search_results.is_empty() {
+                            eprintln!("  [SearchBuffer] 重试仍为空: {}", task.key);
+                        } else {
+                            eprintln!(
+                                "  [SearchBuffer] 重试成功: {} → {} 条结果",
+                                task.key,
+                                search_results.len()
+                            );
+                        }
                     }
+
+                    // ★ 搜索结果写入缓存
+                    if !search_results.is_empty() {
+                        if let Some(ref cache) = worker.law_cache {
+                            let mut c = cache.lock().await;
+                            c.put(task.key.clone(), search_results.clone());
+                            eprintln!("  [SearchBuffer] 已缓存: key={}", task.key);
+                        }
+                    }
+
+                    results = Some(search_results);
                 }
 
                 // ★ 广播结果给所有等待的 Agent
                 let mut pending = worker.pending.lock().await;
                 if let Some(tx) = pending.remove(&task.key) {
-                    let _ = tx.send(results);
+                    let _ = tx.send(results.unwrap_or_default());
                     // broadcast sender 随 drop 自动清理
                 }
 
@@ -963,5 +997,139 @@ impl DashScopeSearchBackend {
         );
 
         Ok(WebSearchResult { answer, sources })
+    }
+}
+
+// ─── 法规缓存持久化层 ──────────────────────────────────────────
+
+/// 单条法规缓存条目。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedLawItem {
+    /// 缓存 key（归一化后的查询）
+    key: String,
+    /// 搜索返回的知识结果
+    results: Vec<KnowledgeResult>,
+    /// 缓存写入时间戳（Unix 秒）
+    created_at: u64,
+    /// TTL（秒），超期后缓存失效。默认 30 天 = 2592000 秒。
+    ttl_seconds: u64,
+}
+
+/// 跨 Session 的法规缓存。
+///
+/// 持久化到 JSON 文件，Key=归一化查询，Value=搜索结果，
+/// TTL=30 天（法规变更周期以月为单位，30 天合理）。
+///
+/// ## 使用方式
+///
+/// 1. 搜索前：`cache.get(&key)` → 命中且未过期 → 直接返回
+/// 2. 搜索后：`cache.put(key, results)`  → 写入内存 + 异步刷盘
+pub struct LawCache {
+    /// 缓存内容（内存 HashMap for O(1) 查找）
+    items: HashMap<String, CachedLawItem>,
+    /// 持久化文件路径
+    cache_path: String,
+    /// 默认 TTL（秒）
+    default_ttl: u64,
+}
+
+impl LawCache {
+    /// 默认 TTL：30 天
+    pub const DEFAULT_TTL: u64 = 30 * 24 * 3600;
+
+    /// 创建/加载法规缓存。
+    ///
+    /// 从 `cache_path` 加载已有缓存文件（JSON），
+    /// 自动淘汰已过期条目。
+    pub fn new(cache_path: &str) -> Self {
+        let mut cache = Self {
+            items: HashMap::new(),
+            cache_path: cache_path.to_string(),
+            default_ttl: Self::DEFAULT_TTL,
+        };
+        cache.load();
+        cache
+    }
+
+    /// 从 JSON 文件加载缓存。
+    fn load(&mut self) {
+        match std::fs::read_to_string(&self.cache_path) {
+            Ok(content) => {
+                match serde_json::from_str::<Vec<CachedLawItem>>(&content) {
+                    Ok(items) => {
+                        let now = Self::now_secs();
+                        let mut valid_count = 0;
+                        let mut expired_count = 0;
+                        for item in items {
+                            if now - item.created_at < item.ttl_seconds {
+                                self.items.insert(item.key.clone(), item);
+                                valid_count += 1;
+                            } else {
+                                expired_count += 1;
+                            }
+                        }
+                        eprintln!(
+                            "  [LawCache] 加载完成: {} 条有效, {} 条已过期",
+                            valid_count, expired_count
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("  [LawCache] 缓存文件损坏，从头开始: {}", e);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("  [LawCache] 缓存文件不存在，将新建: {}", self.cache_path);
+            }
+            Err(e) => {
+                eprintln!("  [LawCache] 读取缓存文件失败: {}", e);
+            }
+        }
+    }
+
+    /// 查询缓存。
+    ///
+    /// 返回 `Some(results)` 表示命中且未过期，`None` 表示未命中或已过期。
+    pub fn get(&self, key: &str) -> Option<Vec<KnowledgeResult>> {
+        self.items.get(key).and_then(|item| {
+            let age = Self::now_secs() - item.created_at;
+            if age < item.ttl_seconds {
+                Some(item.results.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// 写入缓存（内存）并异步刷盘。
+    pub fn put(&mut self, key: String, results: Vec<KnowledgeResult>) {
+        let item = CachedLawItem {
+            key: key.clone(),
+            results,
+            created_at: Self::now_secs(),
+            ttl_seconds: self.default_ttl,
+        };
+        self.items.insert(key, item);
+        self.flush_async();
+    }
+
+    /// 异步刷盘到 JSON 文件（spawn blocking task）。
+    fn flush_async(&self) {
+        let path = self.cache_path.clone();
+        let items: Vec<CachedLawItem> = self.items.values().cloned().collect();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(json) = serde_json::to_string(&items) {
+                if let Err(e) = std::fs::write(&path, &json) {
+                    eprintln!("  [LawCache] 写入缓存文件失败: {}", e);
+                }
+            }
+        });
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 }
