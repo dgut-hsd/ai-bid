@@ -13,7 +13,6 @@ let isLoggingOut = false;
 // ── token refresh 并发控制 ───────────────────────────────────────────
 // 多个请求同时 401 时，只有第一个真正去 refresh，其余 await 同一个 pending promise；
 // refresh 成功后所有排队请求用新 token 重放，避免误触发 logout 踢用户下线。
-let isRefreshing = false;
 let refreshPromise: Promise<string> | null = null;
 
 function getRefreshToken(): string | null {
@@ -26,7 +25,6 @@ function getCurrentStorage(): Storage {
 
 function doRefresh(): Promise<string> {
   if (refreshPromise) return refreshPromise;
-  isRefreshing = true;
   refreshPromise = (async () => {
     const refreshToken = getRefreshToken();
     if (!refreshToken) throw new Error('no refresh token');
@@ -49,7 +47,6 @@ function doRefresh(): Promise<string> {
   refreshPromise
     .catch(() => { /* 错误由调用方处理 */ })
     .finally(() => {
-      isRefreshing = false;
       refreshPromise = null;
     });
   return refreshPromise;

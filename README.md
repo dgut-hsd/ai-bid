@@ -88,7 +88,7 @@ docker compose ps
 
 ```bash
 # ==== 必填：LLM API 密钥 ====
-DASHSCOPE_API_KEY=sk-ws-H.EIPLYIY.oH9a.MEUCIQD4TkLMZBXWRdaYiC8ZyfLTtR6iuz48RRj_3gXUUrMDiQIgX9TFgBQPR8xHkcZpDZ2KUCjuolnysol6GxKe_VSP7ho
+DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # ==== LLM 协议（dashscope / openai_compatible）====
 AIBID_LLM_PROTOCOL=dashscope
@@ -220,15 +220,6 @@ pnpm dev
 ```bash
 # 终端 1：基础设施
 cd backend-java/src/main/resources && docker compose up -d
-
-#终端:先导入个mysql
-cmd /c "docker exec -i smart-mysql mysql -uroot -p1234 smart_tender_system < D:/github-remote/hsd/ai-bid/backend-java/src/main/resources/sql/smart_tender.sql"
-
-让 CMD 来执行 < 重定向（CMD 原生支持，不会搞坏编码），PowerShell 只是调用一下 CMD。
-
-预期输出：成功的标志是只出现一个 Warning，没有任何 ERROR
-mysql: [Warning] Using a password on the command line interface can be insecure.
-这个 Warning 是正常的（因为用了 -p1234 明文密码）。
 
 # 终端 2：Rust AI 引擎
 cd backend-rust

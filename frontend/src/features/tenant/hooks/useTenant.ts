@@ -8,8 +8,8 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useDispatch, useSelector } from 'react-redux';
 import { App } from 'antd';
-import { tenantApi, USE_MOCK } from '../api/tenant';
-import { switchTenant as switchTenantAction, setTenantList, setCurrentTenantId } from '@/store/slices/authSlice';
+import { tenantApi } from '../api/tenant';
+import { switchTenant as switchTenantAction, setTenantList } from '@/store/slices/authSlice';
 import type { RootState } from '@/store';
 import type { SwitchTenantParams } from '../types';
 
@@ -43,32 +43,25 @@ export const useTenant = () => {
       if (resp.code === 200 && resp.data) {
         const session = resp.data;
 
-        if (USE_MOCK) {
-          // Mock 模式：只更新 currentTenantId，不动真实 token（避免覆盖登录态导致 401）
-          dispatch(setCurrentTenantId(session.tenant_id));
-          message.success(`已切换到租户（Mock 模式）`);
-          // 不 reload，只更新 UI 状态
-        } else {
-          // 真实模式：dispatch switchTenant（清旧缓存+写新会话）→ 刷新页面断 SSE
-          dispatch(
-            switchTenantAction({
-              token: session.token,
-              refreshToken: session.refresh_token,
-              tenantId: session.tenant_id,
-              userInfo: {
-                // 保留 user_id 原值，避免 UUID 经 Number() 变成 0
-                id: session.user_id,
-                username: session.username,
-                realName: session.real_name || session.username,
-              },
-            })
-          );
-          queryClient.clear();
-          message.success('租户切换成功，正在刷新…');
-          setTimeout(() => {
-            window.location.reload();
-          }, 500);
-        }
+        // 真实模式：dispatch switchTenant（清旧缓存+写新会话）→ 刷新页面断 SSE
+        dispatch(
+          switchTenantAction({
+            token: session.token,
+            refreshToken: session.refresh_token,
+            tenantId: session.tenant_id,
+            userInfo: {
+              // 保留 user_id 原值，避免 UUID 经 Number() 变成 0
+              id: session.user_id,
+              username: session.username,
+              realName: session.real_name || session.username,
+            },
+          })
+        );
+        queryClient.clear();
+        message.success('租户切换成功，正在刷新…');
+        setTimeout(() => {
+          window.location.reload();
+        }, 500);
       } else {
         message.error(resp.msg || '租户切换失败');
       }
