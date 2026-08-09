@@ -6,10 +6,11 @@
 //! 3. 格式化 HTTP 响应（JSON + 状态码）
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{Extension, Multipart, Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
@@ -26,33 +27,33 @@ use crate::agents::session_graph::SessionGraph;
 use crate::agents::tools::{
     ToolRegistry,
     answer_user::AnswerUserTool,
-    output_finding::OutputFindingTool,
-    read_section::ReadSectionTool,
-    search_document::SearchDocumentTool,
-    search_knowledge::{DashScopeSearchBackend, SearchKnowledgeTool},
-    // V2+ 工具
-    compare_versions::CompareVersionsTool,
-    detect_boilerplate::DetectBoilerplateTool,
-    // V3 采购程序合规审查
-    verify_procurement_method::VerifyProcurementMethodTool,
-    verify_bid_deposit::VerifyBidDepositTool,
-    verify_announcement_period::VerifyAnnouncementPeriodTool,
-    verify_bid_preparation_period::VerifyBidPreparationPeriodTool,
-    // V4 评审标准审查
-    validate_scoring_formula::ValidateScoringFormulaTool,
-    validate_weight_distribution::ValidateWeightDistributionTool,
-    detect_subjective_scoring::DetectSubjectiveScoringTool,
-    check_scoring_completeness::CheckScoringCompletenessTool,
-    check_imported_products::CheckImportedProductsTool,
-    verify_consortium_rules::VerifyConsortiumRulesTool,
     // 零依赖计算/检查工具
     calculate_timeline::CalculateTimelineTool,
     // 依赖 chunk 数据的工具
     check_cross_reference::CheckCrossReferenceTool,
+    check_imported_products::CheckImportedProductsTool,
+    check_scoring_completeness::CheckScoringCompletenessTool,
+    // V2+ 工具
+    compare_versions::CompareVersionsTool,
+    compare_with_template::{ChunkTextProvider, CompareWithTemplateTool, TemplateStore},
+    detect_boilerplate::DetectBoilerplateTool,
+    detect_subjective_scoring::DetectSubjectiveScoringTool,
     extract_obligations::ExtractObligationsTool,
-    compare_with_template::{CompareWithTemplateTool, ChunkTextProvider, TemplateStore},
-    validate_calculation::ValidateCalculationTool,
+    output_finding::OutputFindingTool,
+    read_section::ReadSectionTool,
     search_contradiction::SearchContradictionTool,
+    search_document::SearchDocumentTool,
+    search_knowledge::{DashScopeSearchBackend, SearchKnowledgeTool},
+    validate_calculation::ValidateCalculationTool,
+    // V4 评审标准审查
+    validate_scoring_formula::ValidateScoringFormulaTool,
+    validate_weight_distribution::ValidateWeightDistributionTool,
+    verify_announcement_period::VerifyAnnouncementPeriodTool,
+    verify_bid_deposit::VerifyBidDepositTool,
+    verify_bid_preparation_period::VerifyBidPreparationPeriodTool,
+    verify_consortium_rules::VerifyConsortiumRulesTool,
+    // V3 采购程序合规审查
+    verify_procurement_method::VerifyProcurementMethodTool,
 };
 use crate::agents::trace::TraceLog;
 use crate::agents::types::{
@@ -94,13 +95,92 @@ pub struct InternalRequestContext {
     pub body_sha256: String,
 }
 
+/// Explicit tenant/document composite key used for every in-memory document
+/// and review resource. A document ID is only meaningful inside its tenant.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DocumentKey {
+    pub tenant_id: String,
+    pub document_id: String,
+}
+
+impl DocumentKey {
+    pub fn new(tenant_id: impl Into<String>, document_id: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            document_id: document_id.into(),
+        }
+    }
+}
+
+/// Tenant IDs are decimal strings in the Java/Rust internal contract. Keeping
+/// this check next to path construction prevents an untrusted header from
+/// becoming a filesystem component.
+pub(crate) fn is_valid_tenant_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_safe_document_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn document_key(
+    context: &InternalRequestContext,
+    document_id: &str,
+) -> Result<DocumentKey, (StatusCode, Json<ErrorResponse>)> {
+    if !is_valid_tenant_id(&context.tenant_id) || !is_safe_document_id(document_id) {
+        return Err(document_not_found());
+    }
+    Ok(DocumentKey::new(
+        context.tenant_id.clone(),
+        document_id.to_string(),
+    ))
+}
+
+fn tenant_output_path(tenant_id: &str, relative: &str) -> Option<PathBuf> {
+    if !is_valid_tenant_id(tenant_id) || relative.is_empty() {
+        return None;
+    }
+    let root = PathBuf::from(data_path_str("output/tenants"));
+    let namespace = root.join(tenant_id);
+    let candidate = namespace.join(relative);
+    candidate.starts_with(&namespace).then_some(candidate)
+}
+
+fn tenant_document_path(
+    tenant_id: &str,
+    relative_dir: &str,
+    document_id: &str,
+    suffix: &str,
+) -> Option<PathBuf> {
+    if !is_safe_document_id(document_id) {
+        return None;
+    }
+    let dir = tenant_output_path(tenant_id, relative_dir)?;
+    let candidate = dir.join(format!("{document_id}{suffix}"));
+    candidate.starts_with(&dir).then_some(candidate)
+}
+
+async fn load_document(
+    state: &AppState,
+    key: &DocumentKey,
+) -> Result<Arc<DocumentState>, (StatusCode, Json<ErrorResponse>)> {
+    let docs = state.documents.read().await;
+    docs.get(key)
+        .filter(|document| document.tenant_id == key.tenant_id)
+        .cloned()
+        .ok_or_else(document_not_found)
+}
+
 // ─── 应用状态 ───────────────────────────────────────────────────────
 
 /// 服务全局共享状态。
 #[derive(Clone)]
 pub struct AppState {
-    /// 文档缓存：document_id → 已处理文档
-    pub documents: Arc<TokioRwLock<HashMap<String, Arc<DocumentState>>>>,
+    /// 文档缓存：(tenant_id, document_id) → 已处理文档
+    pub documents: Arc<TokioRwLock<HashMap<DocumentKey, Arc<DocumentState>>>>,
     /// 嵌入客户端（BGE-M3，启动时加载一次）
     pub embed_client: Arc<StdMutex<Option<Arc<EmbeddingClient>>>>,
     /// DashScope 联网搜索
@@ -109,20 +189,21 @@ pub struct AppState {
     pub search_backend: String,
     /// 嵌入引擎类型（local / remote）
     pub embed_engine: String,
-    /// SSE 实时推送通道：doc_id → ReviewEventBus
-    pub review_event_buses: Arc<TokioMutex<HashMap<String, Arc<ReviewEventBus>>>>,
-    /// 异步审查结果缓存：doc_id → CoordinatorOutput
-    pub review_results: Arc<TokioMutex<HashMap<String, CoordinatorOutput>>>,
-    /// 异步审查失败信息：doc_id → 错误消息
-    pub review_errors: Arc<TokioMutex<HashMap<String, String>>>,
-    /// 正在执行的审核任务：doc_id（用于并发控制，防止重复提交）
-    pub active_reviews: Arc<TokioMutex<HashSet<String>>>,
+    /// SSE 实时推送通道：(tenant_id, document_id) → ReviewEventBus
+    pub review_event_buses: Arc<TokioMutex<HashMap<DocumentKey, Arc<ReviewEventBus>>>>,
+    /// 异步审查结果缓存：(tenant_id, document_id) → CoordinatorOutput
+    pub review_results: Arc<TokioMutex<HashMap<DocumentKey, CoordinatorOutput>>>,
+    /// 异步审查失败信息：(tenant_id, document_id) → 错误消息
+    pub review_errors: Arc<TokioMutex<HashMap<DocumentKey, String>>>,
+    /// 正在执行的审核任务：(tenant_id, document_id)（用于并发控制）
+    pub active_reviews: Arc<TokioMutex<HashSet<DocumentKey>>>,
 }
 
 use std::sync::Mutex as StdMutex;
 
 /// 单个文档的处理状态。
 pub struct DocumentState {
+    pub tenant_id: String,
     pub id: String,
     pub filename: String,
     pub stem: String,
@@ -333,8 +414,13 @@ pub async fn health() -> Json<serde_json::Value> {
 )]
 pub async fn process_document(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     mut multipart: Multipart,
 ) -> Result<Json<ProcessResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = context.tenant_id;
+    if !is_valid_tenant_id(&tenant_id) {
+        return Err(bad_request("tenant context is invalid"));
+    }
     println!("[REQ] 收到文件上传请求，开始解析 multipart...");
 
     let mut file_data: Vec<u8> = Vec::new();
@@ -367,27 +453,33 @@ pub async fn process_document(
         file_data.len()
     );
 
-    let tmp_dir = data_path_str("tmp");
+    let tmp_dir = tenant_output_path(&tenant_id, "tmp")
+        .ok_or_else(|| bad_request("tenant context is invalid"))?;
     std::fs::create_dir_all(&tmp_dir).map_err(|e| server_error("创建临时目录失败", e))?;
     let stem = Uuid::new_v4().to_string();
+    let doc_id = stem.clone();
     let ext = std::path::Path::new(&filename)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("pdf");
-    let tmp_path = format!("{}/{}.{}", tmp_dir, stem, ext);
+    let tmp_path = tmp_dir.join(format!("{}.{}", stem, ext));
     std::fs::write(&tmp_path, &file_data).map_err(|e| server_error("写入临时文件失败", e))?;
 
     // DOCX → PDF 转换（对齐 CLI 行为）
     let pdf_path = if ext == "docx" || ext == "doc" {
         println!("[STAGE] DOCX → PDF 转换...");
-        convert_docx_to_pdf(&tmp_path, &tmp_dir).map_err(|e| server_error("DOCX 转 PDF 失败", e))?
+        convert_docx_to_pdf(
+            tmp_path.to_string_lossy().as_ref(),
+            tmp_dir.to_string_lossy().as_ref(),
+        )
+        .map_err(|e| server_error("DOCX 转 PDF 失败", e))?
     } else {
-        std::path::PathBuf::from(&tmp_path)
+        tmp_path.clone()
     };
 
     // 阶段 1: PDF → RawDocument（Rust 主路径 + Python 兜底）
     println!("[STAGE] PDF 文本提取...");
-    let pdf_path_str = pdf_path.to_str().unwrap_or(&tmp_path).to_string();
+    let pdf_path_str = pdf_path.to_string_lossy().to_string();
     let raw_doc: RawDocument = match extract_pdf_to_raw_json(&pdf_path_str) {
         Ok(doc) => {
             println!("Rust pdfplumber 解析成功");
@@ -396,8 +488,8 @@ pub async fn process_document(
         Err(e) => {
             println!("Rust pdfplumber 失败: {}", e);
             println!("切换到 Python pdfplumber 兜底提取...");
-            let fallback_json = format!("{}/{}_python_fallback_raw.json", tmp_dir, stem);
-            extract_with_python(&pdf_path_str, &fallback_json)
+            let fallback_json = tmp_dir.join(format!("{}_python_fallback_raw.json", stem));
+            extract_with_python(&pdf_path_str, &fallback_json.to_string_lossy())
                 .map_err(|e2| server_error("PDF 解析失败（Rust 和 Python 均失败）", e2))?;
             let json_str = std::fs::read_to_string(&fallback_json)
                 .map_err(|e2| server_error("读取 Python 兜底 JSON 失败", e2))?;
@@ -411,21 +503,18 @@ pub async fn process_document(
         raw_doc.pages.iter().map(|p| p.blocks.len()).sum::<usize>()
     );
 
-    // 构建磁盘输出用的 stem：{原始文件名}_{uuid前8位}
-    let file_stem = std::path::Path::new(&filename)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("document");
-    let disk_stem = format!("{}_{}", file_stem, &stem[..8.min(stem.len())]);
+    // 构建磁盘输出用的安全 stem：只使用服务端生成的 document_id。
+    let disk_stem = doc_id.clone();
 
     // ── 写盘：raw_json ──
     {
-        let dir = data_path_str("output/raw_json");
+        let dir = tenant_output_path(&tenant_id, "raw_json")
+            .ok_or_else(|| bad_request("tenant context is invalid"))?;
         let _ = std::fs::create_dir_all(&dir);
-        let path = format!("{}/{}_raw.json", dir, disk_stem);
+        let path = dir.join(format!("{}_raw.json", disk_stem));
         if let Ok(json) = serde_json::to_string_pretty(&raw_doc) {
             let _ = std::fs::write(&path, json);
-            println!("[DISK] raw_json → {}", path);
+            println!("[DISK] raw_json → {}", path.display());
         }
     }
 
@@ -513,12 +602,13 @@ pub async fn process_document(
 
     // ── 写盘：sections ──
     {
-        let dir = data_path_str("output/sections");
+        let dir = tenant_output_path(&tenant_id, "sections")
+            .ok_or_else(|| bad_request("tenant context is invalid"))?;
         let _ = std::fs::create_dir_all(&dir);
-        let path = format!("{}/{}_sections.json", dir, disk_stem);
+        let path = dir.join(format!("{}_sections.json", disk_stem));
         if let Ok(json) = serde_json::to_string_pretty(&all_sections) {
             let _ = std::fs::write(&path, json);
-            println!("[DISK] sections → {}", path);
+            println!("[DISK] sections → {}", path.display());
         }
     }
 
@@ -549,12 +639,13 @@ pub async fn process_document(
 
     // ── 写盘：chunks ──
     {
-        let dir = data_path_str("output/chunks");
+        let dir = tenant_output_path(&tenant_id, "chunks")
+            .ok_or_else(|| bad_request("tenant context is invalid"))?;
         let _ = std::fs::create_dir_all(&dir);
-        let path = format!("{}/{}_chunks.json", dir, disk_stem);
+        let path = dir.join(format!("{}_chunks.json", disk_stem));
         if let Ok(json) = serde_json::to_string_pretty(&chunks) {
             let _ = std::fs::write(&path, json);
-            println!("[DISK] chunks → {}", path);
+            println!("[DISK] chunks → {}", path.display());
         }
     }
 
@@ -584,12 +675,20 @@ pub async fn process_document(
 
     // ── 写盘：embeddings ──
     {
-        let dir = data_path_str("output/embeddings");
-        if let Err(e) = crate::services::embedding_service::save_index(&doc_index, &dir, &disk_stem)
-        {
+        let dir = tenant_output_path(&tenant_id, "embeddings")
+            .ok_or_else(|| bad_request("tenant context is invalid"))?;
+        if let Err(e) = crate::services::embedding_service::save_index(
+            &doc_index,
+            dir.to_string_lossy().as_ref(),
+            &disk_stem,
+        ) {
             eprintln!("[DISK] embeddings 写入失败: {}", e);
         } else {
-            println!("[DISK] embeddings → {}/{}_embedding_index/", dir, disk_stem);
+            println!(
+                "[DISK] embeddings → {}/{}_embedding_index/",
+                dir.display(),
+                disk_stem
+            );
         }
     }
 
@@ -607,8 +706,8 @@ pub async fn process_document(
     let total_blocks: usize = raw_doc.pages.iter().map(|p| p.blocks.len()).sum();
     let total_chars: usize = chunks.iter().map(|c| c.text.len()).sum();
 
-    let doc_id = stem.clone();
     let doc_state = Arc::new(DocumentState {
+        tenant_id: tenant_id.clone(),
         id: doc_id.clone(),
         filename: filename.clone(),
         stem,
@@ -627,7 +726,7 @@ pub async fn process_document(
         .documents
         .write()
         .await
-        .insert(doc_id.clone(), doc_state);
+        .insert(DocumentKey::new(tenant_id, doc_id.clone()), doc_state);
 
     let _ = std::fs::remove_file(&tmp_path);
 
@@ -673,12 +772,15 @@ pub async fn process_document(
 )]
 pub async fn get_document(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
 ) -> Result<Json<DocumentInfo>, (StatusCode, Json<ErrorResponse>)> {
+    let key = document_key(&context, &doc_id)?;
     let docs = state.documents.read().await;
     let doc = docs
-        .get(&doc_id)
-        .ok_or_else(|| not_found(&format!("文档不存在: {}", doc_id)))?;
+        .get(&key)
+        .filter(|document| document.tenant_id == key.tenant_id)
+        .ok_or_else(document_not_found)?;
     Ok(Json(DocumentInfo {
         document_id: doc.id.clone(),
         filename: doc.filename.clone(),
@@ -712,13 +814,16 @@ pub async fn get_document(
 #[axum::debug_handler]
 pub async fn review_document(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
     Json(req): Json<ReviewRequest>,
 ) -> Result<(StatusCode, Json<ReviewAccepted>), (StatusCode, Json<ErrorResponse>)> {
+    let key = document_key(&context, &doc_id)?;
     let docs = state.documents.read().await;
     let doc = docs
-        .get(&doc_id)
-        .ok_or_else(|| not_found(&format!("文档不存在: {}", doc_id)))?
+        .get(&key)
+        .filter(|document| document.tenant_id == key.tenant_id)
+        .ok_or_else(document_not_found)?
         .clone();
     drop(docs);
 
@@ -730,7 +835,7 @@ pub async fn review_document(
     // 并发控制：检查是否已有进行中的审核（用 active_reviews 标记而非 bus 存在性）
     {
         let mut active = state.active_reviews.lock().await;
-        if active.contains(&doc_id) {
+        if active.contains(&key) {
             return Ok((
                 StatusCode::CONFLICT,
                 Json(ReviewAccepted {
@@ -740,14 +845,14 @@ pub async fn review_document(
                 }),
             ));
         }
-        active.insert(doc_id.clone());
+        active.insert(key.clone());
     }
 
     // 创建或获取 ReviewEventBus（SSE 客户端可能已提前连接）
     let review_events = {
         let mut buses = state.review_event_buses.lock().await;
         buses
-            .entry(doc_id.clone())
+            .entry(key.clone())
             .or_insert_with(|| Arc::new(ReviewEventBus::new(review_event_capacity())))
             .clone()
     };
@@ -810,11 +915,11 @@ pub async fn review_document(
 
     // 后台执行管线
     let state_for_task = state.clone();
-    let doc_id_for_task = doc_id.clone();
+    let document_key_for_task = key.clone();
     tokio::spawn(async move {
         run_review_pipeline(
             state_for_task,
-            doc_id_for_task,
+            document_key_for_task,
             review_clauses,
             enabled_agents,
             chunk_map,
@@ -847,7 +952,7 @@ pub async fn review_document(
 #[allow(clippy::too_many_arguments)]
 async fn run_review_pipeline(
     state: AppState,
-    doc_id: String,
+    document_key: DocumentKey,
     review_clauses: Vec<ReviewClause>,
     enabled_agents: Option<Vec<String>>,
     chunk_map: Arc<HashMap<String, Chunk>>,
@@ -860,6 +965,8 @@ async fn run_review_pipeline(
     embed_client_for_tools: Option<Arc<EmbeddingClient>>,
     review_events: Arc<ReviewEventBus>,
 ) {
+    let tenant_id = document_key.tenant_id.clone();
+    let doc_id = document_key.document_id.clone();
     let start_time = std::time::Instant::now();
 
     // ── 指标采集器 ──
@@ -1027,9 +1134,9 @@ async fn run_review_pipeline(
                         .filter(|bid| {
                             chunk.bbox_refs.iter().any(|r| {
                                 let is_same = &r.block_id == *bid;
-                                let is_placeholder =
-                                    r.bbox.x0 == 0.0 && r.bbox.x1 == 400.0
-                                        && (r.bbox.bottom - r.bbox.top) <= 20.1;
+                                let is_placeholder = r.bbox.x0 == 0.0
+                                    && r.bbox.x1 == 400.0
+                                    && (r.bbox.bottom - r.bbox.top) <= 20.1;
                                 is_same && !is_placeholder
                             })
                         })
@@ -1042,10 +1149,8 @@ async fn run_review_pipeline(
                     let max_blocks = 5usize;
                     finding.block_ids = if valid_blocks.len() > max_blocks {
                         // 优选与 source_quote 文本相关的 block
-                        let truncated: Vec<String> = valid_blocks
-                            .into_iter()
-                            .take(max_blocks)
-                            .collect();
+                        let truncated: Vec<String> =
+                            valid_blocks.into_iter().take(max_blocks).collect();
                         truncated
                     } else {
                         valid_blocks
@@ -1073,31 +1178,22 @@ async fn run_review_pipeline(
 
             // ── 写盘：findings ──
             {
-                let disk_stem = {
-                    let docs = state.documents.read().await;
-                    if let Some(doc) = docs.get(&doc_id) {
-                        let file_stem = std::path::Path::new(&doc.filename)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("document");
-                        format!("{}_{}", file_stem, &doc_id[..8.min(doc_id.len())])
-                    } else {
-                        format!("doc_{}", &doc_id[..8.min(doc_id.len())])
-                    }
+                let disk_stem = doc_id.clone();
+                let Some(dir) = tenant_output_path(&tenant_id, "findings") else {
+                    return;
                 };
-                let dir = data_path_str("output/findings");
                 let _ = std::fs::create_dir_all(&dir);
-                let findings_path = format!("{}/{}_findings.json", dir, disk_stem);
+                let findings_path = dir.join(format!("{}_findings.json", disk_stem));
                 if let Ok(json) = serde_json::to_string_pretty(&output.findings) {
                     let _ = std::fs::write(&findings_path, json);
-                    println!("[DISK] findings → {}", findings_path);
+                    println!("[DISK] findings → {}", findings_path.display());
                 }
-                let summary_path = format!("{}/{}_routing_summary.json", dir, disk_stem);
+                let summary_path = dir.join(format!("{}_routing_summary.json", disk_stem));
                 if let Ok(json) = serde_json::to_string_pretty(&output.routing_summary) {
                     let _ = std::fs::write(&summary_path, json);
                 }
                 if let Some(ref snap) = output.graph_snapshot {
-                    let snap_path = format!("{}/{}_graph_snapshot.json", dir, disk_stem);
+                    let snap_path = dir.join(format!("{}_graph_snapshot.json", disk_stem));
                     if let Ok(json) = serde_json::to_string_pretty(snap) {
                         let _ = std::fs::write(&snap_path, json);
                     }
@@ -1107,14 +1203,16 @@ async fn run_review_pipeline(
             // 存入 review_results 供 GET /result 查询
             {
                 let mut results = state.review_results.lock().await;
-                results.insert(doc_id.clone(), output.clone());
+                results.insert(document_key.clone(), output.clone());
             }
 
             // 写盘: {doc_id}_result.json — 重启后磁盘 fallback
             {
-                let dir = data_path_str("output/findings");
+                let Some(dir) = tenant_output_path(&tenant_id, "findings") else {
+                    return;
+                };
                 let _ = std::fs::create_dir_all(&dir);
-                let result_path = format!("{}/{}_result.json", dir, doc_id);
+                let result_path = dir.join(format!("{}_result.json", doc_id));
                 let persisted = ReviewResultResponse {
                     status: "completed".to_string(),
                     result: Some(ReviewResponse {
@@ -1127,7 +1225,7 @@ async fn run_review_pipeline(
                 };
                 if let Ok(json) = serde_json::to_string_pretty(&persisted) {
                     let _ = std::fs::write(&result_path, json);
-                    println!("[DISK] result → {}", result_path);
+                    println!("[DISK] result → {}", result_path.display());
                 }
             }
 
@@ -1195,7 +1293,7 @@ async fn run_review_pipeline(
             // 存入 review_errors
             {
                 let mut errors = state.review_errors.lock().await;
-                errors.insert(doc_id.clone(), msg.clone());
+                errors.insert(document_key.clone(), msg.clone());
             }
 
             // 发送 Error 事件
@@ -1208,14 +1306,14 @@ async fn run_review_pipeline(
 
     // 延迟清理 ReviewEventBus 和 active_reviews
     // （给 SSE 客户端时间接收 Done/Error 事件）
-    let cleanup_doc_id = doc_id.clone();
+    let cleanup_key = document_key.clone();
     let cleanup_state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         let mut buses = cleanup_state.review_event_buses.lock().await;
-        buses.remove(&cleanup_doc_id);
+        buses.remove(&cleanup_key);
         let mut active = cleanup_state.active_reviews.lock().await;
-        active.remove(&cleanup_doc_id);
+        active.remove(&cleanup_key);
     });
 }
 
@@ -1236,17 +1334,24 @@ async fn run_review_pipeline(
 )]
 pub async fn stream_review_events(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
-) -> axum::response::Sse<
-    impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+) -> Result<
+    axum::response::Sse<
+        impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    (StatusCode, Json<ErrorResponse>),
 > {
     use axum::response::sse::Event;
+
+    let key = document_key(&context, &doc_id)?;
+    let _ = load_document(&state, &key).await?;
 
     // 创建或获取 ReviewEventBus（如果 POST /review 尚未创建）
     let review_events = {
         let mut buses = state.review_event_buses.lock().await;
         buses
-            .entry(doc_id.clone())
+            .entry(key)
             .or_insert_with(|| Arc::new(ReviewEventBus::new(review_event_capacity())))
             .clone()
     };
@@ -1312,7 +1417,7 @@ pub async fn stream_review_events(
         }
     };
 
-    axum::response::Sse::new(stream)
+    Ok(axum::response::Sse::new(stream))
 }
 
 /// GET /api/v1/review/:doc_id/result
@@ -1331,12 +1436,14 @@ pub async fn stream_review_events(
 )]
 pub async fn get_review_result(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
 ) -> Result<Json<ReviewResultResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let key = document_key(&context, &doc_id)?;
     // 1. 检查内存中已完成的结果（不移除，允许多次查询）
     {
         let results = state.review_results.lock().await;
-        if let Some(output) = results.get(&doc_id) {
+        if let Some(output) = results.get(&key) {
             return Ok(Json(ReviewResultResponse {
                 status: "completed".to_string(),
                 result: Some(ReviewResponse {
@@ -1353,7 +1460,7 @@ pub async fn get_review_result(
     // 2. 检查失败信息
     {
         let errors = state.review_errors.lock().await;
-        if let Some(msg) = errors.get(&doc_id) {
+        if let Some(msg) = errors.get(&key) {
             return Ok(Json(ReviewResultResponse {
                 status: "failed".to_string(),
                 result: None,
@@ -1365,7 +1472,7 @@ pub async fn get_review_result(
     // 3. 检查是否仍在进行中
     {
         let buses = state.review_event_buses.lock().await;
-        if buses.contains_key(&doc_id) {
+        if buses.contains_key(&key) {
             return Ok(Json(ReviewResultResponse {
                 status: "pending".to_string(),
                 result: None,
@@ -1376,17 +1483,25 @@ pub async fn get_review_result(
 
     // 4. 磁盘 fallback — 重启后内存为空，从 JSON 文件恢复
     {
-        let dir = data_path_str("output/findings");
-        let result_path = format!("{}/{}_result.json", dir, doc_id);
+        let result_path =
+            tenant_document_path(&context.tenant_id, "findings", &doc_id, "_result.json")
+                .ok_or_else(document_not_found)?;
         if let Ok(json) = std::fs::read_to_string(&result_path)
             && let Ok(result) = serde_json::from_str::<ReviewResultResponse>(&json)
         {
-            println!("[DISK] result loaded from disk: {}", result_path);
-            return Ok(Json(result));
+            let belongs_to_document = result
+                .result
+                .as_ref()
+                .map(|review| review.document_id == doc_id)
+                .unwrap_or(true);
+            if belongs_to_document {
+                println!("[DISK] result loaded from disk: {}", result_path.display());
+                return Ok(Json(result));
+            }
         }
     }
 
-    Err(not_found(&format!("审查结果不存在: {}", doc_id)))
+    Err(document_not_found())
 }
 
 /// POST /api/v1/documents/:id/chat
@@ -1405,16 +1520,12 @@ pub async fn get_review_result(
 )]
 pub async fn chat_with_document(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let docs = state.documents.read().await;
-    let doc = docs
-        .get(&doc_id)
-        .ok_or_else(|| not_found(&format!("文档不存在: {}", doc_id)))?
-        .clone();
-    drop(docs);
-
+    let key = document_key(&context, &doc_id)?;
+    let doc = load_document(&state, &key).await?;
     let llm: Arc<dyn LlmClient> =
         Arc::from(create_llm_client().map_err(|e| server_error("创建 Chat LLM 客户端失败", e))?);
 
@@ -1504,28 +1615,25 @@ pub async fn chat_with_document(
 )]
 pub async fn chat_with_document_stream(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
     Json(req): Json<ChatRequest>,
-) -> axum::response::Sse<
-    impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+) -> Result<
+    axum::response::Sse<
+        impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    (StatusCode, Json<ErrorResponse>),
 > {
     use axum::response::sse::Event;
+
+    let key = document_key(&context, &doc_id)?;
+    let doc = load_document(&state, &key).await?;
 
     // All setup + streaming in a single async_stream block
     // (each async_stream::stream! creates a unique type — can't have early returns)
     let stream = async_stream::stream! {
         // ── Setup (inside stream to avoid type mismatch) ──
-        let docs = state.documents.read().await;
-        let doc = match docs.get(&doc_id) {
-            Some(d) => d.clone(),
-            None => {
-                yield Ok(Event::default()
-                    .event("error")
-                    .data(r#"{"message":"文档不存在"}"#));
-                return;
-            }
-        };
-        drop(docs);
+        let doc = doc.clone();
 
         let llm: Arc<dyn LlmClient> = match create_llm_client() {
             Ok(client) => Arc::from(client),
@@ -1637,7 +1745,7 @@ pub async fn chat_with_document_stream(
         }
     };
 
-    axum::response::Sse::new(stream)
+    Ok(axum::response::Sse::new(stream))
 }
 
 /// POST /api/v1/documents/:id/search
@@ -1656,15 +1764,18 @@ pub async fn chat_with_document_stream(
 )]
 pub async fn search_document(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let docs = state.documents.read().await;
-    let doc = docs
-        .get(&doc_id)
-        .ok_or_else(|| not_found(&format!("文档不存在: {}", doc_id)))?
-        .clone();
-    drop(docs);
+    let key = document_key(&context, &doc_id)?;
+    let doc = load_document(&state, &key).await?;
+
+    if req.queries.is_empty() {
+        return Ok(Json(SearchResponse {
+            results: Vec::new(),
+        }));
+    }
 
     let embed_client = {
         let ec = state.embed_client.lock().unwrap();
@@ -1754,14 +1865,12 @@ pub struct BlockBBoxResponse {
 )]
 pub async fn get_block_bboxes(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<BlockQuery>,
 ) -> Result<Json<Vec<BlockBBoxResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let docs = state.documents.read().await;
-    let doc = docs
-        .get(&doc_id)
-        .ok_or_else(|| not_found(&format!("文档不存在: {}", doc_id)))?;
-
+    let key = document_key(&context, &doc_id)?;
+    let doc = load_document(&state, &key).await?;
     let requested_ids: Vec<&str> = params.ids.split(',').map(|s| s.trim()).collect();
     println!(
         "[BLOCKS] 查询 block BBox: doc={}, ids={:?}",
@@ -1841,10 +1950,14 @@ fn not_found(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
-            error: "NOT_FOUND".to_string(),
+            error: "RESOURCE_NOT_FOUND".to_string(),
             detail: msg.to_string(),
         }),
     )
+}
+
+fn document_not_found() -> (StatusCode, Json<ErrorResponse>) {
+    not_found("resource not found")
 }
 
 // ─── Metrics Helpers ────────────────────────────────────────────────────
