@@ -4,7 +4,7 @@ import { useDispatch } from 'react-redux';
 
 import { Form, App } from 'antd';
 
-import { setCredentials } from '@/store/slices/authSlice';
+import { setAuthSession } from '@/store/slices/authSlice';
 
 import { useLoginMutation, useRegisterMutation } from './hooks/useAuth';
 
@@ -31,28 +31,37 @@ export function LoginPage() {
    const onLoginFinish = async (values: LoginFormValues) => {
       try {
          const { phone, password, remember } = values;
-         const response = await loginMutate({ phone, password });
+         const response = await loginMutate({ username: phone, password });
 
          if (response.code === 200 && response.data) {
             dispatch(
-               setCredentials({
-                  token: response.data.token,
-                  userInfo: response.data.userInfo,
+               setAuthSession({
+                  session: response.data,
                   rememberMe: remember,
                })
             );
 
             message.success('登录成功');
 
+            const locationState = location.state;
             const from =
-               (location.state as any)?.from?.pathname || '/dashboard';
+               typeof locationState === 'object' &&
+               locationState !== null &&
+               'from' in locationState &&
+               typeof locationState.from === 'object' &&
+               locationState.from !== null &&
+               'pathname' in locationState.from &&
+               typeof locationState.from.pathname === 'string'
+                  ? locationState.from.pathname
+                  : '/dashboard';
             navigate(from, { replace: true });
          } else {
             message.error(response.msg || '登录失败');
             loginForm.setFieldValue('password', '');
          }
-      } catch (error) {
+      } catch (error: unknown) {
          console.error('Login error: ', error);
+         message.error('登录失败，请检查账号和密码');
          loginForm.setFieldValue('password', '');
       }
    };
@@ -67,10 +76,14 @@ export function LoginPage() {
          } else {
             message.error(response.msg || '注册失败');
          }
-      } catch (error: any) {
+      } catch (error: unknown) {
+         const errorRecord =
+            typeof error === 'object' && error !== null
+               ? error as { response?: { data?: { msg?: string } }; message?: string }
+               : undefined;
          const errMsg =
-            error?.response?.data?.msg ||
-            error?.message ||
+            errorRecord?.response?.data?.msg ||
+            errorRecord?.message ||
             '注册失败，请稍后重试';
          message.error(errMsg);
       }

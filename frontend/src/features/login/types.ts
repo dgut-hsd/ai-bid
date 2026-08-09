@@ -1,20 +1,14 @@
 import type { FormInstance } from 'antd';
+import type { AuthSession, ApiResponse } from '@/features/tenant/types';
 
 export interface LoginParams {
-   phone: string;
+   /** The backend accepts this contract field and maps it to its legacy phone field. */
+   username: string;
    password: string;
 }
 
-export interface UserInfo {
-   id: number;
-   username: string;
-   realName: string;
-}
-
-export interface LoginResponse {
-   token: string;
-   userInfo: UserInfo;
-}
+export type LoginResponse = AuthSession;
+export type AuthResponse = ApiResponse<AuthSession>;
 
 export interface RegisterParams {
    username: string;

@@ -9,9 +9,8 @@ import type {
    AuditCountItem,
 } from '../types';
 import { mutationOptions, queryOptions } from '@tanstack/react-query';
-import { getMockDashboardList } from './dashboardMock';
+import { getStoredCurrentTenantId } from '@/store/slices/authSlice';
 
-const USE_MOCK = false; // 设置为 true 使用模拟数据
 const WEEKDAY_LABEL_MAP: Record<string, string> = {
    Monday: '周一',
    Tuesday: '周二',
@@ -23,10 +22,6 @@ const WEEKDAY_LABEL_MAP: Record<string, string> = {
 };
 
 export const getDashboardList = async (): Promise<ProjectItem[]> => {
-   if (USE_MOCK) {
-      return getMockDashboardList();
-   }
-
    const res = await request.get<
       unknown,
       BaseResponse<ProjectItem[]>
@@ -99,27 +94,39 @@ export const getAuditCount = async (): Promise<AuditCountItem[]> => {
 };
 
 export const dashboardOptions = {
-   list: () =>
-      queryOptions({
-         queryKey: ['dashboardList'],
+   list: (tenantId?: string | null) => {
+      const resolvedTenantId =
+         tenantId === undefined ? getStoredCurrentTenantId() : tenantId;
+      return queryOptions({
+         queryKey: ['dashboardList', resolvedTenantId],
          queryFn: () => getDashboardList(),
+         enabled: Boolean(resolvedTenantId),
          placeholderData: (previousData) => previousData,
          staleTime: 0,
-      }),
-   issueDistribution: () =>
-      queryOptions({
-         queryKey: ['issueDistribution'],
+      });
+   },
+   issueDistribution: (tenantId?: string | null) => {
+      const resolvedTenantId =
+         tenantId === undefined ? getStoredCurrentTenantId() : tenantId;
+      return queryOptions({
+         queryKey: ['issueDistribution', resolvedTenantId],
          queryFn: () => getIssueDistribution(),
+         enabled: Boolean(resolvedTenantId),
          placeholderData: (previousData) => previousData,
          staleTime: 0,
-      }),
-   auditCount: () =>
-      queryOptions({
-         queryKey: ['auditCount'],
+      });
+   },
+   auditCount: (tenantId?: string | null) => {
+      const resolvedTenantId =
+         tenantId === undefined ? getStoredCurrentTenantId() : tenantId;
+      return queryOptions({
+         queryKey: ['auditCount', resolvedTenantId],
          queryFn: () => getAuditCount(),
+         enabled: Boolean(resolvedTenantId),
          placeholderData: (previousData) => previousData,
          staleTime: 0,
-      }),
+      });
+   },
 };
 
 export const dashboardMutations = {
