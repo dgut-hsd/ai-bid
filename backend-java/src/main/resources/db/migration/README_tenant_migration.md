@@ -36,11 +36,10 @@ active. Before starting the migration, take and verify a restorable database bac
 pause application writes and background workers/consumers, and keep the write pause in
 place through validation.
 
-Before V6, run the documented conflict-detection queries for existing `user-{id}`
-tenants and their owner memberships. Review every result set, then run `SHOW WARNINGS`
-in the same client session; any conflict or warning is a stop condition and must be
-resolved before V6 is started. Do not treat an empty application log as a substitute for
-reviewing the database results.
+Before V6, run the two read-only conflict-detection queries below. Each query must
+return zero rows, and its immediately following `SHOW WARNINGS` must return no warning.
+Any result or warning is a stop condition and must be resolved before V6 is started. Do
+not treat an empty application log as a substitute for reviewing the database results.
 
 At minimum, the preflight must return no rows for these checks:
 
@@ -50,6 +49,8 @@ FROM sys_user AS u
 JOIN tenant AS t
   ON t.tenant_code = CONCAT('user-', u.id)
 WHERE t.owner_user_id <> u.id;
+
+SHOW WARNINGS;
 
 SELECT t.id, t.tenant_code, tm.user_id, tm.role, tm.status
 FROM sys_user AS u
