@@ -1,5 +1,6 @@
 package com.ithsd.smart_tender.service.engine.rust;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ithsd.smart_tender.common.BizException;
 import com.ithsd.smart_tender.mapper.TenderMapper;
 import com.ithsd.smart_tender.model.entity.Tender;
@@ -53,13 +54,16 @@ public class RustDocumentService {
      * <p>自动恢复：若 Rust 侧返回 404（服务重启、内存清空），
      * 清除缓存并重新上传。</p>
      *
-     * @param bidId Java 侧 Tender 主键
+     * @param bidId    Java 侧 Tender 主键
+     * @param tenantId 租户 ID（由调用方显式传入，同时用于租户隔离验证）
      * @return Rust document_id（UUID）
      * @throws BizException 上传失败或文件不存在
      */
     @Transactional
-    public String ensureUploaded(Long bidId) {
-        Tender tender = tenderMapper.selectById(bidId);
+    public String ensureUploaded(Long bidId, Long tenantId) {
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, bidId)
+                .eq(Tender::getTenantId, tenantId));
         if (tender == null) {
             throw new BizException(5704, "标书不存在: bidId=" + bidId);
         }
@@ -84,9 +88,14 @@ public class RustDocumentService {
      * 仅返回数据库中已缓存的 Rust 文档 ID，不验证 Rust 内存中的文档是否仍存在。
      * 用于任务恢复：Rust 的最终结果有磁盘 fallback，即使服务重启后文档对象
      * 尚未恢复，旧 document_id 对应的结果仍然可以读取。
+     *
+     * @param bidId    Java 侧 Tender 主键
+     * @param tenantId 租户 ID（由调用方显式传入，同时用于租户隔离验证）
      */
-    public String getCachedDocumentId(Long bidId) {
-        Tender tender = tenderMapper.selectById(bidId);
+    public String getCachedDocumentId(Long bidId, Long tenantId) {
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, bidId)
+                .eq(Tender::getTenantId, tenantId));
         return tender == null ? null : tender.getRustDocumentId();
     }
 

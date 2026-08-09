@@ -5,6 +5,16 @@ export interface LoginParams {
    password: string;
 }
 
+export interface UserInfo {
+   id: number;
+   username: string;
+   realName: string;
+   tenantId: number | null;
+   tenantName: string | null;
+   isSuperAdmin: boolean;
+   role: string;
+}
+
 export interface LoginResponse {
    token: string;
    /** 后端返回 user_info（snake_case），见 docs/前端多租户交接文档.md:74 */

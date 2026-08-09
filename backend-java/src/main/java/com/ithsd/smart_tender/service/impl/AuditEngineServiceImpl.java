@@ -111,7 +111,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             return true;
         }
 
-        String rustDocId = rustDocumentService.getCachedDocumentId(task.getBidId());
+        String rustDocId = rustDocumentService.getCachedDocumentId(task.getBidId(), task.getTenantId());
         if (!StringUtils.hasText(rustDocId)) {
             log.warn("recover: no cached Rust document id, taskId={}", taskId);
             return false;
@@ -162,7 +162,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             updateStage(task, AuditStageEnum.UPLOADING, 10);
             String rustDocId;
             try {
-                rustDocId = rustDocumentService.ensureUploaded(task.getBidId());
+                rustDocId = rustDocumentService.ensureUploaded(task.getBidId(), task.getTenantId());
                 log.info("═══ [审核 Stage 1/4] 文件上传完成 → rustDocId={} ═══", rustDocId);
             } catch (Exception ex) {
                 log.error("❌ [审核 Stage 1/4] Rust 上传失败: taskId={}, bidId={} — {}", taskId, task.getBidId(), ex.getMessage(), ex);

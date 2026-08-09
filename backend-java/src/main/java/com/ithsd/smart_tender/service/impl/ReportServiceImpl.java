@@ -36,12 +36,15 @@ public class ReportServiceImpl implements ReportService {
 
     @Override
     public ReportVO generateReport(String auditIdOrTaskId) {
-        Long auditId = resolveAuditId(auditIdOrTaskId);
-        AuditTask task = auditTaskMapper.selectById(auditId);
+        Long tenantId = TenantScope.requiredTenantId();
+        Long auditId = resolveAuditId(auditIdOrTaskId, tenantId);
+        AuditTask task = auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getId, auditId)
+                .eq(AuditTask::getTenantId, tenantId));
         if (task == null) {
             throw new RuntimeException("审核任务不存在");
         }
-        
+
         if (task.getTaskStatus() != 2) {
             throw new RuntimeException("审核任务尚未完成，无法生成报告");
         }
@@ -55,7 +58,9 @@ public class ReportServiceImpl implements ReportService {
             return vo;
         }
 
-        Tender tender = tenderMapper.selectById(task.getBidId());
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, task.getBidId())
+                .eq(Tender::getTenantId, tenantId));
         if (tender == null) {
             throw new RuntimeException("标书信息不存在");
         }
@@ -87,19 +92,29 @@ public class ReportServiceImpl implements ReportService {
 
     @Override
     public String getReportContent(String auditIdOrTaskId) {
-        Long auditId = resolveAuditId(auditIdOrTaskId);
+        Long tenantId = TenantScope.requiredTenantId();
+        Long auditId = resolveAuditId(auditIdOrTaskId, tenantId);
+
+        // 验证审核任务属于当前租户
+        AuditTask task = auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getId, auditId)
+                .eq(AuditTask::getTenantId, tenantId));
+        if (task == null) {
+            return null;
+        }
+
         LambdaQueryWrapper<AuditReport> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(AuditReport::getAuditId, auditId);
         AuditReport report = auditReportMapper.selectOne(wrapper);
-        
+
         if (report == null) {
             return null;
         }
-        
+
         return report.getDocContent();
     }
 
-    private Long resolveAuditId(String auditIdOrTaskId) {
+    private Long resolveAuditId(String auditIdOrTaskId, Long tenantId) {
         if (auditIdOrTaskId == null || auditIdOrTaskId.isBlank()) {
             throw new RuntimeException("审核任务标识不能为空");
         }
@@ -108,6 +123,7 @@ public class ReportServiceImpl implements ReportService {
             // 1) 前端路由参数当前语义是 bidId：优先按 bid_id 找最新任务，避免与 audit_task.id 数值冲突
             LambdaQueryWrapper<AuditTask> byBidIdWrapper = new LambdaQueryWrapper<>();
             byBidIdWrapper.eq(AuditTask::getBidId, numericId)
+                    .eq(AuditTask::getTenantId, tenantId)
                     .orderByDesc(AuditTask::getCreateTime)
                     .last("LIMIT 1");
             AuditTask byBidId = auditTaskMapper.selectOne(byBidIdWrapper);
@@ -115,14 +131,18 @@ public class ReportServiceImpl implements ReportService {
                 return byBidId.getId();
             }
             // 2) 回退兼容：若不是 bidId，再按 audit_task 主键(id)解释
-            AuditTask byAuditId = auditTaskMapper.selectById(numericId);
+            AuditTask byAuditId = auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
+                    .eq(AuditTask::getId, numericId)
+                    .eq(AuditTask::getTenantId, tenantId));
             if (byAuditId != null && byAuditId.getId() != null) {
                 return byAuditId.getId();
             }
             throw new RuntimeException("审核任务不存在");
         } catch (NumberFormatException ignore) {
             LambdaQueryWrapper<AuditTask> wrapper = new LambdaQueryWrapper<>();
-            wrapper.eq(AuditTask::getTaskId, auditIdOrTaskId).last("LIMIT 1");
+            wrapper.eq(AuditTask::getTaskId, auditIdOrTaskId)
+                    .eq(AuditTask::getTenantId, tenantId)
+                    .last("LIMIT 1");
             AuditTask task = auditTaskMapper.selectOne(wrapper);
             if (task == null || task.getId() == null) {
                 throw new RuntimeException("审核任务不存在");

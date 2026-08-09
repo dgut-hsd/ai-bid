@@ -33,15 +33,20 @@ export function LoginPage() {
          const { phone, password, remember } = values;
          const response = await loginMutate({ phone, password });
 
-         const user = response.data.user_info;
-         if (response.code === 200 && response.data && user) {
+         if (response.code === 200 && response.data) {
+            // 后端使用 snake_case，需映射为 camelCase
+            const loginData = response.data as any;
             dispatch(
                setCredentials({
-                  token: response.data.token,
+                  token: loginData.token,
                   userInfo: {
-                     id: user.user_id,
-                     username: user.username,
-                     realName: user.realName ?? user.username,
+                     id: loginData.user_info?.user_id ?? loginData.user_info?.id,
+                     username: loginData.user_info?.username,
+                     realName: loginData.user_info?.realName ?? loginData.user_info?.username ?? '',
+                     tenantId: null,
+                     tenantName: null,
+                     isSuperAdmin: false,
+                     role: loginData.current_tenant?.role || '',
                   },
                   rememberMe: remember,
                })
