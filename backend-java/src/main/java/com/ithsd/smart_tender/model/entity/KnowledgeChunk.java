@@ -12,6 +12,9 @@ import java.util.Date;
 public class KnowledgeChunk {
     @TableId(value = "id", type = IdType.AUTO)
     private Long id;
+
+    @TableField("tenant_id")
+    private Long tenantId;
     private Long fileId;
     private Integer chunkIndex;
     private String chunkText;

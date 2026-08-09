@@ -1,5 +1,6 @@
 package com.ithsd.smart_tender.config;
 
+import com.ithsd.smart_tender.common.TenantContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -27,6 +28,7 @@ public class AsyncConfig {
         executor.setQueueCapacity(queueCapacity);
         executor.setKeepAliveSeconds(keepAliveSeconds);
         executor.setThreadNamePrefix("audit-async-");
+        executor.setTaskDecorator(TenantContext::wrap);
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(10);
         executor.setRejectedExecutionHandler((r, e) -> {
