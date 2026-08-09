@@ -1,5 +1,6 @@
 package com.ithsd.smart_tender.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ithsd.smart_tender.common.BaseContext;
 import com.ithsd.smart_tender.mapper.ChatMessageMapper;
 import com.ithsd.smart_tender.mapper.TenderMapper;
@@ -10,6 +11,7 @@ import com.ithsd.smart_tender.model.vo.ChatMessageVO;
 import com.ithsd.smart_tender.model.vo.ChatResponseVO;
 import com.ithsd.smart_tender.service.engine.rust.RustApiClient;
 import com.ithsd.smart_tender.service.engine.rust.RustDocumentService;
+import com.ithsd.smart_tender.service.impl.TenantScope;
 import com.ithsd.smart_tender.model.dto.rust.RustChatRequest;
 import com.ithsd.smart_tender.model.dto.rust.RustChatResponse;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -51,6 +53,7 @@ public class ChatService {
         final Long userId = rawUserId != null ? rawUserId : 0L;
         Long projectId = requestDTO.getProjectId();
         Long bidId = requestDTO.getBidId();
+        Long tenantId = TenantScope.requiredTenantId();
 
         // 1. 保存用户消息
         ChatMessage userMsg = ChatMessage.builder()
@@ -59,13 +62,15 @@ public class ChatService {
                 .createTime(LocalDateTime.now()).build();
         chatMessageMapper.insert(userMsg);
 
-        // 2. 获取标书
-        Tender tender = tenderMapper.selectById(bidId);
+        // 2. 获取标书（租户隔离：必须附加 tenant_id）
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, bidId)
+                .eq(Tender::getTenantId, tenantId));
 
         // 3. 确保文件已上传到 Rust（幂等，Rust 重启后自动重传）
         ChatResponseVO response;
         try {
-            String rustDocId = rustDocumentService.ensureUploaded(bidId);
+            String rustDocId = rustDocumentService.ensureUploaded(bidId, tenantId);
             response = chatViaRust(rustDocId, tender, requestDTO, projectId, bidId, userId);
         } catch (Exception e) {
             log.warn("chat: Rust document upload failed, bidId={}: {}", bidId, e.getMessage());
@@ -106,6 +111,7 @@ public class ChatService {
 
         Long rawUserId = BaseContext.getCurrentId();
         final Long userId = rawUserId != null ? rawUserId : 0L;
+        Long tenantId = TenantScope.requiredTenantId();
 
         log.info("chatStream called: projectId={}, bidId={}, contentLen={}", projectId, bidId,
                 requestDTO.getContent() != null ? requestDTO.getContent().length() : 0);
@@ -118,7 +124,9 @@ public class ChatService {
         chatMessageMapper.insert(userMsg);
 
         // 2. Get tender & ensure uploaded to Rust (lazy upload, like sync chat())
-        Tender tender = tenderMapper.selectById(bidId);
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, bidId)
+                .eq(Tender::getTenantId, tenantId));
         log.info("chatStream tender: bidId={}, found={}, rustDocId={}", bidId,
                 tender != null, tender != null ? tender.getRustDocumentId() : "N/A");
 
@@ -133,7 +141,7 @@ public class ChatService {
         // ★ 触发懒上传到 Rust（对齐同步 chat() 的 chatViaRust 逻辑）
         final String rustDocId;
         try {
-            rustDocId = rustDocumentService.ensureUploaded(bidId);
+            rustDocId = rustDocumentService.ensureUploaded(bidId, tenantId);
             log.info("chatStream: Rust doc ready, docId={}", rustDocId);
         } catch (Exception e) {
             log.warn("chatStream: ensureUploaded failed for bidId={}: {}", bidId, e.getMessage());
@@ -334,6 +342,16 @@ public class ChatService {
     public List<ChatMessageVO> getHistory(Long projectId, Long bidId, Integer days) {
         Long rawUserId = BaseContext.getCurrentId();
         final Long userId = rawUserId != null ? rawUserId : 0L;
+        Long tenantId = TenantScope.requiredTenantId();
+
+        // 验证标书属于当前租户
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, bidId)
+                .eq(Tender::getTenantId, tenantId));
+        if (tender == null) {
+            return List.of();
+        }
+
         int queryDays = (days != null && days > 0) ? days : 10;
         LocalDateTime startTime = LocalDateTime.now().minusDays(queryDays);
         List<ChatMessage> messages = chatMessageMapper.selectList(

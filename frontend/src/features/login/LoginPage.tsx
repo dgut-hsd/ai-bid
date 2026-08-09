@@ -34,10 +34,20 @@ export function LoginPage() {
          const response = await loginMutate({ phone, password });
 
          if (response.code === 200 && response.data) {
+            // 后端使用 snake_case，需映射为 camelCase
+            const loginData = response.data as any;
             dispatch(
                setCredentials({
-                  token: response.data.token,
-                  userInfo: response.data.userInfo,
+                  token: loginData.token,
+                  userInfo: {
+                     id: loginData.user_info?.user_id ?? loginData.user_info?.id,
+                     username: loginData.user_info?.username,
+                     realName: loginData.user_info?.realName || '',
+                     tenantId: null,
+                     tenantName: null,
+                     isSuperAdmin: false,
+                     role: loginData.current_tenant?.role || '',
+                  },
                   rememberMe: remember,
                })
             );

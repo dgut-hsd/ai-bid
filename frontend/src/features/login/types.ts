@@ -9,6 +9,10 @@ export interface UserInfo {
    id: number;
    username: string;
    realName: string;
+   tenantId: number | null;
+   tenantName: string | null;
+   isSuperAdmin: boolean;
+   role: string;
 }
 
 export interface LoginResponse {
