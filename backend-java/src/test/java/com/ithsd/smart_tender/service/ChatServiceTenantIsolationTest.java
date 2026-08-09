@@ -1,6 +1,7 @@
 package com.ithsd.smart_tender.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.ithsd.smart_tender.common.TenantAuthException;
 import com.ithsd.smart_tender.common.TenantContext;
 import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.mapper.ChatMessageMapper;
@@ -23,6 +24,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.lang.reflect.Field;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.times;
@@ -92,6 +94,26 @@ class ChatServiceTenantIsolationTest {
         verify(chatMessageMapper, times(2)).insert(messages.capture());
         assertThat(messages.getAllValues()).extracting(ChatServiceTenantIsolationTest::tenantIdOf)
                 .containsExactly(TENANT_ID, TENANT_ID);
+    }
+
+    @Test
+    void history_hidesCrossTenantProjectBeforeReadingMessages() {
+        when(projectMapper.selectOne(any())).thenReturn(null);
+
+        assertThatThrownBy(() -> chatService.getHistory(10L, 20L, 7))
+                .isInstanceOf(TenantAuthException.class)
+                .satisfies(error -> {
+                    TenantAuthException tenantError = (TenantAuthException) error;
+                    assertThat(tenantError.getStatus()).isEqualTo(404);
+                    assertThat(tenantError.getErrorCode()).isEqualTo("RESOURCE_NOT_FOUND");
+                });
+
+        ArgumentCaptor<QueryWrapper<Project>> projectQuery =
+                ArgumentCaptor.forClass(QueryWrapper.class);
+        verify(projectMapper).selectOne(projectQuery.capture());
+        assertTenantPredicate(projectQuery.getValue());
+        verify(tenderMapper, org.mockito.Mockito.never()).selectOne(any());
+        verify(chatMessageMapper, org.mockito.Mockito.never()).selectList(any());
     }
 
     private static void assertTenantPredicate(QueryWrapper<?> wrapper) {

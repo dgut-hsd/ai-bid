@@ -1,6 +1,7 @@
 package com.ithsd.smart_tender.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.ithsd.smart_tender.common.TenantAuthException;
 import com.ithsd.smart_tender.common.TenantContext;
 import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.mapper.AuditIssueMapper;
@@ -26,10 +27,12 @@ import java.lang.reflect.Field;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -105,6 +108,25 @@ class ReportTenantIsolationTest {
                 ArgumentCaptor.forClass(QueryWrapper.class);
         verify(auditReportMapper).selectOne(reportQuery.capture());
         assertTenantPredicate(reportQuery.getValue());
+    }
+
+    @Test
+    void getReportContent_hidesCrossTenantTaskBeforeReadingReport() {
+        when(auditTaskMapper.selectOne(any())).thenReturn(null);
+
+        assertThatThrownBy(() -> reportService.getReportContent("task-from-b"))
+                .isInstanceOf(TenantAuthException.class)
+                .satisfies(error -> {
+                    TenantAuthException tenantError = (TenantAuthException) error;
+                    assertThat(tenantError.getStatus()).isEqualTo(404);
+                    assertThat(tenantError.getErrorCode()).isEqualTo("RESOURCE_NOT_FOUND");
+                });
+
+        ArgumentCaptor<QueryWrapper<AuditTask>> taskQuery =
+                ArgumentCaptor.forClass(QueryWrapper.class);
+        verify(auditTaskMapper).selectOne(taskQuery.capture());
+        assertTenantPredicate(taskQuery.getValue());
+        verify(auditReportMapper, never()).selectOne(any());
     }
 
     private static void assertTenantPredicate(QueryWrapper<?> wrapper) {

@@ -17,6 +17,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -86,33 +87,18 @@ public class RedisStreamAuditTaskWorker {
     private void handleFailure(String messageId, AuditTaskEnvelope envelope, int retry, RuntimeException ex) {
         int nextRetry = retry + 1;
         if (nextRetry > Math.max(0, queueProperties.getMaxRetry())) {
-            Map<String, String> fields = new java.util.LinkedHashMap<>(envelope.toRedisFields());
+            Map<String, String> fields = new LinkedHashMap<>(envelope.toRedisFields());
             fields.put("retry", String.valueOf(retry));
             fields.put("reason", ex.getMessage() == null ? "unknown" : ex.getMessage());
-            redisTemplate.opsForStream().add(MapRecord.<String, String, String>create(queueProperties.getDlqStreamKey(), Map.of(
-                    "schema_version", fields.get("schema_version"),
-                    "tenant_id", fields.get("tenant_id"),
-                    "task_id", fields.get("task_id"),
-                    "actor_user_id", fields.get("actor_user_id"),
-                    "session_version", fields.get("session_version"),
-                    "request_id", fields.get("request_id"),
-                    "retry", fields.get("retry"),
-                    "reason", fields.get("reason")
-            )));
+            redisTemplate.opsForStream().add(
+                    MapRecord.<String, String, String>create(queueProperties.getDlqStreamKey(), fields));
             ack(messageId);
             return;
         }
-        Map<String, String> fields = new java.util.LinkedHashMap<>(envelope.toRedisFields());
+        Map<String, String> fields = new LinkedHashMap<>(envelope.toRedisFields());
         fields.put("retry", String.valueOf(nextRetry));
-        redisTemplate.opsForStream().add(MapRecord.<String, String, String>create(queueProperties.getStreamKey(), Map.of(
-                "schema_version", fields.get("schema_version"),
-                "tenant_id", fields.get("tenant_id"),
-                "task_id", fields.get("task_id"),
-                "actor_user_id", fields.get("actor_user_id"),
-                "session_version", fields.get("session_version"),
-                "request_id", fields.get("request_id"),
-                "retry", fields.get("retry")
-        )));
+        redisTemplate.opsForStream().add(
+                MapRecord.<String, String, String>create(queueProperties.getStreamKey(), fields));
         ack(messageId);
     }
 
