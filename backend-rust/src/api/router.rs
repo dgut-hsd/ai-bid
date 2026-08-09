@@ -34,6 +34,7 @@ const INTERNAL_SECRET_FALLBACK_ENV: &str = "AIBID_INTERNAL_API_SECRET";
 const MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 const REPLAY_RETENTION_SECONDS: i64 = 600;
 const MAX_INTERNAL_BODY_BYTES: usize = 50 * 1024 * 1024;
+const MAX_INTERNAL_REQUEST_ID_BYTES: usize = 128;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -144,7 +145,7 @@ fn verify_internal_request(
 
     if !handlers::is_valid_tenant_id(&tenant_id)
         || !handlers::is_valid_tenant_id(&user_id)
-        || request_id.len() > 64
+        || request_id.len() > MAX_INTERNAL_REQUEST_ID_BYTES
     {
         return Err(InternalAuthError::Invalid);
     }
@@ -238,7 +239,7 @@ fn internal_auth_error_response(
     let request_id = headers
         .get(INTERNAL_REQUEST_HEADER)
         .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_INTERNAL_REQUEST_ID_BYTES)
         .map(str::to_string)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let status = StatusCode::UNAUTHORIZED;
@@ -735,6 +736,32 @@ mod tests {
         request
     }
 
+    const JAVA_REQUEST_ID: &str =
+        "550e8400-e29b-41d4-a716-446655440000.6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+
+    #[tokio::test]
+    async fn accepts_java_style_request_id() {
+        assert_eq!(JAVA_REQUEST_ID.len(), 36 + 1 + 36);
+        let secret = "test-secret";
+        let request = signed_request(
+            Method::POST,
+            "/api/v1/test",
+            b"{}",
+            unix_timestamp(),
+            "100",
+            "200",
+            JAVA_REQUEST_ID,
+            secret,
+        );
+
+        let response = test_router(InternalAuthConfig::test_secret(secret))
+            .oneshot(request)
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn accepts_valid_request_and_exposes_verified_context() {
         let secret = "test-secret";
@@ -836,7 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_contract_json_for_invalid_signature() {
-        let request_id = "invalid-signature";
+        let request_id = JAVA_REQUEST_ID;
         let mut request = signed_request(
             Method::POST,
             "/api/v1/test",
