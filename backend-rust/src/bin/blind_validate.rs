@@ -1,4 +1,4 @@
-//! Blind-v2 ground truth validation ? runs the YAML rule engine + normalize_finding
+//! Blind-v2 ground truth validation -- runs the YAML rule engine + normalize_finding
 //! directly against the 30 frozen annotations' source_quote texts.
 //!
 //! This is a lightweight proxy for the full pipeline: it tests whether the rule
@@ -33,7 +33,7 @@ struct Annotation {
 /// Map blind-v2 category codes (e.g. "C01_LOCAL_REGISTRATION") to canonical
 /// codes (e.g. "LOCAL_REGISTRATION").
 fn canonical_from_blind(code: &str) -> &str {
-    // Format: "C01_LOCAL_REGISTRATION" ? strip prefix before first '_'
+    // Format: "C01_LOCAL_REGISTRATION" -- strip prefix before first '_'
     if let Some(idx) = code.find('_') {
         &code[idx + 1..]
     } else {
@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (book, warnings) = load_rulebook(Path::new(rulebook_path))
         .map_err(|e| format!("Failed to load {rulebook_path}: {e}. Run from backend-rust/ dir."))?;
     if !warnings.is_empty() {
-        eprintln!("??  Rulebook warnings: {}", warnings.len());
+        eprintln!("!!  Rulebook warnings: {}", warnings.len());
     }
     eprintln!("Loaded {} rules", book.rules.len());
 
@@ -188,10 +188,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Per-annotation detail
-        let cat_status = if cat_matched { "?" } else { "?" };
+        let cat_status = if cat_matched { "+" } else { "-" };
         let crit_status = if ann.is_critical {
-            if critical_matched { "?C" } else { "?C" }
-        } else if critical_matched { "?FP" } else { "  " };
+            if critical_matched { "+C" } else { "-C" }
+        } else if critical_matched { "!FP" } else { "  " };
         eprintln!(
             "  {} {} {:<25} [{:<8}] crit={} hits={:?} legacy={:?}",
             ann.finding_id,
@@ -216,20 +216,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         critical_tp as f64 / (critical_tp + critical_fp) as f64
     } else { 1.0 };
 
-    eprintln!("\n????????????????????????????????????????????????????????????");
-    eprintln!("?  Blind-v2 Ground Truth ? Rule Engine Validation         ?");
-    eprintln!("????????????????????????????????????????????????????????????");
+    eprintln!("\n============================================================");
+    eprintln!("|  Blind-v2 Ground Truth -- Rule Engine Validation         |");
+    eprintln!("============================================================");
     eprintln!("  Total annotations:     {total}");
-    eprintln!("  ?????????????????????????????????????????????????????");
+    eprintln!("  ============================================================");
     eprintln!("  Category detection:");
     eprintln!("    TP={tp}  FP={fp}  FN={fn_}");
     eprintln!("    Recall={:.1}%  Precision={:.1}%  F1={:.1}%", recall * 100.0, precision * 100.0, f1 * 100.0);
-    eprintln!("  ?????????????????????????????????????????????????????");
+    eprintln!("  ============================================================");
     eprintln!("  Critical marking:");
     eprintln!("    Critical TP={critical_tp}  Critical FN={critical_fn}  Critical FP={critical_fp}");
     eprintln!("    Critical Recall={:.1}%  Critical Precision={:.1}%",
         critical_recall * 100.0, critical_precision * 100.0);
-    eprintln!("  ?????????????????????????????????????????????????????");
+    eprintln!("  ============================================================");
     eprintln!("  Per-category breakdown:");
     per_category.sort_by(|a, b| a.0.cmp(&b.0));
     for (cat, total_c, hit, miss) in &per_category {
@@ -239,13 +239,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Baseline comparison
-    eprintln!("  ?????????????????????????????????????????????????????");
+    eprintln!("  ============================================================");
     eprintln!("  Baseline (blind-v2-final-20260727):");
     eprintln!("    Recall=70.0%  Precision=56.8%  F1=62.7%");
     eprintln!("    Critical Recall=30.0%");
-    eprintln!("  ?????????????????????????????????????????????????????");
+    eprintln!("  ============================================================");
     eprintln!("  Target:");
-    eprintln!("    Critical Recall ? 95%");
+    eprintln!("    Critical Recall >= 95%");
 
     // JSON output for piping
     let report = serde_json::json!({
