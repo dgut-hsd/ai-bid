@@ -714,7 +714,6 @@ const ClauseActivityMap: React.FC<Props> = ({
   const totalClauses = clauseMap.size;
   const reviewedClauses = Array.from(clauseMap.values()).filter(c => c.status === 'reviewed').length;
   const totalRisks = sectionTree.reduce((sum, n) => sum + n.riskCount, 0);
-  const clausePct = totalClauses > 0 ? Math.round((reviewedClauses / totalClauses) * 100) : 0;
 
   if (!isAuditing && !isComplete && sectionTree.length === 0 && clauseMap.size === 0 && traceEvents.length === 0) {
     return null;
@@ -753,10 +752,6 @@ const ClauseActivityMap: React.FC<Props> = ({
 
       <PhaseBar phaseEvent={phaseEvent} statsEvent={statsEvent} elapsedSeconds={elapsedSeconds} isComplete={isComplete} />
       {!isComplete && <AgentMiniCards progresses={agentProgresses} />}
-
-      {!isComplete && totalClauses > 0 && (
-        <Progress percent={clausePct} size="small" strokeColor="#52c41a" style={{ marginBottom: 8 }} />
-      )}
 
       <div style={{
         maxHeight: 500,

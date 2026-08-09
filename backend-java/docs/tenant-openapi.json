@@ -1,0 +1,1625 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "AI-Bid 多租户后端 API",
+    "version": "tenant-v1",
+    "description": "Java 业务网关的多租户认证、租户、成员、邀请和审核 SSE 契约。租户 ID 在 JSON、JWT、消息和 Header 中使用十进制字符串。"
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "paths": {
+    "/api/auth/login": {
+      "post": {
+        "operationId": "login",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AuthSession"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/auth/refresh": {
+      "post": {
+        "operationId": "refreshSession",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AuthSession"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/tenants": {
+      "get": {
+        "operationId": "listTenants",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "$ref": "#/components/parameters/Size"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/TenantPage"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createTenant",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTenantRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Tenant"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/tenants/current": {
+      "get": {
+        "operationId": "getCurrentTenant",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/TenantSummary"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/tenants/{tenantId}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TenantId"
+        }
+      ],
+      "patch": {
+        "operationId": "updateTenant",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTenantRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Tenant"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteTenant",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VersionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Empty"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/tenants/{tenantId}/switch": {
+      "post": {
+        "operationId": "switchTenant",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AuthSession"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/tenants/{tenantId}/transfer-owner": {
+      "post": {
+        "operationId": "transferOwner",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransferOwnerRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Tenant"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/tenants/{tenantId}/disable": {
+      "post": {
+        "operationId": "disableTenant",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Tenant"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/tenants/{tenantId}/restore": {
+      "post": {
+        "operationId": "restoreTenant",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Tenant"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/tenants/{tenantId}/members": {
+      "get": {
+        "operationId": "listMembers",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantId"
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "$ref": "#/components/parameters/Size"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/MemberPage"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/tenants/{tenantId}/members/{userId}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TenantId"
+        },
+        {
+          "$ref": "#/components/parameters/UserId"
+        }
+      ],
+      "patch": {
+        "operationId": "updateMember",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMemberRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Member"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "removeMember",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Empty"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/tenants/{tenantId}/invitations": {
+      "get": {
+        "operationId": "listInvitations",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantId"
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "$ref": "#/components/parameters/Size"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/InvitationPage"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createInvitation",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInvitationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Invitation"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/tenants/{tenantId}/invitations/{invitationId}": {
+      "delete": {
+        "operationId": "revokeInvitation",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantId"
+          },
+          {
+            "$ref": "#/components/parameters/InvitationId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Empty"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/tenant-invitations/{token}/accept": {
+      "post": {
+        "operationId": "acceptInvitation",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/InvitationToken"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Member"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "410": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/audit-tasks/{taskId}/stream": {
+      "get": {
+        "operationId": "streamAuditTask",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TaskId"
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Server-Sent Events stream",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "id: 1002\nevent: progress\ndata: {\"schema_version\":1,\"event_id\":\"1002\",\"event\":\"progress\",\"tenant_id\":\"20001\",\"task_id\":\"task-01J9J2J8F0M7Y8B6J5G4T3R2Q1\",\"occurred_at\":\"2026-08-06T13:01:00.123Z\",\"data\":{\"stage\":\"legal\",\"percent\":42,\"message\":\"正在审查\"}}\n\n"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "parameters": {
+      "TenantId": {
+        "name": "tenantId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        }
+      },
+      "UserId": {
+        "name": "userId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        }
+      },
+      "InvitationId": {
+        "name": "invitationId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        }
+      },
+      "InvitationToken": {
+        "name": "token",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 32,
+          "maxLength": 512
+        }
+      },
+      "TaskId": {
+        "name": "taskId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "Page": {
+        "name": "page",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        }
+      },
+      "Size": {
+        "name": "size",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 20
+        }
+      }
+    },
+    "schemas": {
+      "Result": {
+        "type": "object",
+        "required": [
+          "code",
+          "msg",
+          "timestamp"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer"
+          },
+          "msg": {
+            "type": "string"
+          },
+          "data": {},
+          "timestamp": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "ErrorData": {
+        "type": "object",
+        "required": [
+          "error_code",
+          "request_id"
+        ],
+        "properties": {
+          "error_code": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "details": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "ErrorResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Result"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/ErrorData"
+              }
+            }
+          }
+        ]
+      },
+      "LoginRequest": {
+        "type": "object",
+        "required": [
+          "username",
+          "password"
+        ],
+        "properties": {
+          "username": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string",
+            "format": "password"
+          }
+        }
+      },
+      "TenantRole": {
+        "type": "string",
+        "enum": [
+          "OWNER",
+          "ADMIN",
+          "AUDITOR",
+          "MEMBER",
+          "VIEWER"
+        ]
+      },
+      "TenantSummary": {
+        "type": "object",
+        "required": [
+          "tenant_id",
+          "tenant_code",
+          "name",
+          "status",
+          "role",
+          "permissions",
+          "is_current"
+        ],
+        "properties": {
+          "tenant_id": {
+            "type": "string"
+          },
+          "tenant_code": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ACTIVE",
+              "DISABLED",
+              "DELETED"
+            ]
+          },
+          "role": {
+            "$ref": "#/components/schemas/TenantRole"
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "is_current": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Tenant": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TenantSummary"
+          },
+          {
+            "type": "object",
+            "required": [
+              "owner_user_id",
+              "plan_code",
+              "version",
+              "created_at",
+              "updated_at"
+            ],
+            "properties": {
+              "owner_user_id": {
+                "type": "string"
+              },
+              "plan_code": {
+                "type": "string"
+              },
+              "settings": {
+                "type": "object",
+                "additionalProperties": true,
+                "nullable": true
+              },
+              "version": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "created_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "updated_at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
+          }
+        ]
+      },
+      "AuthSession": {
+        "type": "object",
+        "required": [
+          "token",
+          "token_type",
+          "expires_in",
+          "session_version",
+          "user_info",
+          "tenants"
+        ],
+        "properties": {
+          "token": {
+            "type": "string"
+          },
+          "token_type": {
+            "type": "string",
+            "enum": [
+              "Bearer"
+            ]
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "session_version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "user_info": {
+            "type": "object",
+            "required": [
+              "user_id",
+              "username"
+            ],
+            "properties": {
+              "user_id": {
+                "type": "string"
+              },
+              "username": {
+                "type": "string"
+              },
+              "real_name": {
+                "type": "string",
+                "nullable": true
+              }
+            }
+          },
+          "current_tenant": {
+            "$ref": "#/components/schemas/TenantSummary",
+            "nullable": true
+          },
+          "tenants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TenantSummary"
+            }
+          }
+        }
+      },
+      "TenantMember": {
+        "type": "object",
+        "required": [
+          "member_id",
+          "tenant_id",
+          "user_id",
+          "role",
+          "permissions",
+          "status",
+          "joined_at"
+        ],
+        "properties": {
+          "member_id": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          },
+          "real_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "role": {
+            "$ref": "#/components/schemas/TenantRole"
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ACTIVE",
+              "SUSPENDED",
+              "REMOVED"
+            ]
+          },
+          "joined_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "TenantInvitation": {
+        "type": "object",
+        "required": [
+          "invitation_id",
+          "tenant_id",
+          "email",
+          "role",
+          "expires_at",
+          "status"
+        ],
+        "properties": {
+          "invitation_id": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "role": {
+            "$ref": "#/components/schemas/TenantRole"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "accepted_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "revoked_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "PENDING",
+              "ACCEPTED",
+              "REVOKED",
+              "EXPIRED"
+            ]
+          },
+          "accept_token": {
+            "type": "string",
+            "writeOnly": true
+          }
+        }
+      },
+      "CreateTenantRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "tenant_code": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]{2,63}$"
+          },
+          "plan_code": {
+            "type": "string",
+            "default": "STANDARD"
+          },
+          "settings": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "UpdateTenantRequest": {
+        "type": "object",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "plan_code": {
+            "type": "string"
+          },
+          "settings": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "VersionRequest": {
+        "type": "object",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "TransferOwnerRequest": {
+        "type": "object",
+        "required": [
+          "target_user_id",
+          "version"
+        ],
+        "properties": {
+          "target_user_id": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "UpdateMemberRequest": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/TenantRole"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ACTIVE",
+              "SUSPENDED",
+              "REMOVED"
+            ]
+          }
+        },
+        "minProperties": 1,
+        "additionalProperties": false
+      },
+      "CreateInvitationRequest": {
+        "type": "object",
+        "required": [
+          "email",
+          "role"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "ADMIN",
+              "AUDITOR",
+              "MEMBER",
+              "VIEWER"
+            ]
+          },
+          "expires_in_seconds": {
+            "type": "integer",
+            "minimum": 3600,
+            "maximum": 2592000,
+            "default": 604800
+          }
+        }
+      },
+      "EventEnvelope": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "event_id",
+          "event",
+          "tenant_id",
+          "task_id",
+          "occurred_at",
+          "data"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "event": {
+            "type": "string",
+            "enum": [
+              "progress",
+              "issue",
+              "complete",
+              "agent_progress",
+              "trace",
+              "phase",
+              "stats",
+              "finding_added",
+              "finding_updated",
+              "finding_removed",
+              "error"
+            ]
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "occurred_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "responses": {
+      "AuthSession": {
+        "description": "登录、刷新或租户切换成功",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Result"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AuthSession"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "Tenant": {
+        "description": "租户对象",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Result"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Tenant"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "TenantSummary": {
+        "description": "当前租户摘要",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Result"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/TenantSummary"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "TenantPage": {
+        "description": "租户列表",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Result"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "current_tenant_id",
+                        "items"
+                      ],
+                      "properties": {
+                        "current_tenant_id": {
+                          "type": "string",
+                          "nullable": true
+                        },
+                        "items": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/components/schemas/TenantSummary"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "Member": {
+        "description": "成员对象",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Result"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/TenantMember"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "MemberPage": {
+        "description": "成员列表",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Result"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "page": {
+                          "type": "integer"
+                        },
+                        "size": {
+                          "type": "integer"
+                        },
+                        "total": {
+                          "type": "integer",
+                          "format": "int64"
+                        },
+                        "items": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/components/schemas/TenantMember"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "Invitation": {
+        "description": "邀请对象；accept_token 仅创建响应返回一次",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Result"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/TenantInvitation"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "InvitationPage": {
+        "description": "邀请列表",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Result"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "page": {
+                          "type": "integer"
+                        },
+                        "size": {
+                          "type": "integer"
+                        },
+                        "total": {
+                          "type": "integer",
+                          "format": "int64"
+                        },
+                        "items": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/components/schemas/TenantInvitation"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "Empty": {
+        "description": "成功，无业务数据",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Result"
+            }
+          }
+        }
+      },
+      "Error": {
+        "description": "统一错误响应",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    }
+  },
+  "x-contract-version": "tenant-v1",
+  "x-schema-version": 1,
+  "x-role-permissions": {
+    "OWNER": [
+      "tenant.read",
+      "tenant.settings.write",
+      "tenant.members.invite",
+      "tenant.members.remove",
+      "tenant.members.role.write",
+      "tenant.owner.transfer",
+      "tender.write",
+      "audit.start",
+      "audit.report.read",
+      "knowledge.write",
+      "tenant.delete"
+    ],
+    "ADMIN": [
+      "tenant.read",
+      "tenant.settings.write",
+      "tenant.members.invite",
+      "tenant.members.remove",
+      "tenant.members.role.write",
+      "tender.write",
+      "audit.start",
+      "audit.report.read",
+      "knowledge.write"
+    ],
+    "AUDITOR": [
+      "tenant.read",
+      "tender.write",
+      "audit.start",
+      "audit.report.read",
+      "knowledge.write"
+    ],
+    "MEMBER": [
+      "tenant.read",
+      "tender.write",
+      "audit.start",
+      "audit.report.read",
+      "knowledge.write"
+    ],
+    "VIEWER": [
+      "tenant.read",
+      "audit.report.read"
+    ]
+  },
+  "x-error-codes": {
+    "400": [
+      "REQUEST_INVALID",
+      "TENANT_REQUIRED"
+    ],
+    "401": [
+      "AUTH_REQUIRED",
+      "AUTH_INVALID",
+      "TENANT_SESSION_STALE",
+      "INTERNAL_SIGNATURE_MISSING",
+      "INTERNAL_SIGNATURE_INVALID",
+      "INTERNAL_SIGNATURE_EXPIRED",
+      "INTERNAL_REQUEST_REPLAYED"
+    ],
+    "403": [
+      "TENANT_ROLE_FORBIDDEN",
+      "TENANT_OWNER_REQUIRED",
+      "TENANT_CONTEXT_INVALID",
+      "INTERNAL_TENANT_MISMATCH"
+    ],
+    "404": [
+      "TENANT_NOT_FOUND",
+      "RESOURCE_NOT_FOUND",
+      "TENANT_MEMBER_NOT_FOUND",
+      "TENANT_INVITATION_NOT_FOUND"
+    ],
+    "409": [
+      "TENANT_ID_MISMATCH",
+      "TENANT_STATE_INVALID",
+      "TENANT_LAST_OWNER",
+      "TENANT_MEMBER_EXISTS",
+      "TENANT_INVITATION_STATE_INVALID",
+      "TENANT_EVENT_REPLAY_GAP"
+    ],
+    "410": [
+      "TENANT_INVITATION_EXPIRED"
+    ],
+    "429": [
+      "TENANT_QUOTA_EXCEEDED"
+    ],
+    "503": [
+      "TENANT_MIGRATION_NOT_READY"
+    ]
+  },
+  "x-sse": {
+    "path": "/api/audit-tasks/{taskId}/stream",
+    "required_headers": [
+      "Authorization"
+    ],
+    "optional_headers": [
+      "Last-Event-ID"
+    ],
+    "event_schema": {
+      "$ref": "#/components/schemas/EventEnvelope"
+    },
+    "events": [
+      "progress",
+      "issue",
+      "complete",
+      "agent_progress",
+      "trace",
+      "phase",
+      "stats",
+      "finding_added",
+      "finding_updated",
+      "finding_removed",
+      "error"
+    ],
+    "heartbeat_comment_seconds": 15,
+    "reconnect_retry_ms": 3000
+  },
+  "x-internal-java-rust": {
+    "required_headers": [
+      "X-Tenant-Id",
+      "X-User-Id",
+      "X-Request-Id",
+      "X-Internal-Timestamp",
+      "X-Internal-Signature"
+    ],
+    "algorithm": "HMAC-SHA256",
+    "signature_format": "v1=<lowercase hexadecimal digest>",
+    "timestamp_window_seconds": 300,
+    "replay_ttl_seconds": 600,
+    "canonical_lines": [
+      "v1",
+      "{METHOD}",
+      "{path_with_query}",
+      "{X-Internal-Timestamp}",
+      "{X-Tenant-Id}",
+      "{X-User-Id}",
+      "{X-Request-Id}",
+      "{lowercase_hex(SHA-256(body_bytes))}"
+    ]
+  }
+}

@@ -62,9 +62,11 @@ public class TenderServiceImpl implements TenderService {
 
     @Override
     public TenderStatsVO getStats(TenderPageQueryDTO dto) {
+        Long tenantId = TenantScope.requiredTenantId();
         // 使用 QueryWrapper 分组统计
         QueryWrapper<Tender> wrapper = new QueryWrapper<>();
         wrapper.select("parse_status", "count(*) as count");
+        wrapper.eq("tenant_id", tenantId);
         // 动态查询条件，与page接口保持一致（除status外）
         wrapper.like(StringUtils.hasText(dto.getBidName()), "bid_name", dto.getBidName());
         wrapper.eq(StringUtils.hasText(dto.getFileCategory()), "bid_type", dto.getFileCategory());
@@ -102,8 +104,18 @@ public class TenderServiceImpl implements TenderService {
 
     @Override
     public TenderVO upload(MultipartFile file, TenderDTO tenderDTO) {
+        Long tenantId = TenantScope.requiredTenantId();
         if (file.isEmpty()) {
             throw new BizException(400, "文件为空");
+        }
+
+        if (tenderDTO.getProjectId() != null) {
+            Project project = projectMapper.selectOne(new LambdaQueryWrapper<Project>()
+                    .eq(Project::getId, tenderDTO.getProjectId())
+                    .eq(Project::getTenantId, tenantId));
+            if (project == null) {
+                throw TenantScope.resourceNotFound();
+            }
         }
 
         String originalFilename = file.getOriginalFilename();
@@ -131,6 +143,7 @@ public class TenderServiceImpl implements TenderService {
 
         Tender tender = new Tender();
         BeanUtils.copyProperties(tenderDTO, tender);
+        tender.setTenantId(tenantId);
 
         tender.setFileName(originalFilename); // 默认情况下，将使用原始名称作为文件名，或者根据数据传输对象DTO来指定文件名
         if (StringUtils.hasText(tenderDTO.getBidName())) {
@@ -182,7 +195,10 @@ public class TenderServiceImpl implements TenderService {
         if (projectId == null || version == null) {
             return;
         }
-        Project project = projectMapper.selectById(projectId);
+        Long tenantId = TenantScope.requiredTenantId();
+        Project project = projectMapper.selectOne(new LambdaQueryWrapper<Project>()
+                .eq(Project::getId, projectId)
+                .eq(Project::getTenantId, tenantId));
         if (project == null) {
             return;
         }
@@ -191,20 +207,27 @@ public class TenderServiceImpl implements TenderService {
             project.setLatestVersion(version);
             project.setParseStatus(0);
             project.setUpdateTime(LocalDateTime.now());
-            projectMapper.updateById(project);
+            project.setTenantId(tenantId);
+            projectMapper.update(project, new LambdaQueryWrapper<Project>()
+                    .eq(Project::getId, projectId)
+                    .eq(Project::getTenantId, tenantId));
         }
     }
 
     @Override
     public PageResult page(TenderPageQueryDTO dto) {
+        Long tenantId = TenantScope.requiredTenantId();
         Page<Project> pageInfo = new Page<>(dto.getPage(), dto.getSize());
         LambdaQueryWrapper<Project> wrapper = new LambdaQueryWrapper<>();
         
-        wrapper.eq(Project::getUserId, BaseContext.getCurrentId())
+        wrapper.eq(Project::getTenantId, tenantId)
+               .eq(Project::getUserId, BaseContext.getCurrentId())
                .like(StringUtils.hasText(dto.getBidName()), Project::getProjectName, dto.getBidName())
                .ge(dto.getUploadStartTime() != null, Project::getCreateTime, dto.getUploadStartTime() != null ? dto.getUploadStartTime().atStartOfDay() : null)
                .le(dto.getUploadEndTime() != null, Project::getCreateTime, dto.getUploadEndTime() != null ? dto.getUploadEndTime().atTime(java.time.LocalTime.MAX) : null)
-               .orderByDesc(Project::getCreateTime);
+               // 按「改动时间」(updateTime) 倒序：每次上传新版本标书都会刷新 Project.updateTime，
+               // 因此刚上传完标书的项目会排在列表最前，便于在审核列表里快速定位。
+               .orderByDesc(Project::getUpdateTime);
 
         Page<Project> p = projectMapper.selectPage(pageInfo, wrapper);
 
@@ -220,6 +243,7 @@ public class TenderServiceImpl implements TenderService {
             // 查最新版本的标书获取文件相关信息
             LambdaQueryWrapper<Tender> tenderWrapper = new LambdaQueryWrapper<>();
             tenderWrapper.eq(Tender::getProjectId, project.getId())
+                         .eq(Tender::getTenantId, tenantId)
                          .orderByDesc(Tender::getVersion)
                          .last("LIMIT 1");
             Tender latestTender = tenderMapper.selectOne(tenderWrapper);
@@ -271,8 +295,13 @@ public class TenderServiceImpl implements TenderService {
 
     @Override
     public TenderVO getById(Long id) {
-        Tender tender = tenderMapper.selectById(id);
-        if (tender == null) return null;
+        Long tenantId = TenantScope.requiredTenantId();
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, id)
+                .eq(Tender::getTenantId, tenantId));
+        if (tender == null) {
+            throw TenantScope.resourceNotFound();
+        }
         // 验证资源归属：只有标书上传者才能查看详情
         Long currentUserId = BaseContext.getCurrentId();
         if (currentUserId != null && !currentUserId.equals(tender.getUploadUserId())) {
@@ -290,19 +319,23 @@ public class TenderServiceImpl implements TenderService {
 
     @Override
     public List<TenderVO> getVersionsByProjectId(Long projectId) {
+        Long tenantId = TenantScope.requiredTenantId();
         // 验证项目归属：只有项目所有者才能查看版本列表
         Long currentUserId = BaseContext.getCurrentId();
+        Project project = projectMapper.selectOne(new LambdaQueryWrapper<Project>()
+                .eq(Project::getId, projectId)
+                .eq(Project::getTenantId, tenantId));
+        if (project == null) {
+            throw TenantScope.resourceNotFound();
+        }
         if (currentUserId != null) {
-            Project project = projectMapper.selectById(projectId);
-            if (project == null) {
-                throw new BizException(404, "项目不存在");
-            }
             if (!currentUserId.equals(project.getUserId())) {
                 throw new BizException(403, "无权访问该项目");
             }
         }
         LambdaQueryWrapper<Tender> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(Tender::getProjectId, projectId)
+                .eq(Tender::getTenantId, tenantId)
                 .orderByDesc(Tender::getVersion); // 按版本号倒序排列
 
         List<Tender> tenders = tenderMapper.selectList(wrapper);
@@ -328,6 +361,7 @@ public class TenderServiceImpl implements TenderService {
         if (auditUserId == null) {
             LambdaQueryWrapper<AuditTask> fallbackWrapper = new LambdaQueryWrapper<>();
             fallbackWrapper.eq(AuditTask::getBidId, vo.getId())
+                    .eq(AuditTask::getTenantId, TenantScope.requiredTenantId())
                     .isNotNull(AuditTask::getAuditUserId)
                     .orderByDesc(AuditTask::getCreateTime)
                     .last("LIMIT 1");
@@ -350,6 +384,7 @@ public class TenderServiceImpl implements TenderService {
         }
         LambdaQueryWrapper<AuditTask> taskWrapper = new LambdaQueryWrapper<>();
         taskWrapper.eq(AuditTask::getBidId, bidId)
+                .eq(AuditTask::getTenantId, TenantScope.requiredTenantId())
                 .orderByDesc(AuditTask::getCreateTime)
                 .last("LIMIT 1");
         return auditTaskMapper.selectOne(taskWrapper);
@@ -388,11 +423,14 @@ public class TenderServiceImpl implements TenderService {
 
     @Override
     public List<TenderProjectVO> getProjects() {
+        Long tenantId = TenantScope.requiredTenantId();
         Long userId = BaseContext.getCurrentId();
         
         // 1. 去 project 表查当前用户的项目
         LambdaQueryWrapper<Project> projectWrapper = new LambdaQueryWrapper<>();
-        projectWrapper.eq(Project::getUserId, userId).orderByDesc(Project::getCreateTime);
+        projectWrapper.eq(Project::getTenantId, tenantId)
+                .eq(Project::getUserId, userId)
+                .orderByDesc(Project::getCreateTime);
         List<Project> projects = projectMapper.selectList(projectWrapper);
         
         // 获取创建人真实姓名
@@ -411,6 +449,7 @@ public class TenderServiceImpl implements TenderService {
             // 2. 去标书表里查相关字段
             LambdaQueryWrapper<Tender> tenderWrapper = new LambdaQueryWrapper<>();
             tenderWrapper.eq(Tender::getProjectId, project.getId())
+                         .eq(Tender::getTenantId, tenantId)
                          .orderByDesc(Tender::getVersion)
                          .last("LIMIT 1");
             Tender latestTender = tenderMapper.selectOne(tenderWrapper);
@@ -422,6 +461,7 @@ public class TenderServiceImpl implements TenderService {
                 // 3. 查最新版本标书的审核人
                 LambdaQueryWrapper<AuditTask> taskWrapper = new LambdaQueryWrapper<>();
                 taskWrapper.eq(AuditTask::getBidId, latestTender.getId())
+                           .eq(AuditTask::getTenantId, tenantId)
                            .orderByDesc(AuditTask::getCreateTime)
                            .last("LIMIT 1");
                 AuditTask task = auditTaskMapper.selectOne(taskWrapper);
@@ -443,9 +483,12 @@ public class TenderServiceImpl implements TenderService {
 
     @Override
     public void delete(Long id) {
-        Tender tender = tenderMapper.selectById(id);
+        Long tenantId = TenantScope.requiredTenantId();
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, id)
+                .eq(Tender::getTenantId, tenantId));
         if (tender == null) {
-            return; // 资源不存在，静默返回，避免信息泄露
+            throw TenantScope.resourceNotFound();
         }
         // 验证资源归属：只有标书上传者才能删除
         Long currentUserId = BaseContext.getCurrentId();
@@ -458,13 +501,17 @@ public class TenderServiceImpl implements TenderService {
         if (file.exists()) {
             file.delete();
         }
-        tenderMapper.deleteById(id);
+        tenderMapper.delete(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, id)
+                .eq(Tender::getTenantId, tenantId));
     }
 
     @Override
     public List<Long> getBidIdsByUserId(Long userId) {
+        Long tenantId = TenantScope.requiredTenantId();
         QueryWrapper<Tender> queryWrapper = new QueryWrapper<>();
-        queryWrapper.eq("upload_user_id", userId);
+        queryWrapper.eq("tenant_id", tenantId)
+                .eq("upload_user_id", userId);
         return tenderMapper.selectList(queryWrapper).stream().map(Tender::getId).toList();
     }
 }

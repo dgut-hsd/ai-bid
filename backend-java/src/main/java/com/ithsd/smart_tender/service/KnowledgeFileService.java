@@ -7,6 +7,9 @@ import org.springframework.web.multipart.MultipartFile;
 
 public interface KnowledgeFileService extends IService<KnowledgeFile> {
 
+    /** Returns a file only when it belongs to the current tenant. */
+    KnowledgeFile getVisibleById(Long fileId);
+
     /**上传文件
      * 
      * @param file

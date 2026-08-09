@@ -1,5 +1,8 @@
 package com.ithsd.smart_tender.service;
 
+import com.ithsd.smart_tender.common.TenantAuthException;
+import com.ithsd.smart_tender.common.TenantContext;
+import com.ithsd.smart_tender.common.TenantRequestContext;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
@@ -30,7 +33,7 @@ public class StoragePathService {
     private String previewCacheDir;
 
     public Path rootPath() {
-        return Paths.get(storageRoot).normalize();
+        return Paths.get(storageRoot).toAbsolutePath().normalize();
     }
 
     public Path tenderRootPath() {
@@ -39,6 +42,18 @@ public class StoragePathService {
 
     public Path knowledgeRootPath() {
         return rootPath().resolve(knowledgeDir).normalize();
+    }
+
+    public Path tenantRootPath(Long tenantId) {
+        if (tenantId == null || tenantId <= 0) {
+            throw new IllegalArgumentException("tenantId must be positive");
+        }
+        return rootPath().resolve("tenant").resolve(String.valueOf(tenantId)).normalize();
+    }
+
+    public Path tenantKnowledgeRootPath() {
+        TenantRequestContext context = currentTenantContext();
+        return tenantRootPath(context.tenantId()).resolve(knowledgeDir).normalize();
     }
 
     public Path previewCachePath() {
@@ -53,17 +68,16 @@ public class StoragePathService {
     }
 
     public Path buildKnowledgeUploadPath(String originalFilename) {
-        return buildUploadPath(knowledgeRootPath(), originalFilename);
+        return buildUploadPath(tenantKnowledgeRootPath(), originalFilename);
     }
 
     public String toStoredPath(Path absolutePath) {
         Path normalized = absolutePath.toAbsolutePath().normalize();
         Path root = rootPath().toAbsolutePath().normalize();
-        if (normalized.startsWith(root)) {
-            String relative = root.relativize(normalized).toString();
-            return relative.replace("\\", "/");
-        }
-        return normalized.toString().replace("\\", "/");
+        ensureWithinRoot(normalized);
+        ensureTenantPathBelongsToCurrentTenant(normalized);
+        String relative = root.relativize(normalized).toString();
+        return relative.replace("\\", "/");
     }
 
     public Path resolveStoredPath(String storedPath) {
@@ -71,17 +85,16 @@ public class StoragePathService {
             return null;
         }
         String normalizedRaw = storedPath.trim().replace("\\", "/");
-
-        Path direct = Paths.get(storedPath).toAbsolutePath().normalize();
-        if (direct.isAbsolute() && Files.exists(direct)) {
-            return direct;
-        }
-
         Path root = rootPath().toAbsolutePath().normalize();
         List<Path> candidates = new ArrayList<>();
-        candidates.add(root.resolve(normalizedRaw).normalize());
-        candidates.add(knowledgeRootPath().resolve(normalizedRaw).normalize());
-        candidates.add(tenderRootPath().resolve(normalizedRaw).normalize());
+        Path input = Paths.get(storedPath);
+        if (input.isAbsolute()) {
+            candidates.add(input.normalize());
+        } else {
+            candidates.add(root.resolve(normalizedRaw).normalize());
+            candidates.add(knowledgeRootPath().resolve(normalizedRaw).normalize());
+            candidates.add(tenderRootPath().resolve(normalizedRaw).normalize());
+        }
 
         if (normalizedRaw.startsWith("data/uploads/")) {
             candidates.add(knowledgeRootPath().resolve(normalizedRaw.substring("data/uploads/".length())).normalize());
@@ -94,21 +107,32 @@ public class StoragePathService {
         }
 
         for (Path candidate : candidates) {
+            candidate = candidate.toAbsolutePath().normalize();
+            ensureWithinRoot(candidate);
+            ensureTenantPathBelongsToCurrentTenant(candidate);
             if (Files.exists(candidate)) {
                 return candidate;
             }
         }
-        return candidates.get(0);
+        Path fallback = candidates.get(0).toAbsolutePath().normalize();
+        ensureWithinRoot(fallback);
+        ensureTenantPathBelongsToCurrentTenant(fallback);
+        return fallback;
     }
 
     public void ensureParentDirectory(Path path) throws IOException {
-        Path parent = path.getParent();
+        Path normalized = path.toAbsolutePath().normalize();
+        ensureWithinRoot(normalized);
+        ensureTenantPathBelongsToCurrentTenant(normalized);
+        Path parent = normalized.getParent();
         if (parent != null && !Files.exists(parent)) {
             Files.createDirectories(parent);
         }
     }
 
     private Path buildUploadPath(Path baseDir, String originalFilename) {
+        Path normalizedBase = baseDir.toAbsolutePath().normalize();
+        ensureWithinRoot(normalizedBase);
         String extension = "";
         if (StringUtils.hasText(originalFilename)) {
             int dot = originalFilename.lastIndexOf(".");
@@ -118,6 +142,37 @@ public class StoragePathService {
         }
         String dateFolder = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
         String uniqueFileName = UUID.randomUUID() + extension;
-        return baseDir.resolve(dateFolder).resolve(uniqueFileName).toAbsolutePath().normalize();
+        Path result = normalizedBase.resolve(dateFolder).resolve(uniqueFileName).toAbsolutePath().normalize();
+        ensureWithinRoot(result);
+        ensureTenantPathBelongsToCurrentTenant(result);
+        return result;
+    }
+
+    private TenantRequestContext currentTenantContext() {
+        TenantRequestContext context = TenantContext.get();
+        if (context == null || context.tenantId() == null) {
+            String requestId = context == null ? UUID.randomUUID().toString() : context.requestId();
+            throw new TenantAuthException(400, "TENANT_REQUIRED", "A current tenant is required", requestId);
+        }
+        return context;
+    }
+
+    private void ensureWithinRoot(Path candidate) {
+        Path root = rootPath().toAbsolutePath().normalize();
+        if (!candidate.toAbsolutePath().normalize().startsWith(root)) {
+            throw new SecurityException("Storage path escapes configured root");
+        }
+    }
+
+    private void ensureTenantPathBelongsToCurrentTenant(Path candidate) {
+        Path normalized = candidate.toAbsolutePath().normalize();
+        Path tenantNamespace = rootPath().resolve("tenant").toAbsolutePath().normalize();
+        if (!normalized.startsWith(tenantNamespace)) {
+            return;
+        }
+        TenantRequestContext context = currentTenantContext();
+        if (!normalized.startsWith(tenantRootPath(context.tenantId()))) {
+            throw new SecurityException("Storage path belongs to another tenant");
+        }
     }
 }

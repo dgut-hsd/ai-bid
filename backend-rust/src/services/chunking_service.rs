@@ -383,12 +383,12 @@ fn flush_merge_buffer(
 
 // ─── 规则 4：过长 chunk 硬切 ─────────────────────────────────
 
-/// 将过长文本在段落边界切分为多个 chunk，相邻片段保留 overlap。
+/// 将过长文本在语义边界切分为多个 chunk，相邻片段保留 overlap。
 ///
 /// 切分策略：
-/// 1. 找到所有段落边界位置（`\n\n` 或 `\n` 后跟中文序号）
-/// 2. 每次切 `split_max_len` 长度，回退到最近的段落边界
-/// 3. 下一片段从 `end - split_overlap` 开始，保证语义连续
+/// 1. 找到所有语义边界（`find_para_boundaries`：句末标点、段落、表格行、编号）
+/// 2. 每次切 `split_max_len` 长度，回退到最近的语义边界
+/// 3. 下一片段从 overlap 窗口内的安全断点开始，保证语义连续
 fn split_long_chunk(
     path: &[String],
     text: &str,
@@ -507,11 +507,15 @@ fn find_safe_overlap_start(text: &str, split_point: usize, overlap: usize) -> us
     let search_start = split_point.saturating_sub(overlap);
     let search_end = split_point;
 
-    // 单次扫描，记录三个优先级的最佳候选位置
-    let mut best_sentence: Option<usize> = None; // 句末标点后换行
-    let mut best_para: Option<usize> = None; // \n\n 后
-    let mut best_section: Option<usize> = None; // 编号起始
-    let mut best_newline: Option<usize> = None; // 任意换行（最后手段）
+    // 单次扫描，记录 5 个优先级的最佳候选位置。
+    // 扫描从 search_start → search_end（= split_point），
+    // 对每个优先级选择离 split_point 最近的匹配（即最后一个匹配），
+    // 确保 overlap 起点尽可能接近切分点而非被推到远处。
+    let mut best_sentence: Option<usize> = None;   // 句末标点后换行
+    let mut best_para: Option<usize> = None;       // \n\n 后
+    let mut best_section: Option<usize> = None;    // 编号起始
+    let mut best_table_row: Option<usize> = None;  // 表格行边界（|\n 或 \n|）
+    let mut best_newline: Option<usize> = None;    // 任意换行（最后手段）
 
     let cjk_numerals: &[char] = &['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
 
@@ -521,8 +525,7 @@ fn find_safe_overlap_start(text: &str, split_point: usize, overlap: usize) -> us
         }
 
         // 优先级1：。！？后紧跟 \n
-        if best_sentence.is_none()
-            && (chars[i] == '。' || chars[i] == '！' || chars[i] == '？')
+        if (chars[i] == '。' || chars[i] == '！' || chars[i] == '？')
             && chars[i + 1] == '\n'
         {
             let mut start = i + 1;
@@ -530,12 +533,12 @@ fn find_safe_overlap_start(text: &str, split_point: usize, overlap: usize) -> us
                 start += 1; // 跳过 \n\n 的第二个 \n
             }
             if start < split_point {
-                best_sentence = Some(start);
+                best_sentence = Some(start); // 总是更新，选最近的
             }
         }
 
         // 优先级2：\n\n
-        if best_para.is_none() && chars[i] == '\n' && chars[i + 1] == '\n' {
+        if chars[i] == '\n' && chars[i + 1] == '\n' {
             let start = i + 2;
             if start < split_point {
                 best_para = Some(start);
@@ -543,7 +546,7 @@ fn find_safe_overlap_start(text: &str, split_point: usize, overlap: usize) -> us
         }
 
         // 优先级3：\n 后跟编号
-        if best_section.is_none() && chars[i] == '\n' && i + 1 < total && {
+        if chars[i] == '\n' && i + 1 < total && {
             let next = chars[i + 1];
             cjk_numerals.contains(&next) || next == '（' || next == '(' || next.is_ascii_digit()
         } {
@@ -553,8 +556,24 @@ fn find_safe_overlap_start(text: &str, split_point: usize, overlap: usize) -> us
             }
         }
 
+        // 优先级3.5：表格行边界 — |\n（行末）或 \n|（行首）
+        // |\n → 下一行起点在 \n 之后 (i+2)
+        if chars[i] == '|' && i + 2 <= total && chars[i + 1] == '\n' {
+            let start = i + 2;
+            if start < split_point {
+                best_table_row = Some(start);
+            }
+        }
+        // \n| → 下一行起点在 | 处 (i+1)
+        if chars[i] == '\n' && i + 1 < total && chars[i + 1] == '|' {
+            let start = i + 1;
+            if start < split_point {
+                best_table_row = Some(start);
+            }
+        }
+
         // 最后手段：任意换行
-        if best_newline.is_none() && chars[i] == '\n' {
+        if chars[i] == '\n' {
             let start = i + 1;
             if start < split_point {
                 best_newline = Some(start);
@@ -562,21 +581,32 @@ fn find_safe_overlap_start(text: &str, split_point: usize, overlap: usize) -> us
         }
     }
 
-    // 按优先级返回最佳候选
+    // 按优先级返回最佳候选（每个都已是最接近 split_point 的匹配）
     best_sentence
         .or(best_para)
         .or(best_section)
+        .or(best_table_row)
         .or(best_newline)
         .unwrap_or_else(|| split_point.saturating_sub(overlap))
 }
 
 /// 查找文本中的段落边界位置（字符偏移）。
 ///
-/// 段落边界定义：
+/// 段落边界定义（按优先级排列）：
 /// - `\n\n`（显式段落分隔）
 /// - `\n\n|` 模式（Markdown 表格行前的空行）→ 确保切分点不落入表格内部
 /// - `|\n\n` 模式（Markdown 表格行后的空行）→ 确保切分点不落入表格内部
-/// - `\n` 后紧跟中文序号（一～十），表示新段落开始
+/// - `。\n` `！\n` `？\n`（句末标点后紧跟换行）→ 句子边界
+/// - `|\n` 或 `\n|`（单换行表格行分隔）→ 表格行边界
+/// - `\n` 后紧跟编号模式：
+///   - 中文序号（一～十）
+///   - ASCII 数字编号（"1." "2." 等）
+///   - 括号编号（"（一）" "(1)" 等）
+///   - 圈号数字（①-⑩）
+///   - 项目符号（- ※ ● ◆ ■ ▲ ▼ ★ ☆）
+///
+/// 设计原则：边界宁可多不可少，多出的边界在 `split_long_chunk` 中
+/// 通过"从 end_candidate 向前搜索最近边界"策略自然收敛到最合适的切分点。
 fn find_para_boundaries(text: &str) -> Vec<usize> {
     let mut boundaries: Vec<usize> = Vec::new();
     let chars: Vec<char> = text.chars().collect();
@@ -585,12 +615,16 @@ fn find_para_boundaries(text: &str) -> Vec<usize> {
     boundaries.push(0);
 
     let cjk_numerals: &[char] = &['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
+    let sentence_ends: &[char] = &['。', '！', '？'];
+    let circled_numerals: &[char] = &[
+        '①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩',
+    ];
+    let bullet_markers: &[char] = &['-', '※', '●', '◆', '■', '▲', '▼', '★', '☆'];
 
     for i in 0..chars.len() {
-        // \n\n — 双换行段落分隔
+        // ── \n\n 双换行段落分隔 ──
         if chars[i] == '\n' && i + 1 < chars.len() && chars[i + 1] == '\n' {
             // Markdown 表格行前空行：\n\n| 模式 → 强制段落边界
-            // 确保 split_long_chunk 不会在表格行中间切分
             if i + 2 < chars.len() && chars[i + 2] == '|' {
                 boundaries.push(i + 1); // 在第二个 \n 之后
                 continue;
@@ -603,10 +637,48 @@ fn find_para_boundaries(text: &str) -> Vec<usize> {
             boundaries.push(i + 1); // 在第二个 \n 之后
             continue;
         }
-        // \n 后紧跟中文序号
+
+        // ── 句末标点后紧跟 \n → 句子边界 ──
+        // 解决测试1：无 \n\n 的连续文本在句末处切分
+        // push(i+2)：边界在 \n 之后，确保句子以 `。\n` 完整结尾
+        if i + 1 < chars.len()
+            && sentence_ends.contains(&chars[i])
+            && chars[i + 1] == '\n'
+        {
+            boundaries.push(i + 2); // 在 \n 之后
+            continue;
+        }
+
+        // ── 表格行边界：|\n 或 \n| ──
+        // 解决测试2：保护 Markdown 表格行不被拦腰切断
+        // |\n：边界在 \n 之后 (i+2)，确保行以 `|\n` 完整结尾
+        if chars[i] == '|' && i + 1 < chars.len() && chars[i + 1] == '\n' {
+            boundaries.push(i + 2); // 在行末 \n 之后
+            continue;
+        }
+        // \n|：边界在 | 位置 (i+1)，确保下一行以 `|` 开头
+        if chars[i] == '\n' && i + 1 < chars.len() && chars[i + 1] == '|' {
+            boundaries.push(i + 1); // 在换行之后、表格行之前
+            continue;
+        }
+
+        // ── \n 后紧跟各种编号模式 ──
+        // 解决测试3：ASCII 数字编号、括号编号、项目符号等
         if chars[i] == '\n' && i + 1 < chars.len() {
             let next = chars[i + 1];
+
+            // 中文序号（一～十）
             if cjk_numerals.contains(&next) {
+                boundaries.push(i + 1);
+                continue;
+            }
+            // ASCII 数字编号 / 括号编号 / 圈号数字 / 项目符号
+            if next.is_ascii_digit()
+                || next == '('
+                || next == '（'
+                || circled_numerals.contains(&next)
+                || bullet_markers.contains(&next)
+            {
                 boundaries.push(i + 1);
             }
         }
@@ -1809,5 +1881,239 @@ mod tests {
     fn test_extract_table_keys_no_table() {
         let keys = extract_table_keys("普通正文内容，没有表格。");
         assert!(keys.is_empty());
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 修复验证测试：文本语义边界切分
+    // 以下测试验证 find_para_boundaries 增强后，split_long_chunk
+    // 能在句末标点、表格行、编号项等语义边界处切分。
+    // ═══════════════════════════════════════════════════════════════
+
+    /// 修复1：句末标点处切分（不再截断句子）
+    ///
+    /// 构造一段约 3000 字的长文本，每 ~47 字以「。」结尾再接 `\n`，
+    /// 全程没有 `\n\n` 双换行。修复后 `find_para_boundaries` 识别
+    /// `。\n` 为语义边界，`split_long_chunk` 在最近的 `。\n` 处切分，
+    /// 而非机械地切在 1500 字符处。
+    #[test]
+    fn test_fix_1_sentence_boundary_split() {
+        // 构造单句模板：~100 字，以「。」结尾后跟换行
+        let sentence = "这是关于投标项目的一份详细说明文档，包含了标的数量名称规格以及交付期限等核心条款的内容说明。\n";
+        // 每句 ~47 字，需要 ~65 句 > 3000 字
+        let body = sentence.repeat(65);
+        let total = body.chars().count();
+        assert!(total > 3000, "构造文本应 > 3000 字，实际: {}", total);
+
+        let section = make_leaf(4, "1. 项目说明", &body);
+        let config = ChunkingConfig::default();
+        let mut chunks = Vec::new();
+        let path = vec!["第一章".to_string()];
+
+        split_long_chunk(&path, &section.body_text, &section, &config, &mut chunks);
+
+        assert!(chunks.len() >= 2, "应产出 ≥2 个 chunk");
+
+        // 修复验证：第一个 chunk 的切分点应为句末边界
+        let first_chunk_end: String =
+            chunks[0].text.chars().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect();
+
+        let ends_with_sentence_boundary = first_chunk_end.contains("。\n")
+            || first_chunk_end.contains("！\n")
+            || first_chunk_end.contains("？\n");
+        assert!(
+            ends_with_sentence_boundary,
+            "【修复验证】第一个 chunk 应以句末标点结尾，\n\
+             实际末尾5字符: {:?}",
+            first_chunk_end
+        );
+
+        // 额外验证：`find_para_boundaries` 找到了句末边界
+        let boundaries = find_para_boundaries(&body);
+        assert!(
+            boundaries.len() > 2,
+            "【修复验证】find_para_boundaries 应找到 > 2 个边界（含句末标点），实际: {}",
+            boundaries.len()
+        );
+        assert_eq!(boundaries[0], 0);
+        assert_eq!(*boundaries.last().unwrap(), total);
+    }
+
+    /// 修复2：表格行边界保护（不再拦腰切断表格行）
+    ///
+    /// 构造一个含 pipe 分隔符的大表格，行之间仅用 `\n` 分隔无空行。
+    /// 修复后 `find_para_boundaries` 识别 `|\n` 和 `\n|` 为表格行边界，
+    /// 切分点落在完整行之间。
+    #[test]
+    fn test_fix_2_table_row_boundary_protected() {
+        // 构造 60 行 Markdown 表格，每行 ~30 字，总计 ~1800 字
+        let mut table_rows = String::new();
+        for i in 1..=60 {
+            table_rows.push_str(&format!(
+                "| {} | 条款内容描述第{}项 | 满足 | 详见附件{} |\n",
+                i, i, i
+            ));
+        }
+        let total = table_rows.chars().count();
+        assert!(
+            total > 1500,
+            "表格文本应 > 1500 字, 实际: {}",
+            total
+        );
+        // 确认没有 \n\n 双换行
+        assert!(
+            !table_rows.contains("\n\n"),
+            "表格行之间不应有空行"
+        );
+
+        let section = make_leaf(4, "1. 商务条款响应表", &table_rows);
+        let config = ChunkingConfig::default();
+        let mut chunks = Vec::new();
+        let path = vec!["第五章".to_string()];
+
+        split_long_chunk(&path, &section.body_text, &section, &config, &mut chunks);
+
+        assert!(chunks.len() >= 2, "应产出 ≥2 个 chunk");
+
+        // 修复验证：所有 chunk 都应包含完整表格行
+        let mut has_broken_row = false;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let text = &chunk.text;
+            let first_char = text.chars().next().unwrap_or(' ');
+            let last_char = text.chars().rev().next().unwrap_or(' ');
+
+            if i > 0 && first_char != '|' {
+                has_broken_row = true;
+            }
+            if i < chunks.len() - 1 && last_char != '\n' {
+                has_broken_row = true;
+            }
+        }
+        assert!(
+            !has_broken_row,
+            "【修复验证】表格行不应被切断，所有中间chunk应以 | 开头、以 \\n 结尾"
+        );
+
+        // 验证 find_para_boundaries 在表格行之间找到了边界
+        let boundaries = find_para_boundaries(&table_rows);
+        let non_virtual = boundaries.len() - 2;
+        assert!(
+            non_virtual > 0,
+            "【修复验证】find_para_boundaries 应在表格行之间找到边界，实际: {}",
+            non_virtual
+        );
+    }
+
+    /// 修复3：数字编号列表项边界保护（不再切断列表项）
+    ///
+    /// 构造一个用 `1.` `2.` `3.` 等 ASCII 数字编号的列表。
+    /// 修复后 `find_para_boundaries` 识别 `\n`+ASCII 数字为编号边界，
+    /// 切分点落在列表项之间。
+    #[test]
+    fn test_fix_3_numbered_list_boundary_protected() {
+        // 构造 ASCII 编号列表：35 项，每项 ~48 字
+        let mut list = String::new();
+        for i in 1..=35 {
+            list.push_str(&format!(
+                "{}. 投标人应当具备承担本招标项目的能力和良好的商业信誉记录，提供近三年无重大违法记录的书面声明材料。\n",
+                i
+            ));
+        }
+        let total = list.chars().count();
+        assert!(total > 1500, "列表文本应 > 1500 字, 实际: {}", total);
+
+        // 确认使用 ASCII 数字编号（非 CJK 数字）
+        assert!(list.contains("1. "), "应为 ASCII 数字编号");
+
+        let section = make_leaf(4, "1. 资格条件清单", &list);
+        let config = ChunkingConfig::default();
+        let mut chunks = Vec::new();
+        let path = vec!["第二章".to_string()];
+
+        split_long_chunk(&path, &section.body_text, &section, &config, &mut chunks);
+
+        assert!(chunks.len() >= 2, "应产出 ≥2 个 chunk");
+
+        // 修复验证：所有中间 chunk 应以数字编号开头
+        let mut has_truncated_item = false;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let text = &chunk.text;
+            if i == 0 {
+                continue;
+            }
+            let first_line = text.lines().next().unwrap_or("");
+            let is_numbered_start = first_line
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false);
+            if !is_numbered_start {
+                has_truncated_item = true;
+            }
+        }
+        assert!(
+            !has_truncated_item,
+            "【修复验证】所有中间 chunk 应以数字编号开头，列表项不应被切断"
+        );
+
+        // 验证 find_para_boundaries 在编号之间找到了边界
+        let boundaries = find_para_boundaries(&list);
+        let non_virtual = boundaries.len() - 2;
+        assert!(
+            non_virtual > 0,
+            "【修复验证】find_para_boundaries 应在编号列表中找到边界，实际: {}",
+            non_virtual
+        );
+    }
+
+    /// 修复4：切分点与 overlap 起点质量对齐
+    ///
+    /// 修复后 `find_para_boundaries` 也识别 `。\n` 等语义边界，
+    /// 与 `find_safe_overlap_start` 能力一致。切分点不再机械地
+    /// 落在 1500 字符处，而是回退到最近的句末边界。
+    #[test]
+    fn test_fix_4_split_overlap_aligned() {
+        // 构造文本：在 ~1680 位置有一个 `。\n`（单换行，非 \n\n），
+        // 在 ~1500 位置没有任何语义边界。
+        //
+        // 策略：见下方 —— 构造在 offset ~1480 处有句末标点但无 \n\n 的文本
+
+        // 构造一个在 offset ~1480 处有句末标点 `。\n` 但无 `\n\n` 的文本
+        let segment_a = "A".repeat(1470); // 连续文本到 ~1470
+        let boundary = "。\n";             // 句末换行边界 @ ~1471
+        let segment_b = "B".repeat(1500); // 后续文本
+        let body = format!("{}{}{}", segment_a, boundary, segment_b);
+        let total = body.chars().count();
+        assert!(total > 1500, "总文本应 > 1500 字");
+
+        // 修复验证：find_para_boundaries 在 ~1480 找到了 。\n 边界
+        let boundaries = find_para_boundaries(&body);
+        let has_sentence_boundary = boundaries.iter().any(|&b| {
+            b > 1400 && b < 1550 && b != 0 && b != total
+        });
+        assert!(
+            has_sentence_boundary,
+            "【修复验证】find_para_boundaries 应在 ~1480 找到 。\\n 边界，\n\
+             boundaries 在 1400-1550 范围内: {:?}",
+            boundaries.iter().filter(|&&b| b > 1400 && b < 1550).collect::<Vec<_>>()
+        );
+
+        // 核心验证：切分点接近句末边界而非 1500 机械位置
+        let section = make_leaf(4, "1. 技术条款", &body);
+        let config = ChunkingConfig::default();
+        let mut chunks = Vec::new();
+        let path = vec!["第三章".to_string()];
+
+        split_long_chunk(&path, &section.body_text, &section, &config, &mut chunks);
+
+        assert!(chunks.len() >= 2, "应产出 ≥2 个 chunk");
+        let first_chunk_len = chunks[0].text.chars().count();
+
+        // 第一个 chunk 应接近 ~1472（句末边界）而非 1500
+        let is_near_boundary = first_chunk_len > 1460 && first_chunk_len < 1490;
+        assert!(
+            is_near_boundary,
+            "【修复验证】切分点应接近句末边界（~1472），实际第一个chunk长度={}，应在1460-1490范围内",
+            first_chunk_len
+        );
     }
 }

@@ -140,7 +140,7 @@ public class KnowledgeFileController {
     @GetMapping("/{fileId}/download")
     public ResponseEntity<Resource> downloadFile(@PathVariable("fileId") Long fileId) {
         log.info("下载标准库文件：fileId={}", fileId);
-        KnowledgeFile file = knowledgeFileService.getById(fileId);
+        KnowledgeFile file = knowledgeFileService.getVisibleById(fileId);
         if (file == null || file.getFilePath() == null) {
             return ResponseEntity.notFound().build();
         }
@@ -166,7 +166,7 @@ public class KnowledgeFileController {
     @GetMapping("/{fileId}/preview")
     public ResponseEntity<?> previewFile(@PathVariable("fileId") Long fileId) {
         log.info("预览标准库文件：fileId={}", fileId);
-        KnowledgeFile file = knowledgeFileService.getById(fileId);
+        KnowledgeFile file = knowledgeFileService.getVisibleById(fileId);
         if (file == null || file.getFilePath() == null) {
             return ResponseEntity.notFound().build();
         }
@@ -227,4 +227,3 @@ public class KnowledgeFileController {
     }
 
 }
-

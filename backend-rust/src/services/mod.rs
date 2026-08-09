@@ -3,6 +3,8 @@ pub mod desensitize_service;
 pub mod docx_convert_service;
 pub mod embedding_api_client;
 pub mod embedding_service;
+pub mod knowledge_ingest_service;
 pub mod llm_client;
 pub mod pdf_extract_service;
+pub mod qdrant_store;
 pub mod sectionize_service;

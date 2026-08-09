@@ -16,6 +16,9 @@ public class CreateAuditTaskRequest {
     @Positive(message = "bidId必须为正整数")
     private Long bidId;
 
+    /** Client supplied values are ignored; the service uses TenantContext. */
+    private Long tenantId;
+
     /** Rust Agent 名称列表（小写），为空则全部启用 */
     private List<String> enabledAgents;
     private Boolean forceRefresh;
@@ -26,6 +29,14 @@ public class CreateAuditTaskRequest {
 
     public void setBidId(Long bidId) {
         this.bidId = bidId;
+    }
+
+    public Long getTenantId() {
+        return tenantId;
+    }
+
+    public void setTenantId(Long tenantId) {
+        this.tenantId = tenantId;
     }
 
     public List<String> getEnabledAgents() {

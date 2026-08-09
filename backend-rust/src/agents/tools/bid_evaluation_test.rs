@@ -59,7 +59,7 @@ mod tests {
         let deposit_result = deposit_tool
             .execute(serde_json::json!({
                 "deposit_amount": 15.0,
-                "budget_amount": 500.0,
+                "contract_amount": 500.0,
                 "deposit_form": "现金",
                 "deposit_type": "bid"
             }))
@@ -68,11 +68,12 @@ mod tests {
 
         assert_eq!(deposit_result["status"], "violation");
 
-        // ── 保证金合规校验（500万 × 2% = 10万，合规）
+        // ── 保证金上限校验（货物类 ≤50万）
+        // 500万的2% = 10万，在50万上限内
         let upper_deposit = deposit_tool
             .execute(serde_json::json!({
                 "deposit_amount": 10.0,
-                "budget_amount": 500.0,
+                "contract_amount": 500.0,
                 "deposit_form": "保函",
                 "deposit_type": "bid"
             }))
@@ -81,36 +82,28 @@ mod tests {
 
         assert_eq!(upper_deposit["status"], "compliant");
 
-        // ── P3: 公告期校验（4B-4C 新路径）──
-        // 公开招标公告 2025-06-02(周一) → 2025-06-06(周五) = 4 工作日 < 5 → violation
+        // ── P3: 公告期限校验 ──
+        // 2025-06-01 发布 → 2025-06-14 截止 = 13天 < 20天
         let announce_tool = VerifyAnnouncementPeriodTool;
         let announce_result = announce_tool
             .execute(serde_json::json!({
                 "procurement_method": "公开招标",
-                "period_type": "notice_publication",
-                "procurement_object": "goods",
-                "is_government_procurement": true,
-                "notice_start_date_str": "2025-06-02",
-                "notice_end_date_str": "2025-06-06"
+                "announcement_date_str": "2025-06-01",
+                "bid_deadline_date_str": "2025-06-14"
             }))
             .await
             .unwrap();
-        assert_eq!(announce_result["overall_status"], "violation");
-        assert_eq!(announce_result["announcement_period"]["actual_days"], 4);
-        assert_eq!(announce_result["announcement_period"]["required_days"], 5);
+
+        // 检查公告期是否违规
+        assert_eq!(announce_result["announcement_period"]["status"], "fail");
 
         // ── P4: 投标准备期校验 ──
-        // 招标文件发出 2025-06-01 → 投标截止 2025-06-14 = 13天 < 20天（公开招标）
-        // 新 Contract：真实读取 document_issued_date_str / procurement_object /
-        // is_government_procurement / bid_deadline_date_str。announcement_date_str 仅 legacy 回显。
+        // 2025-06-01 发布 → 2025-06-14 截止 = 13天 < 20天（公开招标）
         let prep_tool = VerifyBidPreparationPeriodTool;
         let prep_result = prep_tool
             .execute(serde_json::json!({
                 "procurement_method": "公开招标",
-                "procurement_object": "goods",
-                "is_government_procurement": true,
                 "announcement_date_str": "2025-06-01",
-                "document_issued_date_str": "2025-06-01",
                 "bid_deadline_date_str": "2025-06-14"
             }))
             .await
@@ -129,31 +122,25 @@ mod tests {
     #[tokio::test]
     async fn scenario_2_scoring_pipeline() {
         // ── P5: 价格分公式校验 ──
-        // 货物 70% 权重 → 87号令无上限 → compliant（旧代码错判为 violation）
+        // 货物 70% 权重 → 超过 60% 上限 → violation
         let formula_tool = ValidateScoringFormulaTool;
         let formula_result = formula_tool
             .execute(serde_json::json!({
                 "price_weight": 70.0,
                 "procurement_category": "货物",
-                "procurement_object": "goods",
-                "procurement_method": "open_tender",
-                "evaluation_method": "comprehensive_scoring",
-                "price_evaluation_context": "normal",
                 "scoring_formula_type": "最低价"
             }))
             .await
             .unwrap();
 
-        assert_eq!(formula_result["status"], "compliant");
+        assert_eq!(formula_result["status"], "violation");
+        assert!(!formula_result["weight_ok"].as_bool().unwrap());
 
         // 合规情况：货物 50% → compliant
         let formula_ok = formula_tool
             .execute(serde_json::json!({
                 "price_weight": 50.0,
                 "procurement_category": "货物",
-                "procurement_method": "open_tender",
-                "evaluation_method": "comprehensive_scoring",
-                "price_evaluation_context": "normal",
                 "scoring_formula_type": "最低价"
             }))
             .await
@@ -171,15 +158,14 @@ mod tests {
                 "technical_weight": 70.0,
                 "business_weight": 10.0,
                 "procurement_category": "货物",
-                "weights_complete": true
+                "total_score": 100.0
             }))
             .await
             .unwrap();
 
-        // 价格分 20% + 技术分 70% + 商务分 10% = 100%（总和闭合），
-        // 缺失维度检查（技术分+商务分均非0 → 完整），compliant 或 risk（heuristic）
-        assert!(weight_result["status"].as_str().unwrap() != "violation",
-            "总和闭合+数值合法 → 不应为 violation；价格分范围由 validate_scoring_formula 负责");
+        // 价格分 20% < 30% (货物最低) → violation
+        assert_eq!(weight_result["status"], "violation");
+        assert!(!weight_result["price_range_ok"].as_bool().unwrap());
 
         // 合规情况
         let weight_ok = weight_tool
@@ -188,7 +174,7 @@ mod tests {
                 "technical_weight": 35.0,
                 "business_weight": 20.0,
                 "procurement_category": "货物",
-                "weights_complete": true
+                "total_score": 100.0
             }))
             .await
             .unwrap();
@@ -344,7 +330,7 @@ mod tests {
         let deposit_result = VerifyBidDepositTool
             .execute(serde_json::json!({
                 "deposit_amount": 3.0,
-                "budget_amount": 300.0,
+                "contract_amount": 300.0,
                 "deposit_form": "保函",
                 "return_deadline_days": 5,
                 "deposit_type": "bid"
@@ -353,47 +339,41 @@ mod tests {
             .unwrap();
         assert_eq!(deposit_result["status"], "compliant");
 
-        // P4: 竞争性磋商准备期 磋商文件发出 2025-06-01 → 首次响应截止 2025-06-12 = 11天 ≥ 10天 → compliant
-        // 新 Contract：真实读取 document_issued_date_str + first_response_deadline_date_str。
-        // 不携带 legacy bid_deadline_date_str（磋商场景禁止使用该字段）。
+        // P3: 竞争性磋商公告期 2025-06-01 → 2025-06-12 = 11天 ≥ 10天 → compliant
+        let announce_result = VerifyAnnouncementPeriodTool
+            .execute(serde_json::json!({
+                "procurement_method": "竞争性磋商",
+                "announcement_date_str": "2025-06-01",
+                "bid_deadline_date_str": "2025-06-12"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(announce_result["announcement_period"]["status"], "pass");
+
+        // P4: 竞争性磋商准备期 11天 ≥ 10天 → compliant
         let prep_result = VerifyBidPreparationPeriodTool
             .execute(serde_json::json!({
                 "procurement_method": "竞争性磋商",
-                "procurement_object": "goods",
-                "is_government_procurement": true,
                 "announcement_date_str": "2025-06-01",
-                "document_issued_date_str": "2025-06-01",
-                "first_response_deadline_date_str": "2025-06-12"
+                "bid_deadline_date_str": "2025-06-12"
             }))
             .await
             .unwrap();
         assert_eq!(prep_result["status"], "compliant");
 
-        // Contract 验证：新字段（first_response_deadline_date_str）必须存在于工具 definition
-        let def = VerifyBidPreparationPeriodTool.definition();
-        let props = &def["function"]["parameters"]["properties"];
-        assert!(props.get("first_response_deadline_date_str").is_some(),
-            "definition 必须包含 first_response_deadline_date_str（未来真实 Contract）");
-        assert!(props.get("document_issued_date_str").is_some(),
-            "definition 必须包含 document_issued_date_str");
-
         // ──── 阶段 2: 评审与评分 ────
 
-        // P5: 工程招标 → 不适用87号令/214号 → not_applicable
+        // P5: 工程价格分 40% → compliant
         let formula_result = ValidateScoringFormulaTool
             .execute(serde_json::json!({
                 "price_weight": 40.0,
-                "procurement_object": "construction",
                 "procurement_category": "工程",
-                "procurement_method": "open_tender",
-                "evaluation_method": "comprehensive_scoring",
-                "price_evaluation_context": "normal",
                 "scoring_formula_type": "基准价",
                 "formula_description": "去掉最高和最低报价后取平均值作为基准价"
             }))
             .await
             .unwrap();
-        assert_eq!(formula_result["status"], "not_applicable");
+        assert_eq!(formula_result["status"], "compliant");
 
         // P6: 工程价格分 40% + 技术 40% + 其余 20% → compliant
         let weight_result = ValidateWeightDistributionTool
@@ -402,7 +382,7 @@ mod tests {
                 "technical_weight": 40.0,
                 "business_weight": 20.0,
                 "procurement_category": "工程",
-                "weights_complete": true
+                "total_score": 100.0
             }))
             .await
             .unwrap();

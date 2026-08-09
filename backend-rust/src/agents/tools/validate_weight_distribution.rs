@@ -1,47 +1,40 @@
 //! `validate_weight_distribution` 工具 — 权重分配合规检查。
 //!
-//! ## 核心职责
+//! 根据《政府采购货物和服务招标投标管理办法》（财政部令第87号）第55条，
+//! 校验评审因素权重分配是否合规。本工具进行纯数值计算与规则匹配，
+//! 不访问外部 I/O。
 //!
-//! 1. **权重总和闭合性（Product Contract）**：各权重之和应等于目标总值（不声称具体法规）
-//! 2. **数值合法性**：负权重/超范围单项 → violation
-//! 3. **缺失维度提示（Heuristic）**：建议货物有技术+商务、服务有服务分等
-//! 4. **技术分分布（Heuristic）**：建议技术分合理范围，不产生 violation
+//! ## 核心逻辑
 //!
-//! ## 价格权重规则
+//! 1. 权重求和验证（各项权重之和应等于 total_score）
+//! 2. 价格分范围检查：货物 30%-60%，服务 10%-30%，工程 30%-60%
+//! 3. 缺失维度检测：货物必须有技术分+商务分，服务必须有服务分，工程必须有技术分
 //!
-//! 不在本工具内重复实现 87号令/214号的价格分范围检查。
-//! 该职责由 `validate_scoring_formula` 根据 RuleSet 精确执行。
-//! 本工具仅做权重总和一致性 + 数值合法性检查。
+//! ## 法条依据
+//!
+//! - 《政府采购货物和服务招标投标管理办法》（财政部令第87号）第55条
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
 use super::AgentTool;
 
-// ─── 常量 ──────────────────────────────────────────────────────
+// ─── 权重组距常量 ──────────────────────────────────────────────
 
-/// 百分比模式目标总值
-const TARGET: f64 = 100.0;
-/// 单项权重下限: < 0 视为非法输入
-const WEIGHT_MIN: f64 = 0.0;
-/// 单项权重上限: > 100 视为非法输入（百分比模式下不超过100%）
-const WEIGHT_MAX: f64 = 100.0;
-/// 技术分建议范围（heuristic，不产生 violation）
-const TECH_WEIGHT_SUGGESTED_MIN: f64 = 20.0;
-const TECH_WEIGHT_SUGGESTED_MAX: f64 = 60.0;
+/// 货物类价格分权重范围
+const GOODS_PRICE_MIN: f64 = 30.0;
+const GOODS_PRICE_MAX: f64 = 60.0;
 
-/// 将百分比权重转为 basis points (×100) 做精确整数比较。
-/// 同时校验最多两位小数精度。33.333 → Err, 33.33 → Ok(3333)。
-fn to_basis_points(v: f64) -> Result<i64, String> {
-    if !v.is_finite() { return Err(format!("non-finite value: {}", v)); }
-    if v.abs() > 1_000_000.0 { return Err(format!("value out of range: {}", v)); }
-    // 精度校验：最多两位小数
-    let bp = (v * 100.0).round();
-    if (bp / 100.0 - v).abs() > 1e-9 {
-        return Err(format!("precision violation: {} exceeds 2 decimal places", v));
-    }
-    Ok(bp as i64)
-}
+/// 服务类价格分权重范围
+const SERVICE_PRICE_MIN: f64 = 10.0;
+const SERVICE_PRICE_MAX: f64 = 30.0;
+
+/// 工程类价格分权重范围
+const CONSTRUCTION_PRICE_MIN: f64 = 30.0;
+const CONSTRUCTION_PRICE_MAX: f64 = 60.0;
+
+/// 浮点数比较容差
+const EPSILON: f64 = 1e-6;
 
 // ─── 参数 ──────────────────────────────────────────────────────
 
@@ -60,10 +53,8 @@ pub struct ValidateWeightDistributionArgs {
     pub business_weight: Option<f64>,
     /// 采购品类："货物"/"工程"/"服务"
     pub procurement_category: String,
-    /// 当前权重是否覆盖全部评审因素。
-    /// Some(true): 总和必须闭合；Some(false): 跳过闭合检查；
-    /// None: 无法确定 → uncertain。
-    pub weights_complete: Option<bool>,
+    /// 总分（通常为 100）
+    pub total_score: f64,
 }
 
 // ─── 输出 ──────────────────────────────────────────────────────
@@ -71,24 +62,18 @@ pub struct ValidateWeightDistributionArgs {
 /// 权重分配合规检查返回结果。
 #[derive(Debug, serde::Serialize)]
 struct WeightDistributionResult {
-    /// 整体判定: "compliant"/"risk"/"uncertain"/"violation"
+    /// 整体判定: "compliant"/"risk"/"violation"
     status: String,
-    /// 权重和 = target_total
+    /// 权重和 = total_score
     sum_check: bool,
-    /// 实际权重总和
-    weight_sum: f64,
-    /// 预期目标值
-    target_total: f64,
-    /// 缺失的评审维度（heuristic）
+    /// 价格分在法定范围内
+    price_range_ok: bool,
+    /// 缺失的评审维度
     missing_dimensions: Vec<String>,
-    /// 启发式风险列表（仅 heuristic，不影响 legal status）
-    heuristic_risks: Vec<String>,
     /// 各检查项详情
     checks: Vec<WeightCheckItem>,
     /// 综合摘要
     summary: String,
-    /// 法规/产品依据说明
-    legal_basis: String,
 }
 
 /// 单项权重检查结果。
@@ -111,166 +96,165 @@ struct WeightCheckItem {
 /// 纯数值计算与规则匹配工具，无外部依赖。
 pub struct ValidateWeightDistributionTool;
 
-fn uncertain_result(reason: &str, suggestion: &str) -> WeightDistributionResult {
-    WeightDistributionResult {
-        status: "uncertain".into(), sum_check: false,
-        weight_sum: 0.0, target_total: 0.0,
-        missing_dimensions: vec![], heuristic_risks: vec![],
-        checks: vec![], summary: format!("{}：{}", reason, suggestion),
-        legal_basis: "无法确定权重闭合状态。".into(),
-    }
-}
-
 impl ValidateWeightDistributionTool {
+    /// 获取品类的价格分法定范围。
+    fn get_price_range(category: &str) -> Result<(f64, f64)> {
+        match category {
+            "货物" => Ok((GOODS_PRICE_MIN, GOODS_PRICE_MAX)),
+            "工程" => Ok((CONSTRUCTION_PRICE_MIN, CONSTRUCTION_PRICE_MAX)),
+            "服务" => Ok((SERVICE_PRICE_MIN, SERVICE_PRICE_MAX)),
+            _ => Err(anyhow!(
+                "不支持的采购品类 '{}'，有效值为: 货物/工程/服务",
+                category
+            )),
+        }
+    }
+
+    /// 判断两个 f64 是否相等（在容差范围内）。
+    fn approx_eq(a: f64, b: f64) -> bool {
+        (a - b).abs() < EPSILON
+    }
 
     /// 核心校验逻辑。
     fn validate(args: &ValidateWeightDistributionArgs) -> Result<WeightDistributionResult> {
-        // ── 0.6 weights_complete 缺失 → uncertain ──
-        let complete = match args.weights_complete {
-            Some(c) => c,
-            None => return Ok(uncertain_result("missing weights_complete", "缺少 weights_complete 字段。无法确定当前权重是否覆盖全部评审因素，请提供。")),
-        };
-
-        // ── 0.7 invalid category → uncertain ──
-        match args.procurement_category.as_str() {
-            "货物" | "工程" | "服务" => {},
-            other => return Ok(uncertain_result("invalid procurement_category",
-                &format!("未识别的采购品类 '{}'。有效值: 货物/工程/服务", other))),
-        }
-
         let mut checks: Vec<WeightCheckItem> = Vec::new();
         let mut missing_dimensions: Vec<String> = Vec::new();
-        let mut heuristic_risks: Vec<String> = Vec::new();
 
+        // ── 1. 权重求和验证 ──
         let service_w = args.service_weight.unwrap_or(0.0);
         let business_w = args.business_weight.unwrap_or(0.0);
-        // ── 1. 数值合法性 + 精度校验 ──
-        let mut invalid_input = false;
-        for (value, label) in &[
-            (args.price_weight, "价格分"), (args.technical_weight, "技术分"),
-            (service_w, "服务分"), (business_w, "商务分"),
-        ] {
-            if *value < WEIGHT_MIN || *value > WEIGHT_MAX || !value.is_finite() {
-                invalid_input = true;
-                checks.push(WeightCheckItem {
-                    item: format!("{}合法性", label), current_value: *value,
-                    required_range: format!("{}-{}", WEIGHT_MIN, WEIGHT_MAX), pass: false,
-                });
-            } else if to_basis_points(*value).is_err() {
-                invalid_input = true;
-                checks.push(WeightCheckItem {
-                    item: format!("{}精度", label), current_value: *value,
-                    required_range: "最多两位小数".into(), pass: false,
-                });
-            }
-        }
-        if invalid_input {
-            return Ok(WeightDistributionResult {
-                status: "invalid_input".into(), sum_check: false,
-                weight_sum: 0.0, target_total: TARGET,
-                missing_dimensions: vec![], heuristic_risks: vec![],
-                checks, summary: "输入非法：权重须在 0-100 范围内，为有限数值，且最多两位小数。".into(),
-                legal_basis: "输入验证失败：权重数值不合法。".into(),
-            });
-        }
-
         let weight_sum = args.price_weight + args.technical_weight + service_w + business_w;
 
-        // ── 2. 权重总和闭合性（Product Contract）──
-        let sum_check = to_basis_points(weight_sum).ok()
-            .zip(to_basis_points(TARGET).ok())
-            .map_or(false, |(s, t)| s == t);
+        let sum_check = Self::approx_eq(weight_sum, args.total_score);
 
-        if complete {
-            checks.push(WeightCheckItem {
-                item: "权重总和".to_string(),
-                current_value: weight_sum,
-                required_range: format!("应等于 {}", TARGET),
-                pass: sum_check,
-            });
-        } else {
-            checks.push(WeightCheckItem {
-                item: "权重总和（仅部分评审因素）".to_string(),
-                current_value: weight_sum,
-                required_range: format!("目标值 {}", TARGET),
-                pass: true,
-            });
-            if !sum_check {
-                heuristic_risks.push(format!("部分权重总和 {} 不等于目标值 {}，需确认是否有遗漏的评审因素。", weight_sum, TARGET));
-            }
-        }
+        checks.push(WeightCheckItem {
+            item: "权重总和".to_string(),
+            current_value: weight_sum,
+            required_range: format!("应等于 {}", args.total_score),
+            pass: sum_check,
+        });
 
-        // ── 3. 缺失维度（Heuristic）──
+        // ── 2. 价格分范围检查 ──
+        let (price_min, price_max) = Self::get_price_range(&args.procurement_category)?;
+        let price_range_ok =
+            args.price_weight >= price_min - EPSILON && args.price_weight <= price_max + EPSILON;
+
+        checks.push(WeightCheckItem {
+            item: format!("{}品类价格分范围", args.procurement_category),
+            current_value: args.price_weight,
+            required_range: format!("{}-{}%", price_min, price_max),
+            pass: price_range_ok,
+        });
+
+        // ── 3. 缺失维度检测 ──
         match args.procurement_category.as_str() {
             "货物" => {
-                if args.technical_weight <= 0.0 { missing_dimensions.push("技术分".to_string()); }
-                if business_w <= 0.0 { missing_dimensions.push("商务分".to_string()); }
+                // 货物必须有技术分 + 商务分
+                if args.technical_weight <= 0.0 {
+                    missing_dimensions.push("技术分".to_string());
+                }
+                if business_w <= 0.0 {
+                    missing_dimensions.push("商务分".to_string());
+                }
             }
             "服务" => {
-                if service_w <= 0.0 { missing_dimensions.push("服务分".to_string()); }
-                if args.technical_weight <= 0.0 { missing_dimensions.push("技术分".to_string()); }
+                // 服务必须有服务分
+                if service_w <= 0.0 {
+                    missing_dimensions.push("服务分".to_string());
+                }
+                // 服务也应有技术分
+                if args.technical_weight <= 0.0 {
+                    missing_dimensions.push("技术分".to_string());
+                }
             }
             "工程" => {
-                if args.technical_weight <= 0.0 { missing_dimensions.push("技术分".to_string()); }
+                // 工程必须有技术分
+                if args.technical_weight <= 0.0 {
+                    missing_dimensions.push("技术分".to_string());
+                }
+                // 工程商务分可选的，但建议有
+                if business_w <= 0.0 {
+                    // 工程商务分不是必须，但标记
+                }
             }
-            _ => unreachable!("handled above"),
-        }
-        if !missing_dimensions.is_empty() {
-            heuristic_risks.push(format!("建议补充评审维度：{}", missing_dimensions.join("、")));
+            _ => {}
         }
 
-        // ── 4. 技术分分布（Heuristic）──
-        if args.technical_weight > 0.0
-            && (args.technical_weight < TECH_WEIGHT_SUGGESTED_MIN
-                || args.technical_weight > TECH_WEIGHT_SUGGESTED_MAX)
-        {
+        // ── 4. 技术分也做范围检查（建议性） ──
+        // 技术分应占合理比例
+        if args.technical_weight > 0.0 {
             checks.push(WeightCheckItem {
                 item: "技术分权重".to_string(),
                 current_value: args.technical_weight,
-                required_range: format!("建议 {}-{}%", TECH_WEIGHT_SUGGESTED_MIN, TECH_WEIGHT_SUGGESTED_MAX),
-                pass: false,
+                required_range: "建议 20%-60%".to_string(),
+                pass: args.technical_weight >= 20.0 && args.technical_weight <= 60.0,
             });
-            heuristic_risks.push(format!(
-                "技术分 {}% 不在建议范围 {}-{}%。（无法规强制依据）",
-                args.technical_weight, TECH_WEIGHT_SUGGESTED_MIN, TECH_WEIGHT_SUGGESTED_MAX
-            ));
         }
 
         // ── 5. 综合判定 ──
-        let legal_violation = complete && !sum_check;
-        let has_risk = !heuristic_risks.is_empty();
+        let has_violation = !sum_check
+            || !price_range_ok
+            || !missing_dimensions.is_empty();
 
-        let status = if legal_violation { "violation".to_string() }
-            else if has_risk { "risk".to_string() }
-            else { "compliant".to_string() };
+        let has_risk = !has_violation
+            && (!price_range_ok || args.technical_weight > 0.0
+                && (args.technical_weight < 20.0 || args.technical_weight > 60.0));
 
-        let legal_basis: String = if legal_violation {
-            "权重一致性校验：所有权重之和应等于目标总值。该检查基于数值闭合性原则，不声称某一具体法规条款。".into()
+        let status = if has_violation {
+            "violation"
+        } else if has_risk {
+            "risk"
         } else {
-            String::new()
+            "compliant"
         };
 
         // ── 6. 综合摘要 ──
         let mut summary_parts: Vec<String> = Vec::new();
+
         if sum_check {
-            summary_parts.push(format!("权重总和 {} 等于目标值 {}", weight_sum, TARGET));
-        } else if complete {
             summary_parts.push(format!(
-                "权重总和不闭合：各项和 {} 不等于目标值 {}（差额 {:.2}）",
-                weight_sum, TARGET, (weight_sum - TARGET).abs()
+                "权重总和 {} 等于总分 {}，通过",
+                weight_sum, args.total_score
             ));
         } else {
-            summary_parts.push(format!("部分权重总和 {}（目标值 {}）", weight_sum, TARGET));
+            summary_parts.push(format!(
+                "权重总和不闭合：各分项之和 {} 不等于总分 {}（差额 {}）",
+                weight_sum,
+                args.total_score,
+                (weight_sum - args.total_score).abs()
+            ));
         }
-        if !missing_dimensions.is_empty() { summary_parts.push(format!("建议补充：{}", missing_dimensions.join("、"))); }
-        summary_parts.push(format!("状态：{}", if status == "compliant" { "合规" } else if status == "violation" { "违规" } else { "需关注" }));
+
+        if price_range_ok {
+            summary_parts.push(format!(
+                "价格分 {}% 在 {} 品类法定范围 {}-{}% 内",
+                args.price_weight, args.procurement_category, price_min, price_max
+            ));
+        } else {
+            summary_parts.push(format!(
+                "价格分 {}% 超出 {} 品类法定范围 {}-{}%",
+                args.price_weight, args.procurement_category, price_min, price_max
+            ));
+        }
+
+        if !missing_dimensions.is_empty() {
+            summary_parts.push(format!(
+                "缺失评审维度：{}",
+                missing_dimensions.join("、")
+            ));
+        } else {
+            summary_parts.push("评审维度完整".to_string());
+        }
+
+        let summary = summary_parts.join("；") + "。";
 
         Ok(WeightDistributionResult {
-            status, sum_check,
-            weight_sum, target_total: TARGET,
-            missing_dimensions, heuristic_risks, checks,
-            summary: summary_parts.join("；") + "。",
-            legal_basis,
+            status: status.to_string(),
+            sum_check,
+            price_range_ok,
+            missing_dimensions,
+            checks,
+            summary,
         })
     }
 }
@@ -289,26 +273,42 @@ impl AgentTool for ValidateWeightDistributionTool {
             "function": {
                 "name": "validate_weight_distribution",
                 "description": "【使用场景】校验评审因素权重分配是否合规——\
-                    ① 所有权重之和等于目标值（数值闭合性）；\
-                    ② 各项权重非负数；\
-                    ③ 建议性检查：核心评审维度是否遗漏、技术分分布是否合理。\
-                    【不使用场景】不校验价格分具体范围（用 validate_scoring_formula）；\
+                    ① 各项权重之和应等于总分（通常100分）；\
+                    ② 价格分在法定范围内（货物/工程30%-60%，服务10%-30%）；\
+                    ③ 必要评审维度是否缺失（货物须有技术分+商务分，服务须有服务分，工程须有技术分）。\
+                    【不使用场景】不校验价格分公式具体算法（用 validate_scoring_formula）；\
                     不校验评分细则主观性（用 detect_subjective_scoring）。\
-                    【注意】\n\
-                    - 价格分法定范围由 validate_scoring_formula 根据采购方式/规则体系精确判定。\n\
-                    - 本工具基于数值闭合性原则，不声称某一具体法规条款。\n\
-                    - weights_complete 必填：true=严格闭合 / false=仅提示 / 缺失→uncertain。",
+                    【法条依据】《政府采购货物和服务招标投标管理办法》（财政部令第87号）第55条。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "price_weight": {"type": "number", "description": "价格分权重"},
-                        "technical_weight": {"type": "number", "description": "技术分权重"},
-                        "service_weight": {"type": "number", "description": "服务分权重（可选）"},
-                        "business_weight": {"type": "number", "description": "商务分权重（可选）"},
-                        "procurement_category": {"type": "string", "enum": ["货物", "工程", "服务"], "description": "采购品类"},
-                        "weights_complete": {"type": "boolean", "description": "必填。当前权重是否覆盖全部评审因素。true=严格闭合 / false=仅提示"}
+                        "price_weight": {
+                            "type": "number",
+                            "description": "价格分权重（百分比数值）。"
+                        },
+                        "technical_weight": {
+                            "type": "number",
+                            "description": "技术分权重（百分比数值）。"
+                        },
+                        "service_weight": {
+                            "type": "number",
+                            "description": "服务分权重（可选，百分比数值）。"
+                        },
+                        "business_weight": {
+                            "type": "number",
+                            "description": "商务分权重（可选，百分比数值）。"
+                        },
+                        "procurement_category": {
+                            "type": "string",
+                            "enum": ["货物", "工程", "服务"],
+                            "description": "采购品类。"
+                        },
+                        "total_score": {
+                            "type": "number",
+                            "description": "总分值，通常为 100。"
+                        }
                     },
-                    "required": ["price_weight", "technical_weight", "procurement_category", "weights_complete"]
+                    "required": ["price_weight", "technical_weight", "procurement_category", "total_score"]
                 }
             }
         })
@@ -327,36 +327,126 @@ impl AgentTool for ValidateWeightDistributionTool {
 mod tests {
     use super::*;
 
-    fn _make(pw: f64, tw: f64, sw: Option<f64>, bw: Option<f64>, cat: &str, complete: Option<bool>) -> ValidateWeightDistributionArgs {
-        ValidateWeightDistributionArgs {
-            price_weight: pw, technical_weight: tw,
-            service_weight: sw, business_weight: bw,
-            procurement_category: cat.to_string(),
-            weights_complete: complete,
-        }
+    #[test]
+    fn test_goods_30_50_20_compliant() {
+        // 货物：30%价格 + 50%技术 + 20%商务 = 100 → 合规
+        let args = ValidateWeightDistributionArgs {
+            price_weight: 30.0,
+            technical_weight: 50.0,
+            service_weight: None,
+            business_weight: Some(20.0),
+            procurement_category: "货物".to_string(),
+            total_score: 100.0,
+        };
+        let result = ValidateWeightDistributionTool::validate(&args).unwrap();
+        assert_eq!(result.status, "compliant");
+        assert!(result.sum_check);
+        assert!(result.price_range_ok);
+        assert!(result.missing_dimensions.is_empty());
     }
-    fn _v(a: &ValidateWeightDistributionArgs) -> WeightDistributionResult { ValidateWeightDistributionTool::validate(a).unwrap() }
 
-    #[test] fn goods_30_50_20_compliant() { let a=_make(30.,50.,None,Some(20.),"货物",Some(true)); assert_eq!(_v(&a).status,"compliant"); }
-    #[test] fn sum_90_violation() { let a=_make(30.,40.,None,Some(20.),"货物",Some(true)); assert_eq!(_v(&a).status,"violation"); }
-    #[test] fn sum_99_99_violation() { let a=_make(30.,40.,None,Some(29.99),"货物",Some(true)); assert_eq!(_v(&a).status,"violation"); }
-    #[test] fn sum_3333_3333_3334_compliant() { let a=_make(33.33,33.33,None,Some(33.34),"货物",Some(true)); assert_eq!(_v(&a).status,"compliant"); }
-    #[test] fn sum_3333_3333_3333_violation() { let a=_make(33.33,33.33,None,Some(33.33),"货物",Some(true)); assert_eq!(_v(&a).status,"violation"); }
-    #[test] fn sum_301_202_497_compliant() { let a=_make(30.1,20.2,None,Some(49.7),"货物",Some(true)); assert_eq!(_v(&a).status,"compliant"); }
-    #[test] fn incomplete_sum_90_risk() { let a=_make(30.,40.,None,Some(20.),"货物",Some(false)); assert_eq!(_v(&a).status,"risk"); }
-    #[test] fn missing_complete_uncertain() { let a=_make(30.,50.,None,Some(20.),"货物",None); assert_eq!(_v(&a).status,"uncertain"); }
-    #[test] fn invalid_category_uncertain() { let a=_make(30.,50.,None,Some(20.),"banana",Some(true)); assert_eq!(_v(&a).status,"uncertain"); }
-    #[test] fn negative_invalid_input() { let a=_make(-5.,80.,None,Some(25.),"货物",Some(true)); assert_eq!(_v(&a).status,"invalid_input"); }
-    #[test] fn weight_0_valid() { let a=_make(0.,60.,None,Some(40.),"货物",Some(true)); assert_eq!(_v(&a).status,"compliant"); }
-    #[test] fn weight_100_valid() { let a=_make(100.,0.,None,Some(0.),"货物",Some(true)); assert!(_v(&a).status != "invalid_input", "100.0 must be valid range"); }
-    #[test] fn weight_100_01_invalid() { let a=_make(100.01,0.,None,Some(0.),"货物",Some(true)); assert_eq!(_v(&a).status,"invalid_input"); }
-    #[test] fn weight_150_invalid() { let a=_make(150.,0.,None,Some(0.),"货物",Some(true)); assert_eq!(_v(&a).status,"invalid_input"); }
-    #[test] fn huge_finite_invalid() { let a=_make(1e6,0.,None,Some(0.),"货物",Some(true)); assert_eq!(_v(&a).status,"invalid_input"); }
-    #[test] fn incomplete_but_over_100_invalid() { let a=_make(150.,20.,None,Some(10.),"货物",Some(false)); assert_eq!(_v(&a).status,"invalid_input"); }
-    #[test] fn nan_invalid_input() { let a=_make(f64::NAN,50.,None,Some(50.),"货物",Some(true)); assert_eq!(_v(&a).status,"invalid_input"); }
-    #[test] fn inf_invalid_input() { let a=_make(f64::INFINITY,0.,None,Some(0.),"货物",Some(true)); assert_eq!(_v(&a).status,"invalid_input"); }
-    #[test] fn precision_33_333_invalid() { let a=_make(33.333,33.333,None,Some(33.334),"货物",Some(true)); assert_eq!(_v(&a).status,"invalid_input"); }
-    #[test] fn precision_30_00_valid() { let a=_make(30.00,50.00,None,Some(20.00),"货物",Some(true)); assert_eq!(_v(&a).status,"compliant"); }
-    #[test] fn missing_service_risk() { let a=_make(20.,80.,None,None,"服务",Some(true)); let r=_v(&a); assert_eq!(r.status,"risk"); assert!(r.missing_dimensions.iter().any(|d| d=="服务分")); }
-    #[test] fn tech_85_risk() { let a=_make(15.,85.,None,None,"货物",Some(true)); let r=_v(&a); assert_eq!(r.status,"risk"); assert!(r.heuristic_risks.iter().any(|h|h.contains("技术分"))); }
+    #[test]
+    fn test_goods_15_60_25_violation_price_too_low() {
+        // 货物：15%价格（低于30%下限）→ 违规
+        let args = ValidateWeightDistributionArgs {
+            price_weight: 15.0,
+            technical_weight: 60.0,
+            service_weight: None,
+            business_weight: Some(25.0),
+            procurement_category: "货物".to_string(),
+            total_score: 100.0,
+        };
+        let result = ValidateWeightDistributionTool::validate(&args).unwrap();
+        assert_eq!(result.status, "violation");
+        assert!(!result.price_range_ok);
+    }
+
+    #[test]
+    fn test_sum_not_100_violation() {
+        // 权重只和 90 ≠ 100 → 违规
+        let args = ValidateWeightDistributionArgs {
+            price_weight: 30.0,
+            technical_weight: 40.0,
+            service_weight: None,
+            business_weight: Some(20.0),
+            procurement_category: "货物".to_string(),
+            total_score: 100.0,
+        };
+        let result = ValidateWeightDistributionTool::validate(&args).unwrap();
+        assert_eq!(result.status, "violation");
+        assert!(!result.sum_check);
+    }
+
+    #[test]
+    fn test_service_missing_service_dimension() {
+        // 服务品类缺少服务分 → 违规
+        let args = ValidateWeightDistributionArgs {
+            price_weight: 20.0,
+            technical_weight: 80.0,
+            service_weight: None,
+            business_weight: None,
+            procurement_category: "服务".to_string(),
+            total_score: 100.0,
+        };
+        let result = ValidateWeightDistributionTool::validate(&args).unwrap();
+        assert_eq!(result.status, "violation");
+        assert!(
+            result
+                .missing_dimensions
+                .iter()
+                .any(|d| d == "服务分"),
+            "服务品类缺少服务分维度"
+        );
+    }
+
+    #[test]
+    fn test_service_20_40_40_compliant() {
+        // 服务：20%价格(在10-30%内) + 40%技术 + 40%服务 = 100 → 合规
+        let args = ValidateWeightDistributionArgs {
+            price_weight: 20.0,
+            technical_weight: 40.0,
+            service_weight: Some(40.0),
+            business_weight: None,
+            procurement_category: "服务".to_string(),
+            total_score: 100.0,
+        };
+        let result = ValidateWeightDistributionTool::validate(&args).unwrap();
+        assert_eq!(result.status, "compliant");
+    }
+
+    #[test]
+    fn test_construction_missing_technical() {
+        // 工程缺少技术分 → 违规
+        let args = ValidateWeightDistributionArgs {
+            price_weight: 50.0,
+            technical_weight: 0.0,
+            service_weight: None,
+            business_weight: Some(50.0),
+            procurement_category: "工程".to_string(),
+            total_score: 100.0,
+        };
+        let result = ValidateWeightDistributionTool::validate(&args).unwrap();
+        assert_eq!(result.status, "violation");
+        assert!(
+            result
+                .missing_dimensions
+                .iter()
+                .any(|d| d == "技术分"),
+            "工程品类缺少技术分维度"
+        );
+    }
+
+    #[test]
+    fn test_invalid_category_errors() {
+        let args = ValidateWeightDistributionArgs {
+            price_weight: 30.0,
+            technical_weight: 70.0,
+            service_weight: None,
+            business_weight: None,
+            procurement_category: "咨询".to_string(),
+            total_score: 100.0,
+        };
+        let result = ValidateWeightDistributionTool::validate(&args);
+        assert!(result.is_err());
+    }
 }

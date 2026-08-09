@@ -7,6 +7,7 @@ import { dashboardRoutes } from '../features/dashboard/routes';
 import { uploadRoutes } from '../features/bidUpload/routes';
 import { bidAuditRoutes } from '../features/bidAudit/routes';
 import { libraryRoutes } from '../features/bidLibrary/routes';
+import { tenantRoutes } from '../features/tenant/routes';
 
 export const router = createBrowserRouter([
    {
@@ -29,6 +30,7 @@ export const router = createBrowserRouter([
          ...uploadRoutes,
          ...bidAuditRoutes,
          ...libraryRoutes,
+         ...tenantRoutes,
       ],
    },
 ]);

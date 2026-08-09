@@ -540,10 +540,14 @@ async fn main() -> Result<()> {
     //   EMBED_ENGINE=local  → 本地 BGE-M3 数据并行（默认，需 models/ 缓存）
     //   EMBED_ENGINE=remote → 远程 text-embedding-v4（需 DASHSCOPE_API_KEY）
     //
-    // 本地模式 K 值（数据并行实例数）：
+    // 本地模式 K 值（数据并行实例数，由 AIBID_EMBED_PARALLELISM 覆盖）：
     //   K=1 → ~1.2GB          K=2 → ~2.4GB, ~1.8×（推荐）
     //   K=3 → ~3.6GB, ~2.5×   K=4 → ~4.8GB, ~3.2×
-    const EMBED_PARALLELISM: usize = 2;
+    // 低内存机器（<16GB）建议 K=1，避免与 Ollama + Neo4j 等并发时 OOM。
+    let embed_parallelism: usize = env::var("AIBID_EMBED_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
 
     let embed_engine = env::var("EMBED_ENGINE").unwrap_or_else(|_| "local".to_string());
     let is_remote = embed_engine == "remote";
@@ -567,13 +571,13 @@ async fn main() -> Result<()> {
     } else {
         println!(
             "正在生成 BGE-M3 Embedding（数据并行: {} 实例）...",
-            EMBED_PARALLELISM
+            embed_parallelism
         );
         ai_bid::services::embedding_service::embed_chunks_parallel(
             &chunks,
             &chunking_config,
             &sections_output.document_id,
-            EMBED_PARALLELISM,
+            embed_parallelism,
         )?
     };
 
@@ -878,14 +882,14 @@ async fn main() -> Result<()> {
             }
             registry.register(Box::new(OutputFindingTool));
             // V2+ 工具
-            registry.register(Box::new(CompareVersionsTool {
-                current_chunks: chunk_map.clone(),
-                current_order: chunk_order.clone(),
-            }));
-            registry.register(Box::new(DetectBoilerplateTool {
-                chunks: chunk_map.clone(),
-                chunk_order: chunk_order.clone(),
-            }));
+            registry.register(Box::new(CompareVersionsTool::new(
+                chunk_map.clone(),
+                chunk_order.clone(),
+            )));
+            registry.register(Box::new(DetectBoilerplateTool::new(
+                chunk_map.clone(),
+                chunk_order.clone(),
+            )));
             // V3 采购程序合规审查
             registry.register(Box::new(VerifyProcurementMethodTool));
             registry.register(Box::new(VerifyBidDepositTool));
@@ -1039,6 +1043,23 @@ async fn main() -> Result<()> {
         let snap_json = serde_json::to_string_pretty(snap)?;
         fs::write(&snap_path, snap_json)?;
         println!("  Graph 快照已写入: {}", snap_path);
+    }
+
+    // 8.5 知识沉淀：审核结果 → 挑精华 → 查重 → 写 Neo4j（默认开启，可用 AIBID_WRITE_NEO4J=0 关闭）
+    if std::env::var("AIBID_WRITE_NEO4J").unwrap_or_else(|_| "1".into()) != "0" {
+        match ai_bid::knowledge::graph::Neo4jClient::connect().await {
+            Ok(client) => match ai_bid::knowledge::run::run(output.findings.clone(), &client).await {
+                Ok(written) => {
+                    println!("  知识沉淀: 写入 Neo4j {} 条新风险/法条", written);
+                }
+                Err(e) => {
+                    eprintln!("  知识沉淀警告: 写 Neo4j 失败（不影响审核结果）: {}", e);
+                }
+            },
+            Err(e) => {
+                eprintln!("  知识沉淀警告: 连接 Neo4j 失败（不影响审核结果）: {}", e);
+            }
+        }
     }
 
     println!();

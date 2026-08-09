@@ -37,7 +37,8 @@ async fn main() -> anyhow::Result<()> {
     println!("  模型加载完成");
 
     let router = ai_bid::api::router::build(state);
-    let bind_addr = "127.0.0.1:3001";
+    let bind_addr = std::env::var("AIBID_RUST_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:3001".to_string());
 
     println!("  监听地址: http://{}", bind_addr);
     println!("    POST /api/v1/documents        上传并处理文档");
@@ -48,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     println!("    GET  /health                   健康检查");
     println!();
 
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     axum::serve(listener, router).await?;
 
     Ok(())
