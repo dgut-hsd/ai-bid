@@ -87,7 +87,7 @@ mybatis-plus:
     pretty-print: false
 
 server:
-  port: 8080
+  port: 3000
 
 management:
   endpoints:
