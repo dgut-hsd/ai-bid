@@ -33,7 +33,7 @@ public class AsyncConfig {
         // 提交任务时在调用方线程捕获 TenantContext 快照，并在工作线程上安装。
         // 否则 Java→Rust 的内部请求签名（InternalRequestSigner）拿不到租户身份，
         // 会直接抛 "TenantContext is required for internal Rust requests"。
-        executor.setTaskDecorator(task -> TenantContext.wrap(task));
+        executor.setTaskDecorator(TenantContext::wrap);
         executor.setRejectedExecutionHandler((r, e) -> {
             log.warn("audit executor rejected task, active={}, queueSize={}", e.getActiveCount(), e.getQueue().size());
             new ThreadPoolExecutor.CallerRunsPolicy().rejectedExecution(r, e);

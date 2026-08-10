@@ -50,6 +50,10 @@ spring:
       mode: always
       schema-locations: classpath:audit_task_event.sql,classpath:trace_schema.sql
   servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
     multipart:
       max-file-size: 50MB
       max-request-size: 50MB
@@ -128,4 +132,5 @@ rust:
     health-check-enabled: true
     # Java→Rust HMAC 签名密钥，必须与 Rust 侧 RUST_API_INTERNAL_SECRET 完全一致。
     # 取值来源：环境变量，或上面 spring.config.import 导入的 .env。
+    # 不设硬编码默认值：Rust 侧缺失时 secret 为 None，两端各用各的默认会静默签名不匹配。
     internal-secret: ${RUST_API_INTERNAL_SECRET:}
