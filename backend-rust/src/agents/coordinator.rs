@@ -2903,6 +2903,7 @@ mod tests {
             review_events: None,
             metrics: None,
             shared_search_cache: Arc::new(Mutex::new(HashMap::new())),
+            chunk_map: None,
         }
     }
 

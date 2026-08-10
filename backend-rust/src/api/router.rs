@@ -607,6 +607,7 @@ mod tests {
             review_event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             review_results: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             review_errors: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            review_usages: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             active_reviews: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         };
         add_internal_auth(

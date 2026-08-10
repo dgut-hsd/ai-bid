@@ -290,6 +290,7 @@ mod tests {
             agent: "财政合规Agent".to_string(),
             confidence: 0.91,
             clause_ids: vec!["ch_042".to_string()],
+            block_ids: vec![],
             source_quote: "投标人须选用华为...".to_string(),
             legal_basis: vec!["政府采购法第20条".to_string()],
             reason: "构成变相指定品牌".to_string(),

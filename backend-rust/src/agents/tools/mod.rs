@@ -69,6 +69,8 @@ pub mod verify_procurement_method;
 pub mod check_imported_products;
 pub mod check_scoring_completeness;
 pub mod detect_subjective_scoring;
+pub mod eval_harness;
+pub mod eval_test;
 pub mod validate_scoring_formula;
 pub mod validate_weight_distribution;
 pub mod verify_consortium_rules;
