@@ -182,7 +182,6 @@ public class TraceServiceImpl implements TraceService {
         }
 
         // 验证 session 关联的审核任务属于当前租户
-        Long tenantId = TenantScope.requiredTenantId();
         if (session.getTaskId() != null) {
             AuditTask task = auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
                     .eq(AuditTask::getTaskId, session.getTaskId())
