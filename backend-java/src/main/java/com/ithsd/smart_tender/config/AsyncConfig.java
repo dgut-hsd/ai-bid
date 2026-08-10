@@ -28,6 +28,7 @@ public class AsyncConfig {
         executor.setQueueCapacity(queueCapacity);
         executor.setKeepAliveSeconds(keepAliveSeconds);
         executor.setThreadNamePrefix("audit-async-");
+        executor.setTaskDecorator(TenantContext::wrap);
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(10);
         // 提交任务时在调用方线程捕获 TenantContext 快照，并在工作线程上安装。

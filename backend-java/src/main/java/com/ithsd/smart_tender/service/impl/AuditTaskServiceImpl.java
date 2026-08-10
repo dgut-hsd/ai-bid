@@ -25,6 +25,7 @@ import com.ithsd.smart_tender.model.vo.SummaryVO;
 import com.ithsd.smart_tender.service.AuditTaskService;
 import com.ithsd.smart_tender.service.TenderService;
 import com.ithsd.smart_tender.service.engine.queue.AuditTaskDispatcher;
+import com.ithsd.smart_tender.service.engine.queue.AuditTaskEnvelope;
 import com.ithsd.smart_tender.service.engine.rust.RustApiClient;
 import com.ithsd.smart_tender.model.dto.rust.RustBlockBBoxResponse;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewResponse;
@@ -117,16 +118,12 @@ public class AuditTaskServiceImpl implements AuditTaskService {
 
         // 必须在当前事务提交后再 dispatch，否则 @Async 线程查不到刚插入的 task
         final String taskId = entity.getTaskId();
-        final TenantContextSnapshot ctxSnapshot = TenantContext.snapshot();
+        // 在调用方线程捕获租户身份，随任务信封一路带到队列消费端（跨进程也不丢）。
+        final AuditTaskEnvelope envelope = AuditTaskEnvelope.capture(taskId);
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                TenantContext.set(ctxSnapshot != null ? ctxSnapshot.toContext() : null);
-                try {
-                    taskDispatcher.dispatch(taskId);
-                } finally {
-                    TenantContext.clear();
-                }
+                taskDispatcher.dispatch(envelope);
             }
         });
         return new AuditTaskCreateVO(entity.getTaskId());
@@ -213,7 +210,8 @@ public class AuditTaskServiceImpl implements AuditTaskService {
             // Rust 重启了 → 从 audit_issue 表重建
             List<AuditIssue> dbIssues = auditIssueMapper.selectList(
                     new LambdaQueryWrapper<AuditIssue>()
-                            .eq(AuditIssue::getAuditId, task.getId()));
+                            .eq(AuditIssue::getAuditId, task.getId())
+                            .eq(AuditIssue::getTenantId, task.getTenantId()));
             allFindings = dbIssues.stream().map(i -> {
                 RustRiskFinding f = new RustRiskFinding();
                 f.setRiskId(i.getIssueNo());

@@ -21,9 +21,59 @@ in `docs/adr/tenant-model.md` and `docs/adr/tenant-isolation.md`.
 4. `tenant_migration_rollback.sql` is a manual rollback script for a disposable,
    pre-backfill environment only. It is intentionally not named as a Flyway migration.
 
-The existing application configuration has Flyway disabled, so deployment must apply
-V1 through V6 using the team's normal Flyway runner or an explicit migration command.
-Do not enable Flyway in application code as part of T1.
+The application configuration has Flyway disabled and `spring.sql.init.mode` explicitly
+set to `never` in both the base and production profiles. `schema-locations` is not
+configured. The legacy `audit_task_event.sql` and `trace_schema.sql` files are therefore
+not startup inputs; deployment must apply V1 through V6 using the team's normal Flyway
+runner or an explicit migration command. Do not enable Flyway in application code as
+part of T1.
+
+## Execution safety
+
+V5 and V6 must be run in order by exactly one migration runner. Do not run them from
+application startup, from concurrent runners, or while another schema/data migration is
+active. Before starting the migration, take and verify a restorable database backup,
+pause application writes and background workers/consumers, and keep the write pause in
+place through validation.
+
+Before V6, run the two read-only conflict-detection queries below. Each query must
+return zero rows, and its immediately following `SHOW WARNINGS` must return no warning.
+Any result or warning is a stop condition and must be resolved before V6 is started. Do
+not treat an empty application log as a substitute for reviewing the database results.
+
+At minimum, the preflight must return no rows for these checks:
+
+```sql
+SELECT t.id, t.tenant_code, t.owner_user_id, u.id AS user_id
+FROM sys_user AS u
+JOIN tenant AS t
+  ON t.tenant_code = CONCAT('user-', u.id)
+WHERE t.owner_user_id <> u.id;
+
+SHOW WARNINGS;
+
+SELECT t.id, t.tenant_code, tm.user_id, tm.role, tm.status
+FROM sys_user AS u
+JOIN tenant AS t
+  ON t.tenant_code = CONCAT('user-', u.id)
+JOIN tenant_member AS tm
+  ON tm.tenant_id = t.id
+ AND tm.user_id = u.id
+WHERE tm.role <> 'OWNER'
+   OR tm.status <> 'ACTIVE';
+
+SHOW WARNINGS;
+```
+
+V5 changes the schema with DDL, so its index/column changes remain non-transactional.
+Schedule V5 in a maintenance window and validate it in pre-production against the exact
+MySQL version and representative data volume, including the expected index algorithm and
+lock behavior, before production execution. Keep the backup and migration evidence with
+the change record.
+
+Published migration files are immutable once any environment may have executed them.
+Do not rewrite V5 or V6 in place; a future repair or correction must be delivered as a
+new, reviewed migration version under normal change control.
 
 The `trace_schema.sql` tables are optional because they are not part of the V1 baseline.
 V5 checks table existence before expanding them; V1's 11 required resource tables remain

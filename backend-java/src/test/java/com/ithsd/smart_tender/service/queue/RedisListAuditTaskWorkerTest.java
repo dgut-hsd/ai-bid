@@ -2,6 +2,7 @@ package com.ithsd.smart_tender.service.queue;
 
 import com.ithsd.smart_tender.service.AuditEngineService;
 import com.ithsd.smart_tender.service.engine.queue.AuditQueueProperties;
+import com.ithsd.smart_tender.service.engine.queue.AuditTaskEnvelope;
 import com.ithsd.smart_tender.service.engine.queue.RedisListAuditTaskWorker;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -41,11 +42,14 @@ class RedisListAuditTaskWorkerTest {
         when(redisTemplate.opsForList()).thenReturn(listOperations);
         when(queueProperties.getStreamKey()).thenReturn("queue:audit:tasks");
         when(queueProperties.getBlockMs()).thenReturn(1000);
-        when(listOperations.leftPop(eq("queue:audit:tasks"), eq(1000L), eq(TimeUnit.MILLISECONDS))).thenReturn("task_123");
+        AuditTaskEnvelope envelope = new AuditTaskEnvelope(
+                1, 20001L, "task_123", 10001L, "OWNER", 1L, "request-a");
+        when(listOperations.leftPop(eq("queue:audit:tasks"), eq(1000L), eq(TimeUnit.MILLISECONDS)))
+                .thenReturn(envelope.toJson());
 
         worker.poll();
 
-        verify(auditEngineService).start("task_123");
+        verify(auditEngineService).start(envelope);
     }
 
     @Test
@@ -57,6 +61,6 @@ class RedisListAuditTaskWorkerTest {
 
         worker.poll();
 
-        verify(auditEngineService, never()).start(anyString());
+        verify(auditEngineService, never()).start(any(AuditTaskEnvelope.class));
     }
 }

@@ -1,58 +1,78 @@
-/**
- * 多租户 API 层
- *
- * 接口路径严格对齐飞书《前端多租户交接文档》。
- * 所有租户接口使用 snake_case，与旧业务接口（camelCase）区分。
- */
+/** Tenant API calls. All response data is normalized in login/api/session.ts. */
 import request from '@/api/request';
 import type { BaseResponse } from '@/api/types';
+import {
+  normalizeAuthResponse,
+  normalizeMemberListResponse,
+  normalizeResponse,
+  normalizeTenantListResponse,
+  normalizeTenantResponse,
+} from '@/features/login/api/session';
 import type {
+  ApiResponse,
   AuthSession,
-  TenantListResponse,
-  TenantSummary,
   CreateTenantParams,
   MemberListResponse,
   SwitchTenantParams,
+  TenantListResponse,
+  TenantSummary,
 } from '../types';
 
 export const tenantApi = {
-  // ─── 认证相关 ──────────────────────────────────────────────────────
-
-  /** 切换租户 — 切完整体替换登录会话，旧 token 失效 */
-  switchTenant: (data: SwitchTenantParams): Promise<BaseResponse<AuthSession>> => {
-    return request.post('/api/auth/switch-tenant', data);
+  /** 切换租户 — 返回完整新会话，旧 token 立即失效 */
+  switchTenant: async (
+    data: SwitchTenantParams
+  ): Promise<ApiResponse<AuthSession>> => {
+    const response = await request.post<unknown, BaseResponse<unknown>>(
+      '/api/auth/switch-tenant',
+      data
+    );
+    return normalizeAuthResponse(response);
   },
 
-  /** 刷新令牌 — Bearer，无请求体，返回新 AuthSession */
-  refresh: (): Promise<BaseResponse<AuthSession>> => {
-    return request.post('/api/auth/refresh', {});
+  /** 刷新令牌 — 使用当前 access token 的 Bearer Header，无独立 refresh token */
+  refresh: async (): Promise<ApiResponse<AuthSession>> => {
+    const response = await request.post<unknown, BaseResponse<unknown>>(
+      '/api/auth/refresh'
+    );
+    return normalizeAuthResponse(response);
   },
-
-  // ─── 租户管理 ──────────────────────────────────────────────────────
 
   /** 获取租户列表（含 current_tenant_id） */
-  getTenants: (): Promise<BaseResponse<TenantListResponse>> => {
-    return request.get('/api/tenants');
+  getTenants: async (): Promise<ApiResponse<TenantListResponse>> => {
+    const response = await request.get<unknown, BaseResponse<unknown>>('/api/tenants');
+    return normalizeResponse(response, normalizeTenantListResponse);
   },
 
-  /** 创建租户 */
-  createTenant: (data: CreateTenantParams): Promise<BaseResponse<TenantSummary>> => {
-    return request.post('/api/tenants', data);
+  /** 创建租户；请求不包含服务端生成的 tenant_id 等字段 */
+  createTenant: async (
+    data: CreateTenantParams
+  ): Promise<ApiResponse<TenantSummary>> => {
+    const response = await request.post<unknown, BaseResponse<unknown>>(
+      '/api/tenants',
+      data
+    );
+    return normalizeTenantResponse(response);
   },
 
   /** 获取当前租户 */
-  getCurrentTenant: (): Promise<BaseResponse<TenantSummary>> => {
-    return request.get('/api/tenants/current');
+  getCurrentTenant: async (): Promise<ApiResponse<TenantSummary>> => {
+    const response = await request.get<unknown, BaseResponse<unknown>>(
+      '/api/tenants/current'
+    );
+    return normalizeTenantResponse(response);
   },
 
   /** 获取租户成员列表 */
-  getMembers: (
+  getMembers: async (
     tenantId: string,
     page = 1,
     size = 20
-  ): Promise<BaseResponse<MemberListResponse>> => {
-    return request.get(`/api/tenants/${tenantId}/members`, {
-      params: { page, size },
-    });
+  ): Promise<ApiResponse<MemberListResponse>> => {
+    const response = await request.get<unknown, BaseResponse<unknown>>(
+      `/api/tenants/${tenantId}/members`,
+      { params: { page, size } }
+    );
+    return normalizeResponse(response, normalizeMemberListResponse);
   },
 };

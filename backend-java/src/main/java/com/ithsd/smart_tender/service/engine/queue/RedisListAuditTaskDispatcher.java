@@ -19,13 +19,15 @@ public class RedisListAuditTaskDispatcher implements AuditTaskDispatcher {
     }
 
     @Override
-    public void dispatch(String taskId) {
+    public void dispatch(AuditTaskEnvelope envelope) {
         try {
             String key = queueProperties.getStreamKey(); // reusing streamKey config as list key
-            redisTemplate.opsForList().rightPush(key, taskId);
-            log.info("audit task dispatched to redis list, taskId={}, key={}", taskId, key);
+            redisTemplate.opsForList().rightPush(key, envelope.toJson());
+            log.info("audit task dispatched to redis list, taskId={}, tenantId={}, key={}"
+                    , envelope.taskId(), envelope.tenantId(), key);
         } catch (Exception ex) {
-            log.error("failed to dispatch audit task to redis list, taskId={}", taskId, ex);
+            log.error("failed to dispatch audit task to redis list, taskId={}, tenantId={}"
+                    , envelope.taskId(), envelope.tenantId(), ex);
             throw ex;
         }
     }

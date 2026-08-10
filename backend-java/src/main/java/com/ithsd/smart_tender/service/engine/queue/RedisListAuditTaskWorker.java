@@ -33,14 +33,23 @@ public class RedisListAuditTaskWorker {
             long timeout = queueProperties.getBlockMs() != null ? queueProperties.getBlockMs() : 1000;
             
             // LPOP is non-blocking, BLPOP is blocking. Let's use leftPop with timeout which is BLPOP
-            String taskId = redisTemplate.opsForList().leftPop(key, timeout, TimeUnit.MILLISECONDS);
-            
-            if (taskId != null) {
-                log.info("received audit task from redis list, taskId={}", taskId);
+            String payload = redisTemplate.opsForList().leftPop(key, timeout, TimeUnit.MILLISECONDS);
+
+            if (payload != null) {
+                AuditTaskEnvelope envelope;
                 try {
-                    auditEngineService.start(taskId);
+                    envelope = AuditTaskEnvelope.fromJson(payload);
+                } catch (IllegalArgumentException ex) {
+                    log.error("discarding invalid audit task envelope from redis list", ex);
+                    return;
+                }
+                log.info("received audit task from redis list, taskId={}, tenantId={}"
+                        , envelope.taskId(), envelope.tenantId());
+                try {
+                    auditEngineService.start(envelope);
                 } catch (Exception e) {
-                    log.error("failed to process audit task, taskId={}", taskId, e);
+                    log.error("failed to process audit task, taskId={}, tenantId={}"
+                            , envelope.taskId(), envelope.tenantId(), e);
                     // Simple retry logic could be implemented here if needed, 
                     // but per requirement we stick to simple list for now.
                     // If strict reliability is needed, we should push to DLQ or retry queue.

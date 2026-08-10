@@ -35,13 +35,13 @@ import static org.mockito.Mockito.*;
 /**
  * 跨租户隔离测试 — AuditHistoryServiceImpl。
  *
- * <p>验证租户 A 的用户无法通过已知 auditId 查看/删除租户 B 的审核历史。</p>
+ * <p>验证租户 A 的用户无法通过已知 auditId 查看/删除租户 B 的审核历史。
+ * task 查询带 tenant_id，查不到即抛 {@code RESOURCE_NOT_FOUND}（而非返回空/继续越权操作）。</p>
  */
 @ExtendWith(MockitoExtension.class)
 class AuditHistoryTenantIsolationTest {
 
     private static final Long TENANT_A = 2001L;
-    private static final Long TENANT_B = 2002L;
     private static final Long USER_A = 1001L;
     private static final Long AUDIT_TASK_ID = 8001L;
 
@@ -62,6 +62,7 @@ class AuditHistoryTenantIsolationTest {
     @BeforeEach
     void setUp() {
         BaseContext.setCurrentId(USER_A);
+        TenantContext.set(new TenantRequestContext(USER_A, TENANT_A, "OWNER", 1L, "audit-hist-a"));
     }
 
     @AfterEach
@@ -70,22 +71,17 @@ class AuditHistoryTenantIsolationTest {
         BaseContext.removeCurrentId();
     }
 
-    private void givenUserInTenantA() {
-        TenantContext.set(new TenantRequestContext(USER_A, TENANT_A, "OWNER", 1L, "audit-hist-a"));
-    }
-
     // ── getDetailById ──────────────────────────────────────────
 
     @Test
-    void getDetailById_shouldReturnNullForCrossTenantTask() {
-        givenUserInTenantA();
-
-        // 租户 A 查不到租户 B 的审核任务
+    void getDetailById_shouldThrowForCrossTenantTask() {
+        // 租户 A 查不到租户 B 的审核任务 → 抛 RESOURCE_NOT_FOUND
         when(auditTaskMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(null);
 
-        AuditHistoryDetailVO result = service.getDetailById(AUDIT_TASK_ID);
+        assertThatThrownBy(() -> service.getDetailById(AUDIT_TASK_ID))
+                .isInstanceOf(TenantAuthException.class)
+                .matches(ex -> ((TenantAuthException) ex).getErrorCode().equals("RESOURCE_NOT_FOUND"));
 
-        assertThat(result).isNull();
         verify(auditTaskMapper).selectOne(any(LambdaQueryWrapper.class));
         // 不应该去查子资源（issues / reports）
         verify(auditIssueMapper, never()).selectList(any(LambdaQueryWrapper.class));
@@ -94,8 +90,6 @@ class AuditHistoryTenantIsolationTest {
 
     @Test
     void getDetailById_shouldReturnDetailForSameTenantTask() {
-        givenUserInTenantA();
-
         AuditTask task = AuditTask.builder()
                 .id(AUDIT_TASK_ID).tenantId(TENANT_A).bidId(5001L)
                 .taskStatus(2).build();
@@ -114,13 +108,13 @@ class AuditHistoryTenantIsolationTest {
     // ── delete ─────────────────────────────────────────────────
 
     @Test
-    void delete_shouldNotDeleteCrossTenantTask() {
-        givenUserInTenantA();
-
-        // 租户 A 查不到租户 B 的任务
+    void delete_shouldThrowForCrossTenantTask() {
+        // 租户 A 查不到租户 B 的任务 → 抛 RESOURCE_NOT_FOUND，不执行删除
         when(auditTaskMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(null);
 
-        service.delete(AUDIT_TASK_ID);
+        assertThatThrownBy(() -> service.delete(AUDIT_TASK_ID))
+                .isInstanceOf(TenantAuthException.class)
+                .matches(ex -> ((TenantAuthException) ex).getErrorCode().equals("RESOURCE_NOT_FOUND"));
 
         verify(auditTaskMapper).selectOne(any(LambdaQueryWrapper.class));
         verify(auditIssueMapper, never()).delete(any(LambdaQueryWrapper.class));
@@ -132,8 +126,6 @@ class AuditHistoryTenantIsolationTest {
 
     @Test
     void page_shouldOnlyReturnSameTenantTasks() {
-        givenUserInTenantA();
-
         @SuppressWarnings("unchecked")
         Page<AuditTask> mockPage = mock(Page.class);
         when(mockPage.getRecords()).thenReturn(List.of());
@@ -158,8 +150,6 @@ class AuditHistoryTenantIsolationTest {
 
     @Test
     void getStatistics_shouldOnlyCountSameTenantTasks() {
-        givenUserInTenantA();
-
         when(auditTaskMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of());
 
         AuditHistoryPageQueryDTO dto = new AuditHistoryPageQueryDTO();
@@ -173,6 +163,7 @@ class AuditHistoryTenantIsolationTest {
 
     @Test
     void getDetailById_shouldThrowWhenNoTenantContext() {
+        TenantContext.clear();
         assertThatThrownBy(() -> service.getDetailById(AUDIT_TASK_ID))
                 .isInstanceOf(TenantAuthException.class)
                 .matches(ex -> ((TenantAuthException) ex).getErrorCode().equals("TENANT_REQUIRED"));
@@ -180,6 +171,7 @@ class AuditHistoryTenantIsolationTest {
 
     @Test
     void delete_shouldThrowWhenNoTenantContext() {
+        TenantContext.clear();
         assertThatThrownBy(() -> service.delete(AUDIT_TASK_ID))
                 .isInstanceOf(TenantAuthException.class)
                 .matches(ex -> ((TenantAuthException) ex).getErrorCode().equals("TENANT_REQUIRED"));

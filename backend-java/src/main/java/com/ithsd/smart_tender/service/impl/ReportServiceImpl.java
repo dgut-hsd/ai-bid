@@ -1,6 +1,6 @@
 package com.ithsd.smart_tender.service.impl;
 
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.mapper.AuditReportMapper;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
@@ -42,15 +42,16 @@ public class ReportServiceImpl implements ReportService {
                 .eq(AuditTask::getId, auditId)
                 .eq(AuditTask::getTenantId, tenantId));
         if (task == null) {
-            throw new RuntimeException("审核任务不存在");
+            throw TenantScope.resourceNotFound();
         }
 
         if (task.getTaskStatus() != 2) {
             throw new RuntimeException("审核任务尚未完成，无法生成报告");
         }
 
-        LambdaQueryWrapper<AuditReport> existWrapper = new LambdaQueryWrapper<>();
-        existWrapper.eq(AuditReport::getAuditId, auditId);
+        QueryWrapper<AuditReport> existWrapper = new QueryWrapper<>();
+        existWrapper.eq("audit_id", auditId)
+                .eq("tenant_id", tenantId);
         AuditReport existReport = auditReportMapper.selectOne(existWrapper);
         if (existReport != null) {
             ReportVO vo = new ReportVO();
@@ -62,13 +63,14 @@ public class ReportServiceImpl implements ReportService {
                 .eq(Tender::getId, task.getBidId())
                 .eq(Tender::getTenantId, tenantId));
         if (tender == null) {
-            throw new RuntimeException("标书信息不存在");
+            throw TenantScope.resourceNotFound();
         }
 
-        LambdaQueryWrapper<AuditIssue> issueWrapper = new LambdaQueryWrapper<>();
-        issueWrapper.eq(AuditIssue::getAuditId, auditId)
-                    .orderByAsc(AuditIssue::getSeverity)
-                    .orderByAsc(AuditIssue::getCategory);
+        QueryWrapper<AuditIssue> issueWrapper = new QueryWrapper<>();
+        issueWrapper.eq("audit_id", auditId)
+                    .eq("tenant_id", tenantId)
+                    .orderByAsc("severity")
+                    .orderByAsc("category");
         List<AuditIssue> issues = auditIssueMapper.selectList(issueWrapper);
 
         User auditor = null;
@@ -79,6 +81,7 @@ public class ReportServiceImpl implements ReportService {
         String docContent = generateMarkdownReport(task, tender, issues, auditor);
 
         AuditReport report = new AuditReport();
+        report.setTenantId(tenantId);
         report.setAuditId(auditId);
         report.setDocContent(docContent);
         report.setGenerateTime(LocalDateTime.now());
@@ -103,12 +106,14 @@ public class ReportServiceImpl implements ReportService {
             return null;
         }
 
+        // 报告表自身也带 tenant_id 过滤（双保险，防止父校验被绕过）
         LambdaQueryWrapper<AuditReport> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(AuditReport::getAuditId, auditId);
+        wrapper.eq(AuditReport::getAuditId, auditId)
+               .eq(AuditReport::getTenantId, tenantId);
         AuditReport report = auditReportMapper.selectOne(wrapper);
 
         if (report == null) {
-            return null;
+            throw TenantScope.resourceNotFound();
         }
 
         return report.getDocContent();
@@ -116,7 +121,7 @@ public class ReportServiceImpl implements ReportService {
 
     private Long resolveAuditId(String auditIdOrTaskId, Long tenantId) {
         if (auditIdOrTaskId == null || auditIdOrTaskId.isBlank()) {
-            throw new RuntimeException("审核任务标识不能为空");
+            throw TenantScope.resourceNotFound();
         }
         try {
             Long numericId = Long.parseLong(auditIdOrTaskId);
@@ -137,6 +142,9 @@ public class ReportServiceImpl implements ReportService {
             if (byAuditId != null && byAuditId.getId() != null) {
                 return byAuditId.getId();
             }
+            if (TenantScope.requiredTenantId() != null) {
+                throw TenantScope.resourceNotFound();
+            }
             throw new RuntimeException("审核任务不存在");
         } catch (NumberFormatException ignore) {
             LambdaQueryWrapper<AuditTask> wrapper = new LambdaQueryWrapper<>();
@@ -145,6 +153,9 @@ public class ReportServiceImpl implements ReportService {
                     .last("LIMIT 1");
             AuditTask task = auditTaskMapper.selectOne(wrapper);
             if (task == null || task.getId() == null) {
+                if (TenantScope.requiredTenantId() != null) {
+                    throw TenantScope.resourceNotFound();
+                }
                 throw new RuntimeException("审核任务不存在");
             }
             return task.getId();

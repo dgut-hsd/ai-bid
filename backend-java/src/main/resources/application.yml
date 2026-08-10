@@ -47,8 +47,7 @@ spring:
     baseline-on-migrate: true
   sql:
     init:
-      mode: always
-      schema-locations: classpath:audit_task_event.sql,classpath:trace_schema.sql
+      mode: never
   servlet:
     encoding:
       charset: UTF-8

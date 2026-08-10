@@ -6,6 +6,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
+import java.util.LinkedHashMap;
 
 @Component
 @ConditionalOnProperty(prefix = "audit.queue", name = "mode", havingValue = "redis-stream")
@@ -19,11 +20,10 @@ public class RedisStreamAuditTaskDispatcher implements AuditTaskDispatcher {
     }
 
     @Override
-    public void dispatch(String taskId) {
-        MapRecord<String, String, String> record = MapRecord.create(queueProperties.getStreamKey(), Map.of(
-                "taskId", taskId,
-                "retry", "0"
-        ));
+    public void dispatch(AuditTaskEnvelope envelope) {
+        Map<String, String> fields = new LinkedHashMap<>(envelope.toRedisFields());
+        fields.put("retry", "0");
+        MapRecord<String, String, String> record = MapRecord.create(queueProperties.getStreamKey(), fields);
         redisTemplate.opsForStream().add(record);
     }
 }

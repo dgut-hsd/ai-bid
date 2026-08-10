@@ -6,6 +6,8 @@ import com.ithsd.smart_tender.mapper.TenderMapper;
 import com.ithsd.smart_tender.model.entity.Tender;
 import com.ithsd.smart_tender.model.dto.rust.RustProcessResponse;
 import com.ithsd.smart_tender.service.StoragePathService;
+import com.ithsd.smart_tender.service.impl.TenantScope;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -60,14 +62,15 @@ public class RustDocumentService {
      * @throws BizException 上传失败或文件不存在
      */
     @Transactional
+    // tenantId 显式传参而非从 TenantContext 取：本方法会被 @Async 引擎线程调用，
+    // 调用方（AuditEngineServiceImpl）持有 task.getTenantId()，比依赖 ThreadLocal 可靠。
     public String ensureUploaded(Long bidId, Long tenantId) {
         Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
                 .eq(Tender::getId, bidId)
                 .eq(Tender::getTenantId, tenantId));
         if (tender == null) {
-            throw new BizException(5704, "标书不存在: bidId=" + bidId);
+            throw TenantScope.resourceNotFound();
         }
-
         // 已有缓存 → 验证有效性
         if (StringUtils.hasText(tender.getRustDocumentId())) {
             if (verifyExists(tender.getRustDocumentId())) {
@@ -81,7 +84,7 @@ public class RustDocumentService {
         }
 
         // 首次上传或重新上传
-        return uploadToRust(bidId, tender);
+        return uploadToRust(bidId, tenantId, tender);
     }
 
     /**
@@ -92,6 +95,8 @@ public class RustDocumentService {
      * @param bidId    Java 侧 Tender 主键
      * @param tenantId 租户 ID（由调用方显式传入，同时用于租户隔离验证）
      */
+    // 任务恢复场景：查不到（或不属于该租户）返回 null 由调用方走重新上传分支，
+    // 不抛 resourceNotFound，否则恢复流程会直接失败。
     public String getCachedDocumentId(Long bidId, Long tenantId) {
         Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
                 .eq(Tender::getId, bidId)
@@ -111,7 +116,7 @@ public class RustDocumentService {
         }
     }
 
-    private String uploadToRust(Long bidId, Tender tender) {
+    private String uploadToRust(Long bidId, Long tenantId, Tender tender) {
         // 1. 解析文件物理路径
         Path filePath = storagePathService.resolveStoredPath(tender.getFilePath());
         if (filePath == null) {
@@ -138,7 +143,10 @@ public class RustDocumentService {
         // 3. 回写缓存
         tender.setRustDocumentId(result.getDocumentId());
         tender.setPageCount(result.getTotalPages());  // 顺便更新页数
-        tenderMapper.updateById(tender);
+        tender.setTenantId(tenantId);
+        tenderMapper.update(tender, new QueryWrapper<Tender>()
+                .eq("id", bidId)
+                .eq("tenant_id", tenantId));
 
         log.info("Rust upload complete: bidId={}, rustDocId={}, chunks={}, pages={}",
                 bidId, result.getDocumentId(), result.getTotalChunks(), result.getTotalPages());

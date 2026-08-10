@@ -17,6 +17,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -65,35 +66,39 @@ public class RedisStreamAuditTaskWorker {
     }
 
     private void processRecord(MapRecord<String, Object, Object> record) {
-        String taskId = value(record, "taskId");
-        if (!StringUtils.hasText(taskId)) {
+        int retry = parseRetry(value(record, "retry"));
+        AuditTaskEnvelope envelope;
+        try {
+            envelope = AuditTaskEnvelope.fromRedisFields(record.getValue());
+        } catch (IllegalArgumentException ex) {
+            log.warn("discarding invalid audit task envelope from redis stream, messageId={}"
+                    , record.getId().getValue(), ex);
             ack(record.getId().getValue());
             return;
         }
-        int retry = parseRetry(value(record, "retry"));
         try {
-            auditEngineService.start(taskId);
+            auditEngineService.start(envelope);
             ack(record.getId().getValue());
         } catch (RuntimeException ex) {
-            handleFailure(record.getId().getValue(), taskId, retry, ex);
+            handleFailure(record.getId().getValue(), envelope, retry, ex);
         }
     }
 
-    private void handleFailure(String messageId, String taskId, int retry, RuntimeException ex) {
+    private void handleFailure(String messageId, AuditTaskEnvelope envelope, int retry, RuntimeException ex) {
         int nextRetry = retry + 1;
         if (nextRetry > Math.max(0, queueProperties.getMaxRetry())) {
-            redisTemplate.opsForStream().add(MapRecord.<String, String, String>create(queueProperties.getDlqStreamKey(), Map.of(
-                    "taskId", taskId,
-                    "retry", String.valueOf(retry),
-                    "reason", ex.getMessage() == null ? "unknown" : ex.getMessage()
-            )));
+            Map<String, String> fields = new LinkedHashMap<>(envelope.toRedisFields());
+            fields.put("retry", String.valueOf(retry));
+            fields.put("reason", ex.getMessage() == null ? "unknown" : ex.getMessage());
+            redisTemplate.opsForStream().add(
+                    MapRecord.<String, String, String>create(queueProperties.getDlqStreamKey(), fields));
             ack(messageId);
             return;
         }
-        redisTemplate.opsForStream().add(MapRecord.<String, String, String>create(queueProperties.getStreamKey(), Map.of(
-                "taskId", taskId,
-                "retry", String.valueOf(nextRetry)
-        )));
+        Map<String, String> fields = new LinkedHashMap<>(envelope.toRedisFields());
+        fields.put("retry", String.valueOf(nextRetry));
+        redisTemplate.opsForStream().add(
+                MapRecord.<String, String, String>create(queueProperties.getStreamKey(), fields));
         ack(messageId);
     }
 
@@ -135,7 +140,12 @@ public class RedisStreamAuditTaskWorker {
             }
         }
         redisTemplate.opsForStream().add(MapRecord.<String, String, String>create(queueProperties.getStreamKey(), Map.of(
-                "taskId", "_init_",
+                "schema_version", "1",
+                "tenant_id", "0",
+                "task_id", "_init_",
+                "actor_user_id", "0",
+                "session_version", "0",
+                "request_id", "_init_",
                 "retry", "0"
         )));
         try {

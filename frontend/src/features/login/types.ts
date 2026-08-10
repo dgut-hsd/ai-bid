@@ -1,29 +1,14 @@
 import type { FormInstance } from 'antd';
+import type { AuthSession, ApiResponse } from '@/features/tenant/types';
 
 export interface LoginParams {
-   phone: string;
+   /** The backend accepts this contract field and maps it to its legacy phone field. */
+   username: string;
    password: string;
 }
 
-export interface UserInfo {
-   id: number;
-   username: string;
-   realName: string;
-   tenantId: number | null;
-   tenantName: string | null;
-   isSuperAdmin: boolean;
-   role: string;
-}
-
-export interface LoginResponse {
-   token: string;
-   /** 后端返回 user_info（snake_case），见 docs/前端多租户交接文档.md:74 */
-   user_info: {
-      user_id: number | string;
-      username: string;
-      realName: string;
-   };
-}
+export type LoginResponse = AuthSession;
+export type AuthResponse = ApiResponse<AuthSession>;
 
 export interface RegisterParams {
    username: string;
