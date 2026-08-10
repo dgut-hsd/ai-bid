@@ -21,6 +21,8 @@ import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 
+import com.ithsd.smart_tender.common.util.DocxToPdfConverter;
+
 @Service
 public class DocumentPreviewService {
 
@@ -63,37 +65,47 @@ public class DocumentPreviewService {
     }
 
     public byte[] convertToPdfBytes(Path sourcePath) throws IOException {
+        // 1) 优先尝试 JODConverter REST 服务（LibreOffice，质量最好）
+        try {
+            return convertViaJodConverter(sourcePath);
+        } catch (Exception e) {
+            // JODConverter 不可用，降级到纯 Java 转换
+        }
+
+        // 2) 降级：.docx 走纯 Java（Apache POI + PDFBox），.doc 暂不支持
+        String name = sourcePath.getFileName().toString().toLowerCase();
+        if (name.endsWith(".docx")) {
+            Path tmpPdf = Files.createTempFile("preview-", ".pdf");
+            try {
+                DocxToPdfConverter.convert(sourcePath, tmpPdf);
+                byte[] pdfBytes = Files.readAllBytes(tmpPdf);
+                return pdfBytes;
+            } finally {
+                try { Files.deleteIfExists(tmpPdf); } catch (Exception ignored) {}
+            }
+        }
+
+        throw new IOException("文档转换失败：转换服务不可用，且文件格式不支持纯 Java 转换（仅支持 .docx）");
+    }
+
+    private byte[] convertViaJodConverter(Path sourcePath) throws IOException {
         byte[] fileBytes = Files.readAllBytes(sourcePath);
-
         RestTemplate restTemplate = new RestTemplate();
-
         HttpHeaders headers = new HttpHeaders();
-        // Do NOT explicitly set Content-Type to MediaType.MULTIPART_FORM_DATA!
-        // Spring's RestTemplate uses FormHttpMessageConverter which will automatically
-        // set the correct boundary if we don't override the content type here.
 
         MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
-        
         ByteArrayResource resource = new ByteArrayResource(fileBytes) {
             @Override
             public String getFilename() {
                 return sourcePath.getFileName().toString();
             }
         };
-        
-        body.add("data", resource); // JODConverter REST expects multipart field name "data"
+        body.add("data", resource);
 
         HttpEntity<MultiValueMap<String, Object>> requestEntity = new HttpEntity<>(body, headers);
-
         String url = converterBaseUrl + "/lool/convert-to/pdf";
 
-        ResponseEntity<byte[]> response;
-        try {
-            response = restTemplate.postForEntity(url, requestEntity, byte[].class);
-        } catch (org.springframework.web.client.RestClientException e) {
-            throw new IOException("文档转换失败，API 调用异常: " + e.getMessage(), e);
-        }
-
+        ResponseEntity<byte[]> response = restTemplate.postForEntity(url, requestEntity, byte[].class);
         if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
             throw new IOException("文档转换失败，状态码: " + response.getStatusCode());
         }

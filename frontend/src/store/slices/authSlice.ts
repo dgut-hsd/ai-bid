@@ -122,7 +122,10 @@ const authSlice = createSlice({
          localStorage.setItem(STORAGE_KEYS.token, token);
          localStorage.setItem(STORAGE_KEYS.userInfo, JSON.stringify(userInfo));
          localStorage.setItem(STORAGE_KEYS.tenantId, tenantId);
-         localStorage.setItem(STORAGE_KEYS.refreshToken, refreshToken);
+         // 后端 switch-tenant 响应不含 refresh_token，仅在有值时覆盖，避免写入 "undefined"
+         if (refreshToken) {
+            localStorage.setItem(STORAGE_KEYS.refreshToken, refreshToken);
+         }
       },
       /** 设置租户列表（UI 拉取后存入 store） */
       setTenantList: (

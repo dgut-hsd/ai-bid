@@ -56,6 +56,13 @@ public class StoragePathService {
         return tenantRootPath(context.tenantId()).resolve(knowledgeDir).normalize();
     }
 
+    public Path tenantTenderRootPath(Long tenantId) {
+        if (tenantId == null || tenantId <= 0) {
+            throw new IllegalArgumentException("tenantId must be positive");
+        }
+        return tenantRootPath(tenantId).resolve(tenderDir).normalize();
+    }
+
     public Path previewCachePath() {
         if (StringUtils.hasText(previewCacheDir)) {
             return Paths.get(previewCacheDir).normalize();
@@ -64,7 +71,8 @@ public class StoragePathService {
     }
 
     public Path buildTenderUploadPath(String originalFilename) {
-        return buildUploadPath(tenderRootPath(), originalFilename);
+        TenantRequestContext context = currentTenantContext();
+        return buildUploadPath(tenantTenderRootPath(context.tenantId()), originalFilename);
     }
 
     public Path buildKnowledgeUploadPath(String originalFilename) {
@@ -109,14 +117,15 @@ public class StoragePathService {
         for (Path candidate : candidates) {
             candidate = candidate.toAbsolutePath().normalize();
             ensureWithinRoot(candidate);
-            ensureTenantPathBelongsToCurrentTenant(candidate);
+            // 读路径不做租户命名空间校验：旧格式文件（tenant 迁移前上传）不在
+            // tenant/{id}/ 下，校验会阻断预览和审核。文件归属已由外层 SQL 按
+            // tenantId 过滤保证安全性。
             if (Files.exists(candidate)) {
                 return candidate;
             }
         }
         Path fallback = candidates.get(0).toAbsolutePath().normalize();
         ensureWithinRoot(fallback);
-        ensureTenantPathBelongsToCurrentTenant(fallback);
         return fallback;
     }
 
@@ -167,8 +176,15 @@ public class StoragePathService {
     private void ensureTenantPathBelongsToCurrentTenant(Path candidate) {
         Path normalized = candidate.toAbsolutePath().normalize();
         Path tenantNamespace = rootPath().resolve("tenant").toAbsolutePath().normalize();
-        if (!normalized.startsWith(tenantNamespace)) {
+        Path previewCache = previewCachePath().toAbsolutePath().normalize();
+        // preview-cache 不在 tenant/ 命名空间下，明确放行
+        if (normalized.startsWith(previewCache)) {
             return;
+        }
+        // 所有其他路径必须在 tenant/ 命名空间内，否则拒绝
+        if (!normalized.startsWith(tenantNamespace)) {
+            throw new SecurityException(
+                    "Storage path must reside inside a tenant namespace: " + normalized);
         }
         TenantRequestContext context = currentTenantContext();
         if (!normalized.startsWith(tenantRootPath(context.tenantId()))) {

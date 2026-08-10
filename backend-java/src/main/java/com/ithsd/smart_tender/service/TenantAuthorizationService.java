@@ -18,6 +18,7 @@ import java.util.UUID;
 public class TenantAuthorizationService {
 
     private static final Map<String, List<String>> ROLE_PERMISSIONS = Map.of(
+            // ── spec 五角色 ──
             "OWNER", List.of(
                     "tenant.read", "tenant.settings.write", "tenant.members.invite",
                     "tenant.members.remove", "tenant.members.role.write", "tenant.owner.transfer",
@@ -28,8 +29,16 @@ public class TenantAuthorizationService {
                     "tenant.members.remove", "tenant.members.role.write", "tender.write",
                     "audit.start", "audit.report.read", "knowledge.write"
             ),
+            "MANAGER", List.of(
+                    "tenant.read", "tender.write", "audit.start", "audit.report.read",
+                    "knowledge.write"
+            ),
+            "EDITOR", List.of(
+                    "tenant.read", "tender.write", "knowledge.write"
+            ),
+            "MEMBER", List.of("tenant.read", "audit.report.read"),
+            // ── 旧角色（向后兼容） ──
             "AUDITOR", List.of("tenant.read", "tender.write", "audit.start", "audit.report.read", "knowledge.write"),
-            "MEMBER", List.of("tenant.read", "tender.write", "audit.start", "audit.report.read", "knowledge.write"),
             "VIEWER", List.of("tenant.read", "audit.report.read")
     );
 

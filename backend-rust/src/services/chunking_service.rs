@@ -960,29 +960,59 @@ fn extract_table_keys(text: &str) -> Vec<String> {
 /// 内存索引，然后遍历每个 chunk 的 `source_block_ids` 查表填充。
 ///
 /// 调用时机：`chunk_sections()` 之后、序列化到 JSON 或存入 `DocumentState` 之前。
+/// 归一化空白，用于中英文混排文本的子串包含判断。
+/// 去除所有 Unicode 空白字符（空格、制表、换行等），
+/// 避免因空白差异导致 `contains` 误判。
+fn normalize_ws(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// 填充每个 Chunk 的 `bbox_refs` 字段。
+///
+/// 从 `RawDocument` 构建 `block_id → (page_index, bbox, page_width, 文本)` 的
+/// 内存索引，然后遍历每个 chunk 的 `source_block_ids` 查表填充。
+///
+/// **粒度收窄（修复整页高亮）**：`split_long_chunk` 会把整章的
+/// `source_block_ids` 继承到每个切片，导致每个 chunk 都携带整章 block。
+/// 这里仅保留文本真正落在该 chunk 范围内的 block（其归一化文本是
+/// `chunk.text` 归一化后的子串），从而把高亮精度从"整章"收敛到"段落"。
+/// 该收窄经 `handlers.rs` 的 `is_valid` 判定自动传导至 `finding.block_ids`。
+///
+/// 调用时机：`chunk_sections()` 之后、序列化到 JSON 或存入 `DocumentState` 之前。
 pub fn populate_bbox_refs(chunks: &mut [Chunk], raw_doc: &RawDocument) {
-    let mut block_map: HashMap<String, (usize, crate::domain::raw_document::BBox, f64)> =
+    let mut block_map: HashMap<String, (usize, crate::domain::raw_document::BBox, f64, String)> =
         HashMap::new();
 
     for page in &raw_doc.pages {
         for block in &page.blocks {
             block_map.insert(
                 block.id.clone(),
-                (page.page_index, block.bbox.clone(), page.width),
+                (
+                    page.page_index,
+                    block.bbox.clone(),
+                    page.width,
+                    normalize_ws(&block.text),
+                ),
             );
         }
     }
 
     for chunk in chunks.iter_mut() {
-        let mut refs: Vec<BlockBBox> = Vec::with_capacity(chunk.source_block_ids.len());
+        let chunk_norm = normalize_ws(&chunk.text);
+        let mut refs: Vec<BlockBBox> = Vec::new();
         for block_id in &chunk.source_block_ids {
-            if let Some((page, bbox, page_width)) = block_map.get(block_id) {
-                refs.push(BlockBBox {
-                    block_id: block_id.clone(),
-                    page: *page,
-                    bbox: bbox.clone(),
-                    page_width: *page_width,
-                });
+            if let Some((page, bbox, page_width, block_norm)) = block_map.get(block_id) {
+                // 仅保留文本真正属于本 chunk 的 block：
+                // 跳过空文本 block（contains("") 恒真），其余要求归一化文本
+                // 是 chunk 归一化文本的子串，避免继承整章 block 导致整页高亮。
+                if !block_norm.is_empty() && chunk_norm.contains(block_norm) {
+                    refs.push(BlockBBox {
+                        block_id: block_id.clone(),
+                        page: *page,
+                        bbox: bbox.clone(),
+                        page_width: *page_width,
+                    });
+                }
             }
         }
         chunk.bbox_refs = refs;

@@ -2,6 +2,8 @@ package com.ithsd.smart_tender.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.ithsd.smart_tender.common.TenantContext;
+import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.config.RustApiProperties;
 import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
@@ -155,6 +157,10 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             sseHub.close(taskId);
             return;
         }
+
+        // 审核可能由 @Async 线程池、Redis List/Stream Worker 触发，这些线程都没有
+        // HTTP 请求的 ThreadLocal。缺失时以 audit_task 行为权威来源重建租户上下文。
+        boolean contextInstalled = ensureTenantContext(task);
 
         try {
             // Stage 1: 上传文件到 Rust（幂等）
@@ -326,7 +332,46 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             failTask(task, crop(ex.getMessage()));
         } finally {
             sseHub.close(taskId);
+            if (contextInstalled) {
+                TenantContext.clear();
+            }
         }
+    }
+
+    /**
+     * 确保当前线程持有租户上下文。
+     *
+     * <p>{@code InternalRequestSigner} 只认 {@link TenantContext} 里的身份，
+     * 而审核在异步线程上执行，请求线程的 ThreadLocal 不会自动传递。若上下文
+     * 缺失或与任务归属不一致，按 {@code audit_task} 行（租户归属的权威来源）
+     * 重建一个系统内部上下文。</p>
+     *
+     * @return {@code true} 表示上下文由本方法安装，调用方需在结束时清理
+     */
+    private boolean ensureTenantContext(AuditTask task) {
+        TenantRequestContext current = TenantContext.get();
+        if (current != null
+                && current.tenantId() != null
+                && current.tenantId().equals(task.getTenantId())
+                && current.userId() != null && current.userId() > 0) {
+            return false;
+        }
+        if (task.getTenantId() == null || task.getTenantId() <= 0
+                || task.getAuditUserId() == null || task.getAuditUserId() <= 0) {
+            log.error("审核任务缺少租户归属，无法重建上下文: taskId={}, tenantId={}, auditUserId={}",
+                    task.getTaskId(), task.getTenantId(), task.getAuditUserId());
+            return false;
+        }
+        TenantContext.set(new TenantRequestContext(
+                task.getAuditUserId(),
+                task.getTenantId(),
+                null,
+                1L,
+                "audit-" + task.getTaskId()));
+        log.info("异步线程租户上下文已重建: taskId={}, tenantId={}, userId={}, thread={}",
+                task.getTaskId(), task.getTenantId(), task.getAuditUserId(),
+                Thread.currentThread().getName());
+        return true;
     }
 
     /**

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
+import os
 import re
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections import defaultdict
@@ -73,6 +76,73 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# ─── Rust 内部接口 HMAC 签名（与 backend-java InternalRequestSigner 对齐）───
+# Rust server 对 /api/v1/* 要求 HMAC 签名；未配置 secret 时一律 503。
+# benchmark 直连 Rust 引擎，必须生成相同的信封头。secret 从环境变量读取。
+
+_INTERNAL_SECRET_ENVS = ("RUST_API_INTERNAL_SECRET", "AIBID_INTERNAL_API_SECRET")
+
+
+def _internal_secret() -> str:
+    for name in _INTERNAL_SECRET_ENVS:
+        value = os.environ.get(name)
+        if value:
+            return value.strip()
+    # fallback：从仓库根 .env 读取（Rust server 同样从该 .env 加载 secret）
+    env_path = ROOT.parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("RUST_API_INTERNAL_SECRET=") or line.startswith(
+                "AIBID_INTERNAL_API_SECRET="
+            ):
+                value = line.split("=", 1)[1].strip()
+                if value:
+                    return value
+    return ""
+
+
+def _path_and_query(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    path = parsed.path or "/"
+    return path if not parsed.query else f"{path}?{parsed.query}"
+
+
+def internal_auth_headers(method: str, url: str, body: bytes | None) -> dict[str, str]:
+    """生成 Rust 内部接口签名头；secret 未配置时返回空 dict（server 侧等同 503）。"""
+    secret = _internal_secret()
+    if not secret:
+        return {}
+    method = method.upper()
+    timestamp = str(int(time.time()))
+    tenant_id = "1"
+    user_id = "1"
+    request_id = uuid.uuid4().hex
+    body_sha256 = hashlib.sha256(body or b"").hexdigest()
+    canonical = "\n".join(
+        [
+            "v1",
+            method,
+            _path_and_query(url),
+            timestamp,
+            tenant_id,
+            user_id,
+            request_id,
+            body_sha256,
+        ]
+    )
+    signature = hmac.new(
+        secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return {
+        "X-Tenant-Id": tenant_id,
+        "X-User-Id": user_id,
+        "X-Request-Id": request_id,
+        "X-Internal-Timestamp": timestamp,
+        "X-Internal-Signature": f"v1={signature}",
+    }
+
+
 def request_json(
     method: str,
     url: str,
@@ -85,6 +155,7 @@ def request_json(
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
+    headers.update(internal_auth_headers(method, url, data))
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -115,13 +186,17 @@ def upload_pdf(
     ).encode("ascii")
     suffix = f"\r\n--{boundary}--\r\n".encode("ascii")
     body = mode_part + prefix + pdf_path.read_bytes() + suffix
+    upload_headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Accept": "application/json",
+    }
+    upload_headers.update(
+        internal_auth_headers("POST", f"{base_url}/api/v1/documents", body)
+    )
     request = urllib.request.Request(
         f"{base_url}/api/v1/documents",
         data=body,
-        headers={
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Accept": "application/json",
-        },
+        headers=upload_headers,
         method="POST",
     )
     try:
@@ -347,6 +422,7 @@ def main() -> int:
     predictions: list[dict] = []
     failures: list[dict] = []
     durations: dict[str, float] = {}
+    usages: dict[str, dict] = {}
     completed = 0
 
     for position, document_id in enumerate(document_ids, 1):
@@ -357,6 +433,8 @@ def main() -> int:
                 findings = cached.get("predictions", [])
                 predictions.extend(findings)
                 durations[document_id] = float(cached.get("duration_seconds", 0))
+                if cached.get("usage"):
+                    usages[document_id] = cached.get("usage")
                 completed += 1
                 print(f"[{position}/{len(document_ids)}] {document_id} 复用已完成结果")
                 continue
@@ -416,6 +494,9 @@ def main() -> int:
             predictions.extend(doc_predictions)
             durations[document_id] = duration
             completed += 1
+            usage = result.get("usage") or {}
+            if usage:
+                usages[document_id] = usage
             write_json(output_path, {
                 "status": "completed",
                 "document_id": document_id,
@@ -423,6 +504,7 @@ def main() -> int:
                 "upload": upload,
                 "selected_chunk_ids": chunk_ids,
                 "duration_seconds": round(duration, 2),
+                "usage": usage,
                 "predictions": doc_predictions,
             })
             print(
@@ -455,6 +537,10 @@ def main() -> int:
             f.write(json.dumps(prediction, ensure_ascii=False) + "\n")
 
     metrics_path = run_dir / "metrics.json"
+    # Windows 下子进程 stdout 默认用控制台 code page（如 GBK），
+    # 而 evaluate.py 输出 ensure_ascii=False 的中文 JSON；
+    # 强制子进程以 UTF-8 输出，避免 UnicodeDecodeError 导致 stdout=None。
+    evaluate_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     evaluate = subprocess.run(
         [
             sys.executable,
@@ -470,10 +556,12 @@ def main() -> int:
             "--output",
             str(metrics_path),
         ],
+        env=evaluate_env,
         check=True,
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
     )
     metrics = json.loads(evaluate.stdout)
     all_completed = completed == len(document_ids) and not failures
@@ -495,10 +583,18 @@ def main() -> int:
             "critical_severity_recall": metrics["critical"].get("severity_recall", 0),
             "severity_agreement_on_matches": metrics.get("severity_agreement_on_matches", 0),
         },
+        "token_usage": {
+            "documents_with_usage": len(usages),
+            "llm_calls": sum(u.get("llm_calls", 0) for u in usages.values()),
+            "tokens_input": sum(u.get("tokens_input", 0) for u in usages.values()),
+            "tokens_output": sum(u.get("tokens_output", 0) for u in usages.values()),
+            "cost_cny": round(sum(u.get("cost_cny", 0) for u in usages.values()), 2),
+        },
         "release_gate_passed": gate_passed,
         "failures": failures,
     }
     write_json(run_dir / "summary.json", summary)
+    write_json(run_dir / "token_usage.json", summary["token_usage"])
     (run_dir / "summary.md").write_text(
         "\n".join([
             f"# 标书审核验收结果：{'通过' if gate_passed else '未通过'}",
@@ -506,6 +602,9 @@ def main() -> int:
             f"- 运行编号：`{run_id}`",
             f"- 数据集：`{args.split}`，范围：`{args.scope}`",
             f"- 完成文档：{completed}/{len(document_ids)}",
+            f"- LLM 调用：{summary['token_usage']['llm_calls']} 次 | tokens "
+            f"{summary['token_usage']['tokens_input']:,} in / {summary['token_usage']['tokens_output']:,} out "
+            f"| 成本 ¥{summary['token_usage']['cost_cny']:.2f}",
             f"- Precision：{metrics['overall']['precision']:.2%}",
             f"- Recall：{metrics['overall']['recall']:.2%}",
             f"- F1：{metrics['overall']['f1']:.2%}（门槛 80%）",

@@ -108,6 +108,9 @@ pub enum ReviewEvent {
         agent: String,
         confidence: f64,
         clause_ids: Vec<String>,
+        /// 关联的原始 block_id 列表（从 chunk.source_block_ids 框架自动填充）。
+        /// 前端用于 bbox-based PDF 精确高亮；流式阶段若框架尚未填充则为空，前端退化为文本匹配。
+        block_ids: Vec<String>,
         source_quote: String,
         legal_basis: Vec<String>,
         reason: String,

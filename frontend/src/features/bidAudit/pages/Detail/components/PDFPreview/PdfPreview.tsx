@@ -339,18 +339,56 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
          const exactCompact = compactForMatch(query);
          let matchStatus: HighlightStatus = 'miss';
          let selectedKeyword = '';
-         let selectedCompact = '';
-         let selectedIndexes: number[] = [];
+         // 多候选匹配：每条匹配记录含 compact 文本起始位置和长度
+         // （不同候选 keyword 长度不同，不能再用全局 selectedCompact）
+         const matchInfos: Array<{ start: number; length: number }> = [];
          if (exactCompact.length >= 2) {
             const indexes = findAllCompactPositions(compactText, exactCompact, maxMatches);
             if (indexes.length) {
                matchStatus = 'exact_hit';
                selectedKeyword = query;
-               selectedCompact = exactCompact;
-               selectedIndexes = indexes;
+               for (const idx of indexes) {
+                  matchInfos.push({ start: idx, length: exactCompact.length });
+               }
             }
          }
-         if (!selectedIndexes.length) {
+         // ★ 子串回退：把 source_quote 按标点拆成多段，每段独立匹配，
+         // 合并所有不重叠的命中 → 长 source_quote 不会只亮前一两句。
+         if (!matchInfos.length) {
+            const pageCandidates = buildPageCandidates(query)
+               .map((item) => ({ raw: item, compact: compactForMatch(item) }))
+               .filter((item) => item.compact.length >= 4);
+            const seenRanges = new Set<number>();
+            for (const candidate of pageCandidates) {
+               if (matchInfos.length >= maxMatches) break;
+               const indexes = findAllCompactPositions(
+                  compactText,
+                  candidate.compact,
+                  maxMatches - matchInfos.length
+               );
+               for (const idx of indexes) {
+                  // 跳过与已有匹配重叠的命中
+                  let overlap = false;
+                  for (let j = idx; j < idx + candidate.compact.length; j++) {
+                     if (seenRanges.has(j)) {
+                        overlap = true;
+                        break;
+                     }
+                  }
+                  if (overlap) continue;
+                  matchInfos.push({ start: idx, length: candidate.compact.length });
+                  for (let j = idx; j < idx + candidate.compact.length; j++) {
+                     seenRanges.add(j);
+                  }
+               }
+               if (matchInfos.length > 0 && !selectedKeyword) {
+                  matchStatus = 'token_fallback_hit';
+                  selectedKeyword = query;
+               }
+            }
+         }
+         // 子串回退也没结果时降级到 token 粒度的兜底
+         if (!matchInfos.length) {
             const tokenCandidates = buildHighlightCandidates('', tokens)
                .map((item) => ({ raw: item, compact: compactForMatch(item) }))
                .filter((item) => item.compact.length >= 2)
@@ -360,12 +398,13 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
                if (!indexes.length) continue;
                matchStatus = 'token_fallback_hit';
                selectedKeyword = candidate.raw;
-               selectedCompact = candidate.compact;
-               selectedIndexes = indexes;
+               for (const idx of indexes) {
+                  matchInfos.push({ start: idx, length: candidate.compact.length });
+               }
                break;
             }
          }
-         if (!selectedIndexes.length || !selectedCompact) {
+         if (!matchInfos.length || !selectedKeyword) {
             if (!silent) {
                setHighlightStatus('miss');
                console.info('[pdf-highlight] status=miss page=%s query=%s', page, query);
@@ -373,9 +412,9 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
             return false;
          }
          const boxes: HighlightBox[] = [];
-         selectedIndexes.forEach((start, occIdx) => {
+         matchInfos.forEach(({ start, length }, occIdx) => {
             const perOcc: CharBox[] = [];
-            for (let i = start; i < start + selectedCompact.length && i < charBoxes.length; i++) {
+            for (let i = start; i < start + length && i < charBoxes.length; i++) {
                perOcc.push(charBoxes[i]);
             }
             const merged = mergeCharBoxes(perOcc);

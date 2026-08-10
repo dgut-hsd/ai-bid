@@ -3,6 +3,7 @@ pub mod chat_agent;
 pub mod coordinator;
 pub mod fact_check;
 pub mod procedure;
+pub mod procurement_context;
 pub mod prompts;
 pub mod react_loop;
 pub mod registry;

@@ -237,6 +237,7 @@ export const mapFindingAddedEvent = (event: FindingAddedEvent): AuditIssue => {
       context: event.source_quote || '',
     },
     clauseIds: Array.isArray(event.clause_ids) ? event.clause_ids : [],
-    blockIds: [],
+    // 流式阶段：若 Rust 已下发 block_ids 则优先走 BBox 精确高亮；否则为空 → 退化为文本匹配
+    blockIds: Array.isArray(event.block_ids) ? event.block_ids : [],
   };
 };

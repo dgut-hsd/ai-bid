@@ -168,6 +168,9 @@ pub struct Coordinator {
     metrics: Option<Arc<Mutex<crate::metrics::MetricsCollector>>>,
     /// ★ 跨 Agent 共享搜索缓存（避免不同 Agent 重复搜索相同的法规）
     pub shared_search_cache: Arc<Mutex<HashMap<(String, String), serde_json::Value>>>,
+    /// ★ Chunk 数据（含 bbox_refs），用于流式 FindingAdded 中填充 block_ids。
+    /// None 表示未设置（CLI 路径等不传 bbox 数据的场景）。
+    chunk_map: Option<Arc<HashMap<String, crate::domain::chunk::Chunk>>>,
 }
 
 impl Coordinator {
@@ -204,6 +207,7 @@ impl Coordinator {
             review_events: None,
             metrics: None,
             shared_search_cache,
+            chunk_map: None,
         };
 
         // 启动时加载已有动态 Agent
@@ -228,6 +232,14 @@ impl Coordinator {
     /// 设置指标采集器（用于记录全链路性能数据）。
     pub fn with_metrics(mut self, collector: Arc<Mutex<crate::metrics::MetricsCollector>>) -> Self {
         self.metrics = Some(collector);
+        self
+    }
+
+    /// 设置 Chunk 数据（含 bbox_refs），用于流式 FindingAdded 事件中填充 block_ids。
+    ///
+    /// 仅在 HTTP server 模式下启用（CLI 模式不设置此通道，此时 block_ids 保持上游值）。
+    pub fn with_chunk_map(mut self, map: Arc<HashMap<String, crate::domain::chunk::Chunk>>) -> Self {
+        self.chunk_map = Some(map);
         self
     }
 
@@ -829,14 +841,14 @@ impl Coordinator {
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
                 Ok((query, category, Ok(result))) => {
-                    eprintln!("  [BATCH_SEARCH] ✅ {} [{}]", query, category);
+                    eprintln!("  [BATCH_SEARCH] ? {} [{}]", query, category);
                     query_results.insert((query, category), result);
                 }
                 Ok((query, _category, Err(e))) => {
-                    eprintln!("  [BATCH_SEARCH] ❌ {} — {}", query, e);
+                    eprintln!("  [BATCH_SEARCH] ? {} — {}", query, e);
                 }
                 Err(e) => {
-                    eprintln!("  [BATCH_SEARCH] ❌ join error: {}", e);
+                    eprintln!("  [BATCH_SEARCH] ? join error: {}", e);
                 }
             }
         }
@@ -946,7 +958,8 @@ impl Coordinator {
         }
 
         // 确保每条条款至少分配给一个已启用的 Agent（优先 FactCheck）
-        let has_factcheck = self.config.enabled_agents.contains(&AgentId::FactCheck);
+        let enabled_agent_ids = &self.config.enabled_agents;
+        let has_factcheck = enabled_agent_ids.contains(&AgentId::FactCheck);
         for clause in clauses {
             let mut assigned = false;
             for clauses_list in routing.values() {
@@ -1057,6 +1070,7 @@ impl Coordinator {
             let tools_factory = self.tools_factory.clone();
             let max_parallel = self.config.max_parallel_clauses;
             let shared_search_cache = self.shared_search_cache.clone();
+            let chunk_map_for_emit = self.chunk_map.clone();
 
             let handle = tokio::spawn(async move {
                 let agent_name = agent_id.to_string();
@@ -1129,6 +1143,39 @@ impl Coordinator {
                 // 重复/被合并项由 merge_findings_v3 后续发 finding_removed 自动清理
                 if let Some(ref events) = review_events {
                     for f in findings.iter().filter(|f| !f.no_risk) {
+                        // ★ 流式 block_ids 填充：从 chunk_map 查 bbox_refs，
+                        // 过滤占位 bbox（lopdf 失败降级），取前 5 个。
+                        // chunk_map 未设置或查不到 chunk → 保持上游 block_ids（通常为空）。
+                        let resolved_block_ids = chunk_map_for_emit
+                            .as_ref()
+                            .map(|cm| {
+                                // 聚合所有 clause 对应 chunk 的 valid block_ids。
+                                // 修复根因1：原逻辑只取 clause_ids.first() 一个 chunk。
+                                let mut valid: Vec<String> = Vec::new();
+                                for cid in &f.clause_ids {
+                                    if let Some(chunk) = cm.get(cid) {
+                                        for bid in &chunk.source_block_ids {
+                                            let is_valid = chunk.bbox_refs.iter().any(|r| {
+                                                &r.block_id == bid
+                                                    && !(r.bbox.x0 == 0.0
+                                                        && r.bbox.x1 == 400.0
+                                                        && (r.bbox.bottom - r.bbox.top) <= 20.1)
+                                            });
+                                            if is_valid && !valid.contains(bid) {
+                                                valid.push(bid.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                // 全部占位 → 退化上游 block_ids；否则用聚合结果。
+                                // 修复根因2：移除 .take(5) 截断，保留所有有效 block。
+                                if valid.is_empty() {
+                                    f.block_ids.clone()
+                                } else {
+                                    valid
+                                }
+                            })
+                            .unwrap_or_else(|| f.block_ids.clone());
                         events.emit(&ReviewEvent::FindingAdded {
                             risk_id: f.risk_id.clone(),
                             severity: severity_str(&f.severity).to_string(),
@@ -1138,6 +1185,7 @@ impl Coordinator {
                             agent: f.agent.clone(),
                             confidence: f.confidence as f64,
                             clause_ids: f.clause_ids.clone(),
+                            block_ids: resolved_block_ids,
                             source_quote: f.source_quote.chars().take(500).collect(),
                             legal_basis: f.legal_basis.clone(),
                             reason: f.reason.chars().take(500).collect(),
@@ -1470,8 +1518,8 @@ impl Coordinator {
     ///   ├─ Step A: LegalDomain 自动分类（纯规则，零 LLM）
     ///   │
     ///   ├─ Step B: 规则预筛（已知法规直通，跳过 LLM）
-    ///   │    ├─ 法条名称/条款号合法 → ✅ 直接通过（~70%）
-    ///   │    └─ 无法判断 → ➡ 进入 LLM 批量验证
+    ///   │    ├─ 法条名称/条款号合法 → ? 直接通过（~70%）
+    ///   │    └─ 无法判断 → ? 进入 LLM 批量验证
     ///   │
     ///   ├─ Step C: LLM 批量验证（按 legal_domain 分组）
     ///   │    每组一条 prompt → 一次 ReAct → 输出该组所有验证结论
@@ -1528,7 +1576,7 @@ impl Coordinator {
                 for original in findings.iter_mut() {
                     if original.risk_id == vf.risk_id {
                         original.reason.push_str(&format!(
-                            "\n[LegalVerify] ✅ 规则直通验证通过 (domain={})。",
+                            "\n[LegalVerify] ? 规则直通验证通过 (domain={})。",
                             domain
                         ));
                         total_verified += 1;
@@ -1601,7 +1649,7 @@ impl Coordinator {
                                     if original.risk_id == entry.risk_id {
                                         if entry.is_valid && entry.confidence >= 0.5 {
                                             original.reason.push_str(&format!(
-                                                "\n[LegalVerify] ✅ 批量验证通过 (domain={}, confidence={:.2})。",
+                                                "\n[LegalVerify] ? 批量验证通过 (domain={}, confidence={:.2})。",
                                                 domain, entry.confidence
                                             ));
                                             // 回写修正后的法条引用
@@ -1613,7 +1661,7 @@ impl Coordinator {
                                             original.severity = RiskSeverity::Info;
                                             original.clear_criticality();
                                             original.reason.push_str(&format!(
-                                                "\n[LegalVerify] ❌ 批量验证未通过 (domain={}, confidence={:.2}): {}。已降级。",
+                                                "\n[LegalVerify] ? 批量验证未通过 (domain={}, confidence={:.2}): {}。已降级。",
                                                 domain, entry.confidence, entry.reason
                                             ));
                                         }
@@ -1623,7 +1671,7 @@ impl Coordinator {
                                 }
                             }
                         } else {
-                            eprintln!("    [{}] ⚠️ 批量结果 JSON 解析失败", domain);
+                            eprintln!("    [{}] ?? 批量结果 JSON 解析失败", domain);
                         }
                         break; // 只解析第一个 BATCH_VERIFICATION 标记
                     }
@@ -1648,7 +1696,7 @@ impl Coordinator {
                                 original.clear_criticality();
                                 original
                                     .reason
-                                    .push_str("\n[LegalVerify] ❌ 置信度不足，已降级 (fallback)。");
+                                    .push_str("\n[LegalVerify] ? 置信度不足，已降级 (fallback)。");
                             }
                             total_verified += 1;
                             break;
@@ -1703,10 +1751,10 @@ impl Coordinator {
                                 original.clear_criticality();
                                 original
                                     .reason
-                                    .push_str("\n[LegalVerify] ❌ 法条引用验证未通过，已降级。");
+                                    .push_str("\n[LegalVerify] ? 法条引用验证未通过，已降级。");
                             } else {
                                 original.reason.push_str(&format!(
-                                    "\n[LegalVerify] ✅ 法条引用验证通过 (confidence={:.2})。",
+                                    "\n[LegalVerify] ? 法条引用验证通过 (confidence={:.2})。",
                                     vf.confidence
                                 ));
                                 if !vf.legal_basis.is_empty() {
@@ -1837,7 +1885,7 @@ impl Coordinator {
             f.reason.chars().take(500).collect::<String>()
         ));
         task.push_str("请对上述法条引用进行对抗性验证，使用 output_finding 输出验证结论。\n\n");
-        task.push_str("🛑 无论验证通过或修正，每条 legal_basis 必须包含可验证的 URL 链接（Markdown 格式: [法条名](URL)），禁止输出纯文本法条名。");
+        task.push_str("? 无论验证通过或修正，每条 legal_basis 必须包含可验证的 URL 链接（Markdown 格式: [法条名](URL)），禁止输出纯文本法条名。");
         task
     }
 
@@ -1881,7 +1929,7 @@ impl Coordinator {
         }
 
         task.push_str("---\n\n");
-        task.push_str("🛑 现在调用 **output_verification_batch** 输出所有验证结论。\n");
+        task.push_str("? 现在调用 **output_verification_batch** 输出所有验证结论。\n");
         task.push_str("每条 corrected_legal_basis 必须包含可验证的 URL 链接（Markdown 格式: [法条名](URL)）。");
         task
     }
@@ -1896,10 +1944,10 @@ impl Coordinator {
                     finding.clear_criticality();
                     finding
                         .reason
-                        .push_str("\n[LegalVerify] ❌ 法条引用置信度不足，已降级 (fallback)。");
+                        .push_str("\n[LegalVerify] ? 法条引用置信度不足，已降级 (fallback)。");
                 } else {
                     finding.reason.push_str(&format!(
-                        "\n[LegalVerify] ✅ 法条引用置信度充足 (fallback, confidence={:.2})。",
+                        "\n[LegalVerify] ? 法条引用置信度充足 (fallback, confidence={:.2})。",
                         finding.confidence
                     ));
                 }
@@ -2076,7 +2124,7 @@ impl Coordinator {
             ));
             for (cid, pairs) in &snapshot.contradicts {
                 for (other_cid, reason) in pairs {
-                    ctx.push_str(&format!("- {} ↔ {} : {}\n", cid, other_cid, reason));
+                    ctx.push_str(&format!("- {} ? {} : {}\n", cid, other_cid, reason));
                 }
             }
             ctx.push('\n');
@@ -2556,7 +2604,7 @@ impl Coordinator {
             .count();
 
         eprintln!(
-            "  [TRIAGE] 🔴High={} 🟡Medium={} 🟢Low={} ℹ️Info={}",
+            "  [TRIAGE] ?High={} ?Medium={} ?Low={} ??Info={}",
             high, medium, low, info
         );
 

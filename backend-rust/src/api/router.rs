@@ -299,6 +299,7 @@ fn hex_nibble(value: u8) -> Option<u8> {
             handlers::ReviewAccepted,
             handlers::ReviewResponse,
             handlers::ReviewResultResponse,
+            handlers::ReviewUsage,
             handlers::SearchResponse,
             handlers::SearchResultGroup,
             handlers::SearchHitDto,
@@ -416,6 +417,11 @@ pub fn build(state: AppState) -> Router {
         .route(
             "/knowledge/ingest",
             post(knowledge_handlers::ingest_knowledge),
+        )
+        // 知识库检索（检索组）
+        .route(
+            "/knowledge/search",
+            post(knowledge_handlers::search_knowledge),
         )
         // SSE 实时推送 + 异步审查结果
         .route(

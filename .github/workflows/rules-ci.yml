@@ -1,0 +1,32 @@
+name: Rules Engine CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  rules-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend-rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('backend-rust/Cargo.lock') }}
+
+      - name: Check compilation (lib + bins)
+        working-directory: backend-rust
+        run: cargo check --bins
+
+      - name: Run rules engine unit tests
+        working-directory: backend-rust
+        run: cargo test --lib rules

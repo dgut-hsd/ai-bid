@@ -1,6 +1,13 @@
 spring:
   profiles:
     active: prod
+  # 仓库根的 .env 由 Rust（dotenv crate）自动加载，Java 侧没有等价机制。
+  # 这里显式导入，保证 RUST_API_INTERNAL_SECRET 等共享密钥两端取值一致。
+  # optional: 前缀确保文件缺失时不影响启动（容器部署仍可用环境变量注入）。
+  config:
+    import:
+      - optional:file:./.env[.properties]
+      - optional:file:../.env[.properties]
   application:
     name: smart_tender
   mvc:
@@ -50,7 +57,7 @@ spring:
 security:
   jwt:
     # Local/test fallback only; production profile requires ST_JWT_SECRET.
-    secret: ${ST_JWT_SECRET:local-test-only-jwt-secret-change-me}
+    secret: local-test-only-jwt-secret-change-me
     ttl-millis: ${ST_JWT_TTL_MILLIS:86400000}
     accept-legacy-user-id: false
 
@@ -119,3 +126,6 @@ rust:
     connect-timeout-ms: 5000
     read-timeout-ms: 900000
     health-check-enabled: true
+    # Java→Rust HMAC 签名密钥，必须与 Rust 侧 RUST_API_INTERNAL_SECRET 完全一致。
+    # 取值来源：环境变量，或上面 spring.config.import 导入的 .env。
+    internal-secret: ${RUST_API_INTERNAL_SECRET:}

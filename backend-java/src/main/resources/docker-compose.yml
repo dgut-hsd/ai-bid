@@ -110,19 +110,17 @@ services:
     networks:
       - qdrant-network
 
-  # 文档转换服务（保留原配置，JODConverter + LibreOffice）
-  # 注：ghcr.io/jodconverter 镜像国内拉取困难，暂时注释；docx 转换走 Rust 侧
-  # doc-converter 已停用期间，docx/doc 上传可依赖 Rust docx_convert_service 直接转换
-  # doc-converter:
-  #   container_name: doc-converter
-  #   image: ghcr.io/jodconverter/jodconverter-examples:rest
-  #   ports:
-  #     - "8088:8080"
-  #   environment:
-  #     SPRING_SERVLET_MULTIPART_MAX_FILE_SIZE: 50MB
-  #     SPRING_SERVLET_MULTIPART_MAX_REQUEST_SIZE: 50MB
-  #   networks:
-  #     - qdrant-network
+  # 文档转换服务（JODConverter + LibreOffice）
+  doc-converter:
+    container_name: doc-converter
+    image: ghcr.io/jodconverter/jodconverter-examples:rest
+    ports:
+      - "8088:8080"
+    environment:
+      SPRING_SERVLET_MULTIPART_MAX_FILE_SIZE: 50MB
+      SPRING_SERVLET_MULTIPART_MAX_REQUEST_SIZE: 50MB
+    networks:
+      - qdrant-network
 
   # Qdrant 向量数据库（单进程，无需 etcd/MinIO）
   qdrant:

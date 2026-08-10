@@ -389,6 +389,8 @@ export interface FindingAddedEvent {
   agent: string;
   confidence: number;
   clause_ids: string[];
+  /** 关联的原始 block_id 列表（Rust 框架自动填充，用于 bbox 精确高亮；流式阶段可能为空 → 退化为文本匹配） */
+  block_ids?: string[];
   source_quote: string;
   legal_basis: string[];
   reason: string;
