@@ -473,17 +473,15 @@ const TraceEventRow: React.FC<{ ev: TraceEvent }> = ({ ev }) => {
       {expanded && hasDetail && p && (
         <div style={{ padding: '4px 8px 6px 28px', fontSize: 10 }}>
           {/* agent_thought: 完整推理 */}
-          {ev.event_type === 'agent_thought' && typeof p.content === 'string' ? (
+          {ev.event_type === 'agent_thought' && typeof p.content === 'string' && (
             <div style={{
               padding: '4px 8px', background: '#fffbe6', border: '1px solid #ffe58f',
               borderRadius: 3, maxHeight: 180, overflowY: 'auto', whiteSpace: 'pre-wrap',
               wordBreak: 'break-word', color: '#595959', lineHeight: '16px',
             }}>
-              {p.content}
+              {String(p.content)}
             </div>
-          ) : null}
-          {/* tool_call: 完整参数 */}
-          {null /* DIAG-486 */}
+          )}
           {/* tool_result: 内容预览 */}
           {ev.event_type === 'tool_result' && (
             <>
@@ -517,7 +515,7 @@ const TraceEventRow: React.FC<{ ev: TraceEvent }> = ({ ev }) => {
             </>
           )}
           {/* output_finding: reason */}
-          {ev.event_type === 'output_finding' && p.reason && (
+          {ev.event_type === 'output_finding' && Boolean(p.reason) && (
             <div style={{
               padding: '4px 8px', background: '#fffbe6', border: '1px solid #ffe58f',
               borderRadius: 3, maxHeight: 200, overflowY: 'auto', whiteSpace: 'pre-wrap',

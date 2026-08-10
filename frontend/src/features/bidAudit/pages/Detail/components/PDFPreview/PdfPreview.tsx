@@ -245,24 +245,16 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
       pageTextIndexCacheRef.current = {};
    }, [scale, fileUrl]);
 
+   // 纯 overlay 高亮：不再直接改 react-pdf 文本层 DOM，避免与 React 重渲染（SSE 实时进度）冲突产生 insertBefore
    const clearSpanHighlights = React.useCallback((page: number) => {
-      if (!containerRef.current || !page) return;
-      const layer = containerRef.current.querySelector(
-         `[data-page-num="${page}"] .react-pdf__Page__textContent`
-      ) as HTMLElement | null;
-      if (!layer) return;
-      const marked = layer.querySelectorAll('span[data-pdf-hit]');
-      marked.forEach((node) => {
-         const el = node as HTMLElement;
-         el.removeAttribute('data-pdf-hit');
-      });
+      if (!page) return;
       setHighlightBoxesByPage((prev) => {
          if (!prev[page]) return prev;
          const next = { ...prev };
          delete next[page];
          return next;
       });
-   }, [containerRef]);
+   }, []);
 
    const getPageTextIndex = React.useCallback(
       async (page: number): Promise<PageTextIndex | null> => {
@@ -437,7 +429,7 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
                matchStatus,
                page,
                selectedKeyword,
-               selectedIndexes.length
+               matchInfos.length
             );
          }
          return true;
@@ -544,7 +536,6 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
             spanIndexes.forEach((spanIndex) => {
                const span = spans[spanIndex];
                if (!span) return;
-               span.setAttribute('data-pdf-hit', isPrimary ? '1' : '2');
                const rect = span.getBoundingClientRect();
                if (rect.width <= 0 || rect.height <= 0) return;
                allBoxes.push({
@@ -576,20 +567,6 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
                selectedKeyword,
                selectedIndexes.length
             );
-         }
-         let firstPrimary: HTMLElement | null = null;
-         for (const span of spans) {
-            if (span.getAttribute('data-pdf-hit') === '1') {
-               firstPrimary = span;
-               break;
-            }
-         }
-         if (firstPrimary) {
-            firstPrimary.scrollIntoView({
-               behavior: 'smooth',
-               block: 'center',
-               inline: 'nearest',
-            });
          }
          return true;
       },
