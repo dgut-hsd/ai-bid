@@ -854,7 +854,7 @@ pub struct LegalVerifyResult {
 ///
 /// 用于 SessionGraph 的 reviewed_by 边、AgentBus 消息路由、
 /// AgentRegistry 查找等所有需要标识 Agent 的场景。
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 pub enum AgentId {
     /// 事实核查 — 提取结构化事实，与法规阈值对照
     FactCheck,
@@ -1151,6 +1151,54 @@ pub struct RoutingSummary {
 
 // ─── SessionGraph 相关类型 ───────────────────────────────────────
 
+/// 单次 Agent 条款审查的执行状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAttemptStatus {
+    Started,
+    Completed,
+    Failed,
+}
+
+/// 成功完成审查后的结果类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAttemptOutcome {
+    Findings,
+    NoRisk,
+}
+
+/// 审查尝试失败的稳定错误码。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAttemptErrorCode {
+    ClauseTimeout,
+    IncompleteOutput,
+    EmptyResult,
+    TaskPanic,
+    TaskCancelled,
+}
+
+/// Agent 对单条条款的一次审查尝试。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReviewAttempt {
+    pub attempt_id: String,
+    pub agent_id: AgentId,
+    pub chunk_id: String,
+    pub status: ReviewAttemptStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ReviewAttemptOutcome>,
+    #[serde(default)]
+    pub finding_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<ReviewAttemptErrorCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
 /// SessionGraph 中的条款节点。
 ///
 /// 在 Coordinator PRELOAD 阶段写入，供 Agent 查询"谁审过这条？"。
@@ -1285,6 +1333,9 @@ pub struct GraphSnapshot {
     pub contradicts: HashMap<String, Vec<(String, String)>>,
     /// same_law 物化边: chunk_id → Vec<other_chunk_id>
     pub same_law: HashMap<String, Vec<String>>,
+    /// 每次 Agent 条款审查的生命周期记录；旧快照缺失时为空。
+    #[serde(default)]
+    pub review_attempts: HashMap<String, ReviewAttempt>,
 }
 
 impl GraphSnapshot {
@@ -1303,6 +1354,7 @@ impl GraphSnapshot {
             cases: HashMap::new(),
             contradicts: HashMap::new(),
             same_law: HashMap::new(),
+            review_attempts: HashMap::new(),
         }
     }
 }
@@ -1782,6 +1834,29 @@ mod tests {
         assert!(snap.cases.is_empty());
         assert!(snap.contradicts.is_empty());
         assert!(snap.same_law.is_empty());
+        assert!(snap.review_attempts.is_empty());
+    }
+
+    #[test]
+    fn test_graph_snapshot_deserializes_without_review_attempts() {
+        let json = serde_json::json!({
+            "chunks": {},
+            "risks": {},
+            "has_risk": {},
+            "reviewed_by": {},
+            "linked_to": {},
+            "cites": {},
+            "cited_by": {},
+            "agents": {},
+            "laws": {},
+            "cases": {},
+            "contradicts": {},
+            "same_law": {}
+        });
+
+        let snapshot: GraphSnapshot =
+            serde_json::from_value(json).expect("历史快照应保持可反序列化");
+        assert!(snapshot.review_attempts.is_empty());
     }
 
     // ── RiskSeverity 排序 ─────────────────────────────────────

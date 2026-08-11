@@ -609,6 +609,7 @@ impl SessionGraph {
                 .ok()
                 .map(|g| g.clone())
                 .unwrap_or_default(),
+            review_attempts: HashMap::new(),
         }
     }
 
