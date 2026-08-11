@@ -31,6 +31,7 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub mod answer_user;
 pub mod calculate_timeline;
@@ -92,6 +93,27 @@ impl ToolRegistry {
         self.tools.insert(name, tool);
     }
 
+    /// 为所有工具增加统一的预算与单次调用超时控制。
+    pub fn into_controlled(
+        self,
+        control: Arc<crate::agents::execution_control::ReviewExecutionControl>,
+    ) -> Self {
+        let tools = self
+            .tools
+            .into_iter()
+            .map(|(name, tool)| {
+                let wrapped: Box<dyn AgentTool> = Box::new(ControlledTool {
+                    name: name.clone(),
+                    definition: tool.definition(),
+                    inner: tool,
+                    control: control.clone(),
+                });
+                (name, wrapped)
+            })
+            .collect();
+        Self { tools }
+    }
+
     /// 获取所有工具的 definitions（发送给 LLM）。
     pub fn definitions(&self) -> Vec<serde_json::Value> {
         self.tools.values().map(|t| t.definition()).collect()
@@ -121,6 +143,31 @@ impl ToolRegistry {
     /// 用于 Scout 等精简工具集的 Agent（如只保留 read_section + output_finding）。
     pub fn retain_only(&mut self, names: &[&str]) {
         self.tools.retain(|name, _| names.contains(&name.as_str()));
+    }
+}
+
+struct ControlledTool {
+    name: String,
+    definition: serde_json::Value,
+    inner: Box<dyn AgentTool>,
+    control: Arc<crate::agents::execution_control::ReviewExecutionControl>,
+}
+
+#[async_trait::async_trait]
+impl AgentTool for ControlledTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn definition(&self) -> serde_json::Value {
+        self.definition.clone()
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value> {
+        self.control.reserve_tool_call(&self.name)?;
+        tokio::time::timeout(self.control.limits().call_timeout, self.inner.execute(args))
+            .await
+            .map_err(|_| anyhow::anyhow!("工具 {} 调用超时", self.name))?
     }
 }
 

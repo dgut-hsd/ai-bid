@@ -65,6 +65,8 @@ use crate::services::sectionize_service::{self, Section};
 /// 服务全局共享状态。
 #[derive(Clone)]
 pub struct AppState {
+    /// 全进程共享的审核并发额度，所有文档和阶段共同竞争。
+    pub review_execution_limiter: Arc<crate::agents::execution_control::GlobalExecutionLimiter>,
     /// 文档缓存：document_id → 已处理文档
     pub documents: Arc<TokioRwLock<HashMap<String, Arc<DocumentState>>>>,
     /// 嵌入客户端（BGE-M3，启动时加载一次）
@@ -125,6 +127,9 @@ impl AppState {
         };
 
         Ok(Self {
+            review_execution_limiter: Arc::new(
+                crate::agents::execution_control::GlobalExecutionLimiter::from_env(),
+            ),
             documents: Arc::new(TokioRwLock::new(HashMap::new())),
             embed_client: Arc::new(StdMutex::new(embed_client)),
             dashscope_search,
@@ -215,6 +220,8 @@ pub struct ReviewResponse {
     pub document_id: String,
     pub findings: Vec<crate::agents::types::RiskFinding>,
     pub routing_summary: crate::agents::types::RoutingSummary,
+    #[serde(default)]
+    pub execution_summary: crate::agents::types::ExecutionSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_snapshot: Option<crate::agents::types::GraphSnapshot>,
 }
@@ -671,6 +678,7 @@ pub async fn get_document(
     request_body = ReviewRequest,
     responses(
         (status = 202, description = "Review accepted", body = ReviewAccepted),
+        (status = 400, description = "Invalid review parameters", body = ErrorResponse),
         (status = 404, description = "Document not found", body = ErrorResponse),
         (status = 409, description = "Review already in progress", body = ReviewAccepted)
     )
@@ -688,35 +696,23 @@ pub async fn review_document(
         .clone();
     drop(docs);
 
+    // Agent 选择属于公开请求契约，必须在提交后台任务前完整校验。
+    let enabled_agents = if let Some(agent_names) = req.enabled_agents.as_ref() {
+        let mut parsed_agents = Vec::with_capacity(agent_names.len());
+        for agent_name in agent_names {
+            let agent_id = AgentId::parse(agent_name)
+                .ok_or_else(|| bad_request(&format!("非法 Agent 名称: {}", agent_name)))?;
+            parsed_agents.push(agent_id);
+        }
+        Some(parsed_agents)
+    } else {
+        None
+    };
+
     println!(
         "[REQ] 启动异步审核: doc_id={}, filename={}",
         doc_id, doc.filename
     );
-
-    // 并发控制：检查是否已有进行中的审核（用 active_reviews 标记而非 bus 存在性）
-    {
-        let mut active = state.active_reviews.lock().await;
-        if active.contains(&doc_id) {
-            return Ok((
-                StatusCode::CONFLICT,
-                Json(ReviewAccepted {
-                    status: "conflict".to_string(),
-                    document_id: doc_id,
-                    message: "该文档已有进行中的审核任务".to_string(),
-                }),
-            ));
-        }
-        active.insert(doc_id.clone());
-    }
-
-    // 创建或获取 ReviewEventBus（SSE 客户端可能已提前连接）
-    let review_events = {
-        let mut buses = state.review_event_buses.lock().await;
-        buses
-            .entry(doc_id.clone())
-            .or_insert_with(|| Arc::new(ReviewEventBus::new(review_event_capacity())))
-            .clone()
-    };
 
     // 准备 clause 列表。
     //
@@ -754,6 +750,31 @@ pub async fn review_document(
         })
         .collect();
 
+    // 参数校验完成后再原子占用审核锁，非法请求不得污染任务状态。
+    {
+        let mut active = state.active_reviews.lock().await;
+        if active.contains(&doc_id) {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(ReviewAccepted {
+                    status: "conflict".to_string(),
+                    document_id: doc_id,
+                    message: "该文档已有进行中的审核任务".to_string(),
+                }),
+            ));
+        }
+        active.insert(doc_id.clone());
+    }
+
+    // 创建或获取 ReviewEventBus（SSE 客户端可能已提前连接）。
+    let review_events = {
+        let mut buses = state.review_event_buses.lock().await;
+        buses
+            .entry(doc_id.clone())
+            .or_insert_with(|| Arc::new(ReviewEventBus::new(review_event_capacity())))
+            .clone()
+    };
+
     println!(
         "[REQ] 审核条款数: {}, 启用 Agent: {:?}",
         review_clauses.len(),
@@ -761,7 +782,6 @@ pub async fn review_document(
     );
 
     // 提取后台任务所需数据（脱离 doc 引用）
-    let enabled_agents = req.enabled_agents.clone();
     let chunk_map = doc.chunk_map.clone();
     let review_chunk_map = doc.review_chunk_map.clone();
     let doc_index = doc.doc_index.clone();
@@ -815,7 +835,7 @@ async fn run_review_pipeline(
     state: AppState,
     doc_id: String,
     review_clauses: Vec<ReviewClause>,
-    enabled_agents: Option<Vec<String>>,
+    enabled_agents: Option<Vec<AgentId>>,
     chunk_map: Arc<HashMap<String, Chunk>>,
     review_chunk_map: Arc<HashMap<String, Chunk>>,
     doc_index: Arc<DocumentVectorIndex>,
@@ -841,11 +861,8 @@ async fn run_review_pipeline(
     let trace = Arc::new(TokioMutex::new(TraceLog::new()));
 
     let mut coord_config = CoordinatorConfig::default();
-    if let Some(ref agent_names) = enabled_agents {
-        coord_config.enabled_agents = agent_names
-            .iter()
-            .filter_map(|s| AgentId::parse(s))
-            .collect();
+    if let Some(agent_ids) = enabled_agents {
+        coord_config.enabled_agents = agent_ids;
     }
 
     let llm_factory = Arc::new(move || create_llm_client().expect("创建 LLM 客户端失败"));
@@ -891,6 +908,7 @@ async fn run_review_pipeline(
             graph,
             trace,
         )
+        .with_global_execution_limiter(state.review_execution_limiter.clone())
         .with_review_events(review_events.clone())
         .with_metrics(metrics.clone()),
     );
@@ -899,6 +917,7 @@ async fn run_review_pipeline(
     match coordinator.review(&review_clauses).await {
         Ok(mut output) => {
             let duration_secs = start_time.elapsed().as_secs_f64();
+            let result_status = output.execution_summary.status.as_str().to_string();
             println!(
                 "[OK] 审核完成: {} 条风险发现, 耗时 {:.1}s",
                 output.findings.len(),
@@ -993,11 +1012,12 @@ async fn run_review_pipeline(
                 let _ = std::fs::create_dir_all(&dir);
                 let result_path = format!("{}/{}_result.json", dir, doc_id);
                 let persisted = ReviewResultResponse {
-                    status: "completed".to_string(),
+                    status: result_status.clone(),
                     result: Some(ReviewResponse {
                         document_id: doc_id.clone(),
                         findings: output.findings.clone(),
                         routing_summary: output.routing_summary.clone(),
+                        execution_summary: output.execution_summary.clone(),
                         graph_snapshot: output.graph_snapshot.clone(),
                     }),
                     error: None,
@@ -1057,13 +1077,27 @@ async fn run_review_pipeline(
                 }
             }
 
-            // 发送 Done 事件
-            review_events.emit(&crate::agents::review_event::ReviewEvent::Done {
-                total_findings: output.findings.len(),
-                high_risk: high_risk_count,
-                session_id: doc_id.clone(),
-                duration_secs,
-            });
+            if output.execution_summary.status
+                == crate::agents::types::ReviewExecutionStatus::PartialFailed
+            {
+                review_events.emit(&crate::agents::review_event::ReviewEvent::PartialDone {
+                    total_findings: output.findings.len(),
+                    high_risk: high_risk_count,
+                    session_id: doc_id.clone(),
+                    duration_secs,
+                    failed_agents: output.execution_summary.failed_agents.clone(),
+                    failed_clauses: output.execution_summary.failed_clauses.clone(),
+                    failed_stages: output.execution_summary.failed_stages.clone(),
+                    budget: output.execution_summary.budget.clone(),
+                });
+            } else {
+                review_events.emit(&crate::agents::review_event::ReviewEvent::Done {
+                    total_findings: output.findings.len(),
+                    high_risk: high_risk_count,
+                    session_id: doc_id.clone(),
+                    duration_secs,
+                });
+            }
         }
         Err(e) => {
             let msg = format!("审核引擎执行失败: {}", e);
@@ -1084,7 +1118,7 @@ async fn run_review_pipeline(
     }
 
     // 延迟清理 ReviewEventBus 和 active_reviews
-    // （给 SSE 客户端时间接收 Done/Error 事件）
+    // （给 SSE 客户端时间接收 Done/PartialDone/Error 事件）
     let cleanup_doc_id = doc_id.clone();
     let cleanup_state = state.clone();
     tokio::spawn(async move {
@@ -1202,7 +1236,7 @@ pub async fn stream_review_events(
         ("doc_id" = String, Path, description = "Document UUID")
     ),
     responses(
-        (status = 200, description = "Review result (status: completed/pending/failed)", body = ReviewResultResponse),
+        (status = 200, description = "Review result (status: completed/partial_failed/pending/failed)", body = ReviewResultResponse),
         (status = 404, description = "No review record found", body = ErrorResponse)
     )
 )]
@@ -1215,11 +1249,12 @@ pub async fn get_review_result(
         let results = state.review_results.lock().await;
         if let Some(output) = results.get(&doc_id) {
             return Ok(Json(ReviewResultResponse {
-                status: "completed".to_string(),
+                status: output.execution_summary.status.as_str().to_string(),
                 result: Some(ReviewResponse {
                     document_id: doc_id,
                     findings: output.findings.clone(),
                     routing_summary: output.routing_summary.clone(),
+                    execution_summary: output.execution_summary.clone(),
                     graph_snapshot: output.graph_snapshot.clone(),
                 }),
                 error: None,
@@ -2081,6 +2116,194 @@ pub async fn move_metric_experiment_group(
         );
     }
     (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::chunk::ChunkType;
+
+    fn make_test_chunk() -> Chunk {
+        Chunk {
+            chunk_id: "ch_001".to_string(),
+            chunk_type: ChunkType::Leaf,
+            section_path: vec!["测试章节".to_string()],
+            text: "测试条款".to_string(),
+            page_start: 0,
+            page_end: 0,
+            source_block_ids: Vec::new(),
+            bbox_refs: Vec::new(),
+        }
+    }
+
+    fn make_test_document(doc_id: &str) -> Arc<DocumentState> {
+        let chunk = make_test_chunk();
+        let chunk_map = Arc::new(HashMap::from([(chunk.chunk_id.clone(), chunk.clone())]));
+        Arc::new(DocumentState {
+            id: doc_id.to_string(),
+            filename: "test.pdf".to_string(),
+            stem: "test".to_string(),
+            raw_doc: RawDocument {
+                document_id: doc_id.to_string(),
+                source_path: "test.pdf".to_string(),
+                pages: Vec::new(),
+            },
+            sections: Vec::new(),
+            chunks: vec![chunk.clone()],
+            review_chunks: vec![chunk],
+            chunk_map: chunk_map.clone(),
+            review_chunk_map: chunk_map,
+            chunk_order: Arc::new(vec!["ch_001".to_string()]),
+            doc_index: Arc::new(DocumentVectorIndex::new(Vec::new(), Vec::new())),
+            redaction_vault: Arc::new(RedactionVault::default()),
+            desensitization_summary: DesensitizationSummary::default(),
+        })
+    }
+
+    async fn make_test_state(doc_id: &str) -> AppState {
+        let state = AppState {
+            review_execution_limiter: Arc::new(
+                crate::agents::execution_control::GlobalExecutionLimiter::new(
+                    crate::agents::execution_control::ExecutionLimits::default(),
+                ),
+            ),
+            documents: Arc::new(TokioRwLock::new(HashMap::new())),
+            embed_client: Arc::new(StdMutex::new(None)),
+            dashscope_search: None,
+            search_backend: "dashscope".to_string(),
+            embed_engine: "remote".to_string(),
+            review_event_buses: Arc::new(TokioMutex::new(HashMap::new())),
+            review_results: Arc::new(TokioMutex::new(HashMap::new())),
+            review_errors: Arc::new(TokioMutex::new(HashMap::new())),
+            active_reviews: Arc::new(TokioMutex::new(HashSet::new())),
+        };
+        state
+            .documents
+            .write()
+            .await
+            .insert(doc_id.to_string(), make_test_document(doc_id));
+        state
+    }
+
+    #[tokio::test]
+    async fn invalid_review_request_does_not_reserve_document() {
+        let doc_id = "doc_invalid_request";
+        let state = make_test_state(doc_id).await;
+
+        let response = review_document(
+            State(state.clone()),
+            Path(doc_id.to_string()),
+            Json(ReviewRequest {
+                chunk_ids: Vec::new(),
+                max_clauses: Some(0),
+                enabled_agents: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.expect_err("非法请求应返回错误").0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            !state.active_reviews.lock().await.contains(doc_id),
+            "非法请求不得占用审核锁"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_agent_name_is_rejected_before_review_starts() {
+        let doc_id = "doc_invalid_agent";
+        let state = make_test_state(doc_id).await;
+
+        let response = review_document(
+            State(state.clone()),
+            Path(doc_id.to_string()),
+            Json(ReviewRequest {
+                chunk_ids: Vec::new(),
+                max_clauses: None,
+                enabled_agents: Some(vec!["FactCheck".to_string(), "UnknownAgent".to_string()]),
+            }),
+        )
+        .await;
+
+        let (status, Json(error)) = response.expect_err("非法 Agent 名称应返回错误");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.detail, "非法 Agent 名称: UnknownAgent");
+        assert!(
+            !state.active_reviews.lock().await.contains(doc_id),
+            "非法 Agent 名称不得占用审核锁"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_request_takes_precedence_over_active_review_conflict() {
+        let doc_id = "doc_invalid_while_active";
+        let state = make_test_state(doc_id).await;
+        state.active_reviews.lock().await.insert(doc_id.to_string());
+
+        let response = review_document(
+            State(state),
+            Path(doc_id.to_string()),
+            Json(ReviewRequest {
+                chunk_ids: Vec::new(),
+                max_clauses: Some(0),
+                enabled_agents: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.expect_err("非法请求应优先返回参数错误").0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn review_result_preserves_partial_failed_status() {
+        let doc_id = "doc_partial_result";
+        let state = make_test_state(doc_id).await;
+        state.review_results.lock().await.insert(
+            doc_id.to_string(),
+            CoordinatorOutput {
+                findings: Vec::new(),
+                routing_summary: crate::agents::types::RoutingSummary {
+                    total_clauses: 1,
+                    agent_clause_counts: HashMap::new(),
+                    high_risk_count: 0,
+                    legal_verify_count: 0,
+                    blind_spot_findings: 0,
+                },
+                graph_snapshot: None,
+                execution_summary: crate::agents::types::ExecutionSummary {
+                    status: crate::agents::types::ReviewExecutionStatus::PartialFailed,
+                    successful_agents: 1,
+                    failed_agents: vec![crate::agents::types::AgentExecutionFailure {
+                        agent_id: "missing-agent".to_string(),
+                        message: "Agent 定义未找到".to_string(),
+                    }],
+                    failed_clauses: Vec::new(),
+                    failed_stages: Vec::new(),
+                    budget: None,
+                },
+            },
+        );
+
+        let Json(response) = get_review_result(State(state), Path(doc_id.to_string()))
+            .await
+            .expect("部分失败结果应可查询");
+
+        assert_eq!(response.status, "partial_failed");
+        assert_eq!(
+            response
+                .result
+                .expect("部分失败应保留成功结果")
+                .execution_summary
+                .failed_agents
+                .len(),
+            1
+        );
+    }
 }
 
 /// GET /api/v1/metrics/experiment-groups — 列出所有实验组。
