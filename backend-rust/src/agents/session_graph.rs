@@ -66,6 +66,8 @@ pub struct SessionGraph {
     ///
     /// Coordinator 批量搜索阶段写入，Execute Phase 读取并注入 Agent prompt。
     search_results: RwLock<HashMap<String, Vec<SearchCacheEntry>>>,
+    /// 审查尝试记录，以 attempt_id 为键。
+    review_attempts: RwLock<HashMap<String, ReviewAttempt>>,
 }
 
 impl SessionGraph {
@@ -87,6 +89,7 @@ impl SessionGraph {
             risk_id_counter: AtomicU64::new(0),
             scout_complete: AtomicBool::new(false),
             search_results: RwLock::new(HashMap::new()),
+            review_attempts: RwLock::new(HashMap::new()),
         }
     }
 
@@ -100,6 +103,114 @@ impl SessionGraph {
     pub fn next_risk_id(&self) -> String {
         let id = self.risk_id_counter.fetch_add(1, Ordering::Relaxed);
         format!("R_{:03}", id + 1)
+    }
+
+    /// 创建一条已经取得执行名额的审查尝试。
+    pub fn start_review_attempt(
+        &self,
+        agent_id: AgentId,
+        chunk_id: &str,
+    ) -> Result<String, String> {
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let attempt = ReviewAttempt {
+            attempt_id: attempt_id.clone(),
+            agent_id,
+            chunk_id: chunk_id.to_string(),
+            status: ReviewAttemptStatus::Started,
+            outcome: None,
+            finding_ids: Vec::new(),
+            error_code: None,
+            error_message: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let mut attempts = self
+            .review_attempts
+            .write()
+            .map_err(|_| "SessionGraph 审查尝试写锁已中毒".to_string())?;
+        attempts.insert(attempt_id.clone(), attempt);
+        Ok(attempt_id)
+    }
+
+    /// 将审查尝试标记为成功，并派生兼容的 reviewed_by 边。
+    pub fn complete_review_attempt(
+        &self,
+        attempt_id: &str,
+        outcome: ReviewAttemptOutcome,
+        finding_ids: Vec<String>,
+    ) -> Result<(), String> {
+        let (agent_id, chunk_id) = {
+            let mut attempts = self
+                .review_attempts
+                .write()
+                .map_err(|_| "SessionGraph 审查尝试写锁已中毒".to_string())?;
+            let attempt = attempts
+                .get_mut(attempt_id)
+                .ok_or_else(|| format!("审查尝试不存在: {}", attempt_id))?;
+            if attempt.status != ReviewAttemptStatus::Started {
+                return Err(format!("审查尝试 {} 已结束，禁止重复流转", attempt_id));
+            }
+            attempt.status = ReviewAttemptStatus::Completed;
+            attempt.outcome = Some(outcome);
+            attempt.finding_ids = finding_ids;
+            attempt.finished_at = Some(chrono::Utc::now().to_rfc3339());
+            (attempt.agent_id.clone(), attempt.chunk_id.clone())
+        };
+        self.add_reviewed_by(&chunk_id, agent_id);
+        Ok(())
+    }
+
+    /// 将审查尝试标记为失败；失败尝试不计入 reviewed_by。
+    pub fn fail_review_attempt(
+        &self,
+        attempt_id: &str,
+        error_code: ReviewAttemptErrorCode,
+        error_message: &str,
+    ) -> Result<(), String> {
+        let mut attempts = self
+            .review_attempts
+            .write()
+            .map_err(|_| "SessionGraph 审查尝试写锁已中毒".to_string())?;
+        let attempt = attempts
+            .get_mut(attempt_id)
+            .ok_or_else(|| format!("审查尝试不存在: {}", attempt_id))?;
+        if attempt.status != ReviewAttemptStatus::Started {
+            return Err(format!("审查尝试 {} 已结束，禁止重复流转", attempt_id));
+        }
+        attempt.status = ReviewAttemptStatus::Failed;
+        attempt.error_code = Some(error_code);
+        attempt.error_message = Some(error_message.to_string());
+        attempt.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        Ok(())
+    }
+
+    /// 批量收口指定 Agent、指定条款中仍处于 started 的审查尝试。
+    pub fn fail_started_attempts(
+        &self,
+        agent_id: &AgentId,
+        chunk_ids: &[String],
+        error_code: ReviewAttemptErrorCode,
+        error_message: &str,
+    ) -> Result<usize, String> {
+        let mut attempts = self
+            .review_attempts
+            .write()
+            .map_err(|_| "SessionGraph 审查尝试写锁已中毒".to_string())?;
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let mut closed = 0;
+        for attempt in attempts.values_mut() {
+            if attempt.status == ReviewAttemptStatus::Started
+                && &attempt.agent_id == agent_id
+                && chunk_ids.contains(&attempt.chunk_id)
+            {
+                attempt.status = ReviewAttemptStatus::Failed;
+                attempt.error_code = Some(error_code);
+                attempt.error_message = Some(error_message.to_string());
+                attempt.finished_at = Some(finished_at.clone());
+                closed += 1;
+            }
+        }
+        Ok(closed)
     }
 
     // ── 写入 (Agent 调用) ──────────────────────────────────────
@@ -609,7 +720,12 @@ impl SessionGraph {
                 .ok()
                 .map(|g| g.clone())
                 .unwrap_or_default(),
-            review_attempts: HashMap::new(),
+            review_attempts: self
+                .review_attempts
+                .read()
+                .map_err(|_| "SessionGraph 审查尝试读锁已中毒")
+                .map(|attempts| attempts.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -719,6 +835,80 @@ mod tests {
 
         let ctx = g.query_clause_context("ch_001");
         assert_eq!(ctx.reviewed_by.len(), 2);
+    }
+
+    #[test]
+    fn test_review_attempt_completed_no_risk_counts_as_reviewed() {
+        let graph = SessionGraph::new();
+        graph.add_chunk(make_test_chunk("ch_001"));
+        let attempt_id = graph
+            .start_review_attempt(AgentId::FactCheck, "ch_001")
+            .expect("应创建审查尝试");
+
+        graph
+            .complete_review_attempt(&attempt_id, ReviewAttemptOutcome::NoRisk, Vec::new())
+            .expect("无风险也应正常完成");
+
+        let snapshot = graph.snapshot();
+        let attempt = &snapshot.review_attempts[&attempt_id];
+        assert_eq!(attempt.status, ReviewAttemptStatus::Completed);
+        assert_eq!(attempt.outcome, Some(ReviewAttemptOutcome::NoRisk));
+        assert_eq!(snapshot.reviewed_by["ch_001"], vec![AgentId::FactCheck]);
+    }
+
+    #[test]
+    fn test_failed_review_attempt_does_not_count_as_reviewed() {
+        let graph = SessionGraph::new();
+        graph.add_chunk(make_test_chunk("ch_001"));
+        let attempt_id = graph
+            .start_review_attempt(AgentId::FactCheck, "ch_001")
+            .expect("应创建审查尝试");
+
+        graph
+            .fail_review_attempt(
+                &attempt_id,
+                ReviewAttemptErrorCode::ClauseTimeout,
+                "条款审查超时",
+            )
+            .expect("应记录失败");
+
+        let snapshot = graph.snapshot();
+        assert_eq!(
+            snapshot.review_attempts[&attempt_id].status,
+            ReviewAttemptStatus::Failed
+        );
+        assert!(!snapshot.reviewed_by.contains_key("ch_001"));
+    }
+
+    #[test]
+    fn test_reconcile_started_attempts_only_closes_selected_agent_and_chunks() {
+        let graph = SessionGraph::new();
+        let target = graph
+            .start_review_attempt(AgentId::FactCheck, "ch_001")
+            .expect("应创建目标尝试");
+        let untouched = graph
+            .start_review_attempt(AgentId::Procedure, "ch_002")
+            .expect("应创建非目标尝试");
+
+        let closed = graph
+            .fail_started_attempts(
+                &AgentId::FactCheck,
+                &["ch_001".to_string()],
+                ReviewAttemptErrorCode::TaskCancelled,
+                "执行阶段取消",
+            )
+            .expect("应收口目标尝试");
+
+        let snapshot = graph.snapshot();
+        assert_eq!(closed, 1);
+        assert_eq!(
+            snapshot.review_attempts[&target].status,
+            ReviewAttemptStatus::Failed
+        );
+        assert_eq!(
+            snapshot.review_attempts[&untouched].status,
+            ReviewAttemptStatus::Started
+        );
     }
 
     #[test]
