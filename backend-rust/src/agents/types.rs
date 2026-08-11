@@ -1174,7 +1174,6 @@ pub enum ReviewAttemptOutcome {
 pub enum ReviewAttemptErrorCode {
     ClauseTimeout,
     IncompleteOutput,
-    EmptyResult,
     TaskPanic,
     TaskCancelled,
 }

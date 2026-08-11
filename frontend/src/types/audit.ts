@@ -222,7 +222,6 @@ export type ReviewAttemptOutcome = 'findings' | 'no_risk';
 export type ReviewAttemptErrorCode =
   | 'clause_timeout'
   | 'incomplete_output'
-  | 'empty_result'
   | 'task_panic'
   | 'task_cancelled';
 

@@ -544,7 +544,32 @@ impl ReActLoop {
                 .as_ref()
                 .map(|g| g.next_risk_id())
                 .unwrap_or_else(|| format!("R_{:03}", idx + 1));
-            findings.extend(self.review_single(clause, &risk_id).await);
+            let attempt_id = self.graph.as_ref().and_then(|graph| {
+                let agent_id = AgentId::parse(&self.config.name)
+                    .unwrap_or_else(|| AgentId::Dynamic(self.config.name.clone()));
+                match graph.start_review_attempt(agent_id, &clause.chunk_id) {
+                    Ok(attempt_id) => Some(attempt_id),
+                    Err(error) => {
+                        eprintln!("  [SessionGraph] 创建审查尝试失败: {}", error);
+                        None
+                    }
+                }
+            });
+            let clause_findings = self.review_single(clause, &risk_id).await;
+            if let (Some(graph), Some(attempt_id)) = (&self.graph, attempt_id.as_deref()) {
+                let transition_result = match classify_review_attempt(&clause_findings) {
+                    Ok((outcome, finding_ids)) => {
+                        graph.complete_review_attempt(attempt_id, outcome, finding_ids)
+                    }
+                    Err(error_code) => {
+                        graph.fail_review_attempt(attempt_id, error_code, "条款审查未完整结束")
+                    }
+                };
+                if let Err(error) = transition_result {
+                    eprintln!("  [SessionGraph] 收口审查尝试失败: {}", error);
+                }
+            }
+            findings.extend(clause_findings);
 
             // 每审完一条条款后，发送 AgentProgress（SSE 实时推送）
             if let Some(ref events) = self.review_events {
@@ -801,11 +826,6 @@ impl ReActLoop {
                     }
 
                     conversation.push(ChatMessage::System { content: graph_msg });
-                }
-
-                // 记录当前 Agent 已审查此条款
-                if let Some(agent_id) = AgentId::parse(agent_name) {
-                    graph.add_reviewed_by(&clause.chunk_id, agent_id);
                 }
             }
 
@@ -2325,7 +2345,7 @@ impl ReActLoop {
 /// * `max_parallel` — 最大并行审查条款数（Semaphore permits）
 /// * `graph` — SessionGraph（用于生成全局唯一 risk_id，None 时回退到索引编号）
 /// * `review_events` — SSE 推送通道（None 时不推送）
-/// * `agent_name` — Agent 名称（用于日志和进度事件）
+/// * `agent_id` — Agent 身份（用于审查尝试、日志和进度事件）
 #[derive(Debug)]
 pub struct ClauseReviewFailure {
     pub clause_id: String,
@@ -2339,6 +2359,27 @@ pub struct ClauseReviewReport {
     pub failed_clauses: Vec<ClauseReviewFailure>,
 }
 
+fn classify_review_attempt(
+    findings: &[RiskFinding],
+) -> Result<(ReviewAttemptOutcome, Vec<String>), ReviewAttemptErrorCode> {
+    if findings.is_empty() {
+        return Ok((ReviewAttemptOutcome::NoRisk, Vec::new()));
+    }
+    if findings.iter().any(|finding| finding.truncated) {
+        return Err(ReviewAttemptErrorCode::IncompleteOutput);
+    }
+    let finding_ids: Vec<String> = findings
+        .iter()
+        .filter(|finding| !finding.no_risk)
+        .map(|finding| finding.risk_id.clone())
+        .collect();
+    if finding_ids.is_empty() {
+        Ok((ReviewAttemptOutcome::NoRisk, Vec::new()))
+    } else {
+        Ok((ReviewAttemptOutcome::Findings, finding_ids))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn review_clauses_parallel_report<F>(
     clauses: &[ReviewClause],
@@ -2348,7 +2389,7 @@ pub async fn review_clauses_parallel_report<F>(
     max_parallel: usize,
     graph: Option<Arc<SessionGraph>>,
     review_events: Option<Arc<ReviewEventBus>>,
-    agent_name: &str,
+    agent_id: AgentId,
     execution_control: Option<Arc<crate::agents::execution_control::ReviewExecutionControl>>,
 ) -> ClauseReviewReport
 where
@@ -2380,7 +2421,8 @@ where
         let make_agent = make_agent.clone();
         let graph = graph.clone();
         let events = review_events.clone();
-        let name = agent_name.to_string();
+        let task_agent_id = agent_id.clone();
+        let name = task_agent_id.to_string();
         let done = done.clone();
         let raw_findings_total = raw_findings_total.clone();
         let execution_control = execution_control.clone();
@@ -2389,6 +2431,15 @@ where
             let _permit = sem.acquire_owned().await;
             let _global_permit = if let Some(ref control) = execution_control {
                 Some(control.acquire().await?)
+            } else {
+                None
+            };
+            let attempt_id = if let Some(ref graph) = graph {
+                Some(
+                    graph
+                        .start_review_attempt(task_agent_id, &clause.chunk_id)
+                        .map_err(anyhow::Error::msg)?,
+                )
             } else {
                 None
             };
@@ -2406,26 +2457,61 @@ where
                 .as_ref()
                 .map(|g| g.next_risk_id())
                 .unwrap_or_else(|| format!("R_{:03}", idx + 1));
-            let findings = if let Some(ref control) = execution_control {
+            let (findings, timeout_message) = if let Some(ref control) = execution_control {
                 match tokio::time::timeout(
                     control.limits().clause_timeout,
                     agent.review_single(&clause, &risk_id),
                 )
                 .await
                 {
-                    Ok(findings) => findings,
-                    Err(_) => vec![RiskFinding::truncated_finding(
-                        risk_id.clone(),
-                        clause.chunk_id.clone(),
-                        &name,
-                        clause.tier,
-                        clause.tier,
-                        "单条条款审查超过 180 秒",
-                    )],
+                    Ok(findings) => (findings, None),
+                    Err(_) => {
+                        let message = "单条条款审查超过 180 秒";
+                        (
+                            vec![RiskFinding::truncated_finding(
+                                risk_id.clone(),
+                                clause.chunk_id.clone(),
+                                &name,
+                                clause.tier,
+                                clause.tier,
+                                message,
+                            )],
+                            Some(message),
+                        )
+                    }
                 }
             } else {
-                agent.review_single(&clause, &risk_id).await
+                (agent.review_single(&clause, &risk_id).await, None)
             };
+
+            if let (Some(graph), Some(attempt_id)) = (graph.as_ref(), attempt_id.as_deref()) {
+                if let Some(message) = timeout_message {
+                    graph
+                        .fail_review_attempt(
+                            attempt_id,
+                            ReviewAttemptErrorCode::ClauseTimeout,
+                            message,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                } else {
+                    match classify_review_attempt(&findings) {
+                        Ok((outcome, finding_ids)) => {
+                            graph
+                                .complete_review_attempt(attempt_id, outcome, finding_ids)
+                                .map_err(anyhow::Error::msg)?;
+                        }
+                        Err(error_code) => {
+                            let message = match error_code {
+                                ReviewAttemptErrorCode::IncompleteOutput => "条款审查未完整结束",
+                                _ => "条款审查失败",
+                            };
+                            graph
+                                .fail_review_attempt(attempt_id, error_code, message)
+                                .map_err(anyhow::Error::msg)?;
+                        }
+                    }
+                }
+            }
 
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             let risk_count = findings.iter().filter(|f| !f.no_risk).count();
@@ -2493,7 +2579,7 @@ where
                 collected.push(RiskFinding::truncated_finding(
                     format!("R_{:03}", i + 1),
                     clauses[i].chunk_id.clone(),
-                    agent_name,
+                    &agent_id.to_string(),
                     clauses[i].tier,
                     clauses[i].tier,
                     "并行审查 task 异常终止",
@@ -2519,7 +2605,7 @@ pub async fn review_clauses_parallel<F>(
     max_parallel: usize,
     graph: Option<Arc<SessionGraph>>,
     review_events: Option<Arc<ReviewEventBus>>,
-    agent_name: &str,
+    agent_id: AgentId,
     execution_control: Option<Arc<crate::agents::execution_control::ReviewExecutionControl>>,
 ) -> Vec<RiskFinding>
 where
@@ -2536,7 +2622,7 @@ where
         max_parallel,
         graph,
         review_events,
-        agent_name,
+        agent_id,
         execution_control,
     )
     .await
@@ -2739,7 +2825,7 @@ mod multi_finding_tests {
                 1,
                 None,
                 None,
-                "TestAgent",
+                AgentId::Dynamic("TestAgent".to_string()),
                 None,
             )
             .await
@@ -2790,6 +2876,7 @@ mod multi_finding_tests {
             ),
         );
         let control = limiter.start_review(2, 2);
+        let graph = Arc::new(SessionGraph::new());
 
         let report = review_clauses_parallel_report(
             &clauses,
@@ -2808,9 +2895,9 @@ mod multi_finding_tests {
             Arc::new(|| Box::new(ConditionalSlowLlm)),
             Arc::new(crate::agents::tools::ToolRegistry::new),
             2,
+            Some(graph.clone()),
             None,
-            None,
-            "TestAgent",
+            AgentId::Dynamic("TestAgent".to_string()),
             Some(control),
         )
         .await;
@@ -2818,6 +2905,64 @@ mod multi_finding_tests {
         assert_eq!(report.successful_clauses, 1);
         assert_eq!(report.failed_clauses.len(), 1);
         assert_eq!(report.failed_clauses[0].clause_id, "ch_timeout");
+        let snapshot = graph.snapshot();
+        assert_eq!(snapshot.review_attempts.len(), 2);
+        assert_eq!(
+            snapshot
+                .review_attempts
+                .values()
+                .filter(|attempt| attempt.status == ReviewAttemptStatus::Completed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .review_attempts
+                .values()
+                .filter(|attempt| attempt.status == ReviewAttemptStatus::Failed)
+                .count(),
+            1
+        );
+        assert!(snapshot.reviewed_by.contains_key("ch_ok"));
+        assert!(!snapshot.reviewed_by.contains_key("ch_timeout"));
+    }
+
+    #[tokio::test]
+    async fn sequential_review_records_completed_no_risk_attempt() {
+        let graph = Arc::new(SessionGraph::new());
+        let agent = ReActLoop::new(
+            AgentConfig {
+                name: "FactCheckAgent".to_string(),
+                system_prompt: "测试".to_string(),
+                default_max_turns: 1,
+                tool_names: vec!["output_finding".to_string()],
+            },
+            Box::new(ConditionalSlowLlm),
+            crate::agents::tools::ToolRegistry::new(),
+        )
+        .with_graph(graph.clone());
+        let clause = ReviewClause {
+            chunk_id: "ch_sequential".to_string(),
+            section_path: vec!["测试".to_string()],
+            text: "正常条款".to_string(),
+            page_start: 0,
+            page_end: 0,
+            tier: RiskTier::Low,
+            tier_max_turns: 1,
+        };
+
+        let findings = agent.review(&[clause]).await;
+
+        assert!(findings.is_empty());
+        let snapshot = graph.snapshot();
+        assert_eq!(snapshot.review_attempts.len(), 1);
+        let attempt = snapshot.review_attempts.values().next().unwrap();
+        assert_eq!(attempt.status, ReviewAttemptStatus::Completed);
+        assert_eq!(attempt.outcome, Some(ReviewAttemptOutcome::NoRisk));
+        assert_eq!(
+            snapshot.reviewed_by["ch_sequential"],
+            vec![AgentId::FactCheck]
+        );
     }
 
     fn finding_json(category: &str, quote: &str) -> serde_json::Value {

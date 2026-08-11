@@ -1252,7 +1252,7 @@ impl Coordinator {
                         max_parallel,
                         Some(graph_for_write.clone()),
                         review_events.clone(),
-                        &agent_name,
+                        agent_id.clone(),
                         Some(execution_control),
                     )
                     .await;
