@@ -40,18 +40,28 @@ const clearAllStorage = () => {
 const getStored = (key: string) =>
    localStorage.getItem(key) || sessionStorage.getItem(key);
 
+/** 安全解析 localStorage 中的 JSON，无效数据返回 null 并清理 */
+const safeJsonParse = (raw: string | null): unknown | null => {
+   if (!raw || raw === 'undefined' || raw === 'null') return null;
+   try {
+      return JSON.parse(raw);
+   } catch {
+      return null;
+   }
+};
+
 const token = getStored(STORAGE_KEYS.token);
 const userInfoStr = getStored(STORAGE_KEYS.userInfo);
 const storedTenantId = getStored(STORAGE_KEYS.tenantId);
 const storedRefreshToken = getStored(STORAGE_KEYS.refreshToken);
 
 const initialState: AuthState = {
-   token: token,
-   userInfo: userInfoStr ? JSON.parse(userInfoStr) : null,
-   isAuthenticated: !!token,
-   currentTenantId: storedTenantId ?? null,
+   token: token && token !== 'undefined' ? token : null,
+   userInfo: safeJsonParse(userInfoStr) as UserInfo | null,
+   isAuthenticated: !!token && token !== 'undefined',
+   currentTenantId: storedTenantId && storedTenantId !== 'undefined' ? storedTenantId : null,
    tenantList: [],
-   refreshToken: storedRefreshToken ?? null,
+   refreshToken: storedRefreshToken && storedRefreshToken !== 'undefined' ? storedRefreshToken : null,
 };
 
 const persistSession = (
@@ -64,7 +74,7 @@ const persistSession = (
    clearAllStorage();
    const store = rememberMe ? localStorage : sessionStorage;
    store.setItem(STORAGE_KEYS.token, token);
-   store.setItem(STORAGE_KEYS.userInfo, JSON.stringify(userInfo));
+   if (userInfo) store.setItem(STORAGE_KEYS.userInfo, JSON.stringify(userInfo));
    if (tenantId) store.setItem(STORAGE_KEYS.tenantId, tenantId);
    if (refreshToken) store.setItem(STORAGE_KEYS.refreshToken, refreshToken);
 };
@@ -80,7 +90,7 @@ const authSlice = createSlice({
                token: string;
                userInfo: UserInfo;
                rememberMe?: boolean;
-               tenantId?: string;
+               tenantId?: string | number;
                refreshToken?: string;
             };
          }
@@ -90,10 +100,10 @@ const authSlice = createSlice({
          state.token = token;
          state.userInfo = userInfo;
          state.isAuthenticated = true;
-         if (tenantId) state.currentTenantId = tenantId;
+         if (tenantId != null) state.currentTenantId = String(tenantId);
          if (refreshToken) state.refreshToken = refreshToken;
 
-         persistSession(token, userInfo, rememberMe, tenantId, refreshToken);
+         persistSession(token, userInfo, rememberMe, tenantId != null ? String(tenantId) : undefined, refreshToken);
       },
       /** 切换租户 — 整体替换登录会话，清旧缓存 */
       switchTenant: (
@@ -101,8 +111,8 @@ const authSlice = createSlice({
          action: {
             payload: {
                token: string;
-               refreshToken: string;
-               tenantId: string;
+               refreshToken?: string;
+               tenantId: string | number;
                userInfo: UserInfo;
             };
          }
@@ -112,8 +122,8 @@ const authSlice = createSlice({
          clearAllStorage();
 
          state.token = token;
-         state.refreshToken = refreshToken;
-         state.currentTenantId = tenantId;
+         state.refreshToken = refreshToken || null;
+         state.currentTenantId = String(tenantId);
          state.userInfo = userInfo;
          state.isAuthenticated = true;
          state.tenantList = []; // 清旧租户列表，由 UI 重新拉取
@@ -121,8 +131,8 @@ const authSlice = createSlice({
          // 新会话写入 localStorage（切租户不涉及 rememberMe，默认持久）
          localStorage.setItem(STORAGE_KEYS.token, token);
          localStorage.setItem(STORAGE_KEYS.userInfo, JSON.stringify(userInfo));
-         localStorage.setItem(STORAGE_KEYS.tenantId, tenantId);
-         localStorage.setItem(STORAGE_KEYS.refreshToken, refreshToken);
+         localStorage.setItem(STORAGE_KEYS.tenantId, String(tenantId));
+         if (refreshToken) localStorage.setItem(STORAGE_KEYS.refreshToken, refreshToken);
       },
       /** 设置租户列表（UI 拉取后存入 store） */
       setTenantList: (
@@ -136,10 +146,10 @@ const authSlice = createSlice({
       /** 仅更新当前租户 ID（Mock 模式 / 不涉及 token 切换时使用） */
       setCurrentTenantId: (
          state,
-         action: { payload: string }
+         action: { payload: string | number }
       ) => {
-         state.currentTenantId = action.payload;
-         localStorage.setItem(STORAGE_KEYS.tenantId, action.payload);
+         state.currentTenantId = String(action.payload);
+         localStorage.setItem(STORAGE_KEYS.tenantId, String(action.payload));
       },
       logout: (state) => {
          state.token = null;
@@ -156,16 +166,15 @@ const authSlice = createSlice({
          const tenantId = getStored(STORAGE_KEYS.tenantId);
          const refreshToken = getStored(STORAGE_KEYS.refreshToken);
 
-         if (token && userInfoStr) {
-            try {
-               const userInfo = JSON.parse(userInfoStr);
+         if (token && token !== 'undefined' && userInfoStr) {
+            const userInfo = safeJsonParse(userInfoStr) as UserInfo | null;
+            if (userInfo) {
                state.token = token;
                state.userInfo = userInfo;
                state.isAuthenticated = true;
-               state.currentTenantId = tenantId ?? null;
-               state.refreshToken = refreshToken ?? null;
-            } catch (error) {
-               console.error('Failed to parse user info:', error);
+               state.currentTenantId = tenantId && tenantId !== 'undefined' ? tenantId : null;
+               state.refreshToken = refreshToken && refreshToken !== 'undefined' ? refreshToken : null;
+            } else {
                clearAllStorage();
             }
          }

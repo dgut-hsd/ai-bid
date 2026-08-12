@@ -16,7 +16,7 @@ import type {
 } from '../types';
 
 // ─── 是否启用 Mock（PR#6 合并前为 true，联调时改 false） ─────────────
-export const USE_MOCK = true;
+export const USE_MOCK = false;
 
 export const tenantApi = {
   // ─── 认证相关 ──────────────────────────────────────────────────────

@@ -27,8 +27,13 @@ export const useTenant = () => {
     queryFn: async () => {
       const resp = await tenantApi.getTenants();
       if (resp.code === 200 && resp.data) {
-        dispatch(setTenantList(resp.data.items));
-        return resp.data;
+        // 规范化 tenant_id 为字符串（后端返回 Long，localStorage 存字符串，统一转 string 避免 === 不匹配）
+        const normalizedItems = resp.data.items.map((t) => ({
+          ...t,
+          tenant_id: String(t.tenant_id),
+        }));
+        dispatch(setTenantList(normalizedItems));
+        return { ...resp.data, items: normalizedItems };
       }
       throw new Error(resp.msg || '获取租户列表失败');
     },
@@ -50,16 +55,17 @@ export const useTenant = () => {
           // 不 reload，只更新 UI 状态
         } else {
           // 真实模式：dispatch switchTenant（清旧缓存+写新会话）→ 刷新页面断 SSE
+          const tenantInfo = session.current_tenant;
+          const userInfoData = session.user_info;
           dispatch(
             switchTenantAction({
               token: session.token,
               refreshToken: session.refresh_token,
-              tenantId: session.tenant_id,
+              tenantId: tenantInfo?.tenant_id,
               userInfo: {
-                // 保留 user_id 原值，避免 UUID 经 Number() 变成 0
-                id: session.user_id,
-                username: session.username,
-                realName: session.real_name || session.username,
+                id: userInfoData?.user_id,
+                username: userInfoData?.username,
+                realName: userInfoData?.realName || userInfoData?.username,
               },
             })
           );
