@@ -952,7 +952,7 @@ impl Coordinator {
         }
 
         // 确保每条条款至少分配给一个已启用的 Agent（优先 FactCheck）
-        let has_factcheck = enabled_agent_ids.contains(&AgentId::FactCheck);
+        let has_factcheck = self.config.enabled_agents.contains(&AgentId::FactCheck);
         for clause in clauses {
             let mut assigned = false;
             for clauses_list in routing.values() {
@@ -968,7 +968,7 @@ impl Coordinator {
                     .push(clause.clone());
             } else if !assigned {
                 // Fallback: 分配给第一个启用的 Agent
-                if let Some(first_enabled) = enabled_agent_ids.first() {
+                if let Some(first_enabled) = self.config.enabled_agents.first() {
                     routing
                         .entry(first_enabled.clone())
                         .or_default()

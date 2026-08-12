@@ -83,7 +83,7 @@ fn init_search_backend() -> (
         let searxng_url =
             env::var("SEARXNG_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
         eprintln!("  搜索后端: SearXNG ({})", searxng_url);
-        (None, Some(SearchBuffer::new(searxng_url)))
+        (None, Some(SearchBuffer::new(searxng_url, None)))
     } else {
         let ds = DashScopeSearchBackend::from_env()
             .expect("DashScope 搜索后端初始化失败。请设置 DASHSCOPE_API_KEY");
@@ -178,8 +178,14 @@ fn make_tools_factory(
         registry.register(Box::new(MockSearchDocumentTool));
         registry.register(Box::new(OutputFindingTool));
         // V2+ 工具
-        registry.register(Box::new(CompareVersionsTool));
-        registry.register(Box::new(DetectBoilerplateTool));
+        registry.register(Box::new(CompareVersionsTool {
+            current_chunks: chunks.clone(),
+            current_order: chunk_order.clone(),
+        }));
+        registry.register(Box::new(DetectBoilerplateTool {
+            chunks: chunks.clone(),
+            chunk_order: chunk_order.clone(),
+        }));
         // V3 采购程序合规审查
         registry.register(Box::new(VerifyProcurementMethodTool));
         registry.register(Box::new(VerifyBidDepositTool));
