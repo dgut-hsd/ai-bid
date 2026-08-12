@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "agents": [
+    {
+      "id": "Dynamic_Unknown",
+      "display_name": "校本术语标准化审查Agent",
+      "system_prompt": "你是校本术语标准化审查Agent。你的职责是识别招标文件中使用的高校内部管理术语（如'第二成绩单''零站式事务中心''学生工作认证'），核查其是否具备国家标准（GB）、教育行业标准（JY/T）、教育部规章或全国性团学政策文件依据；若无，则评估其是否构成验收不可验证风险。审查知识库来源：教育部官网政策文件库、共青团中央官网、国家标准全文公开系统（https://openstd.samr.gov.cn）、全国团体标准信息平台（https://www.ttbz.org.cn）。输出要求：对每个校本术语，输出其是否具有法定/通用依据；若无，说明其模糊性表现（如无定义、无流程、无验收标准）及对应法规条款；建议替换为法定术语或补充可验证定义。",
+      "default_max_turns": 8,
+      "complexity": "Medium",
+      "section_keywords": [
+        "第二成绩单",
+        "学生工作认证",
+        "零站式",
+        "成长历程",
+        "团费台账",
+        "团员证申请"
+      ],
+      "tool_names": [
+        "web_search",
+        "search_document",
+        "read_section",
+        "output_finding"
+      ],
+      "created_at": "2026-07-30T18:23:57.844112600+00:00",
+      "created_by": "BlindSpotAgent",
+      "reason": "DemandAgent 已识别'第二成绩单'为非标概念，但未系统性审查所有校本术语（如'学生工作认证'）的标准化缺失问题；现有Agent均未建立'校本术语→法定依据'映射审查机制，导致同类模糊术语批量遗漏。",
+      "active": false
+    },
+    {
+      "id": "Dynamic_Unknown",
+      "display_name": "高校内部标准嵌套检测Agent",
+      "system_prompt": "你是高校内部标准嵌套检测Agent。你的职责是识别招标文件中是否存在'项目名称/编号嵌入高校全称 + 技术条款强制引用该校内部标准'的组合排他模式。审查范围包括：① 项目名称、编号、采购人描述中是否含高校全称；② 技术要求中是否出现'XX大学/学院/研究院智慧校园XX标准规范'等表述；③ 是否存在跨条款（如ch_001+ch_008+ch_027）形成的隐性指向链。知识库来源：全国标准信息公共服务平台（std.gov.cn）、教育部教育管理信息化标准、财政部政府采购负面清单。搜索指引：若发现高校全称与内部标准术语共现，必须调用web_search验证该标准是否在国家标准平台可查、是否属于法定采信范围。output_finding格式同BlindSpotAgent，需标注组合条款ID及法条依据。",
+      "default_max_turns": 8,
+      "complexity": "Medium",
+      "section_keywords": [
+        "清华大学",
+        "智慧校园",
+        "标准规范",
+        "项目名称",
+        "内部标准"
+      ],
+      "tool_names": [
+        "web_search",
+        "search_document",
+        "read_section",
+        "output_finding"
+      ],
+      "created_at": "2026-08-07T11:49:30.250814500+00:00",
+      "created_by": "BlindSpotAgent",
+      "reason": "现有DemandAgent仅逐条审查技术条款中的内部标准引用（如ch_008、ch_027），未识别项目名称（ch_001）作为元信息与技术条款的跨章节协同排他效应；RuleEngineAgent聚焦单条款合规性，无法建模'名称+标准'的组合风险。该模式具有高度通用性——全国高校信息化招标普遍存在此类嵌套结构，需专用Agent系统性拦截。",
+      "active": false
+    }
+  ]
+}

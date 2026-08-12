@@ -42,8 +42,10 @@ public class ProjectServiceImpl implements ProjectService {
 
     @Override
     public ProjectVO create(ProjectDTO projectDTO) {
+        Long tenantId = TenantScope.requiredTenantId();
         Project project = new Project();
         BeanUtils.copyProperties(projectDTO, project);
+        project.setTenantId(tenantId);
         project.setUserId(BaseContext.getCurrentId());
         project.setParseStatus(0);
         project.setLatestVersion(0);
@@ -60,9 +62,17 @@ public class ProjectServiceImpl implements ProjectService {
     @Override
     @Transactional
     public void delete(Long id) {
+        Long tenantId = TenantScope.requiredTenantId();
+        Project project = projectMapper.selectOne(new LambdaQueryWrapper<Project>()
+                .eq(Project::getId, id)
+                .eq(Project::getTenantId, tenantId));
+        if (project == null) {
+            throw TenantScope.resourceNotFound();
+        }
         // 1. 查找项目下的所有标书
         List<Tender> tenders = tenderMapper.selectList(
                 new LambdaQueryWrapper<Tender>().eq(Tender::getProjectId, id)
+                        .eq(Tender::getTenantId, tenantId)
         );
 
         List<Long> bidIds = tenders.stream().map(Tender::getId).collect(Collectors.toList());
@@ -70,6 +80,7 @@ public class ProjectServiceImpl implements ProjectService {
             // 2. 按 bidId 批量查出审核任务，再级联清理历史数据（问题/报告/任务）
             List<AuditTask> tasks = auditTaskMapper.selectList(
                     new LambdaQueryWrapper<AuditTask>().in(AuditTask::getBidId, bidIds)
+                            .eq(AuditTask::getTenantId, tenantId)
             );
             List<Long> auditIds = tasks.stream().map(AuditTask::getId).collect(Collectors.toList());
             if (CollectionUtils.isNotEmpty(auditIds)) {
@@ -81,6 +92,7 @@ public class ProjectServiceImpl implements ProjectService {
                 );
                 auditTaskMapper.delete(
                         new LambdaQueryWrapper<AuditTask>().in(AuditTask::getId, auditIds)
+                                .eq(AuditTask::getTenantId, tenantId)
                 );
             }
         }
@@ -95,16 +107,26 @@ public class ProjectServiceImpl implements ProjectService {
             }
 
             // 4. 删除标书记录
-            tenderMapper.deleteById(tender.getId());
+            tenderMapper.delete(new LambdaQueryWrapper<Tender>()
+                    .eq(Tender::getId, tender.getId())
+                    .eq(Tender::getTenantId, tenantId));
         }
 
         // 5. 删除项目记录
-        projectMapper.deleteById(id);
+        projectMapper.delete(new LambdaQueryWrapper<Project>()
+                .eq(Project::getId, id)
+                .eq(Project::getTenantId, tenantId));
     }
 
     @Override
     public ProjectVO update(ProjectDTO projectDTO) {
-        Project project = projectMapper.selectById(projectDTO.getId());
+        Long tenantId = TenantScope.requiredTenantId();
+        Project project = projectMapper.selectOne(new LambdaQueryWrapper<Project>()
+                .eq(Project::getId, projectDTO.getId())
+                .eq(Project::getTenantId, tenantId));
+        if (project == null) {
+            throw TenantScope.resourceNotFound();
+        }
         if (project != null) {
             if (projectDTO.getProjectName() != null) {
                 project.setProjectName(projectDTO.getProjectName());
@@ -113,7 +135,10 @@ public class ProjectServiceImpl implements ProjectService {
                 project.setSupplierName(projectDTO.getSupplierName());
             }
             project.setUpdateTime(LocalDateTime.now());
-            projectMapper.updateById(project);
+            project.setTenantId(tenantId);
+            projectMapper.update(project, new LambdaQueryWrapper<Project>()
+                    .eq(Project::getId, projectDTO.getId())
+                    .eq(Project::getTenantId, tenantId));
             
             ProjectVO vo = new ProjectVO();
             BeanUtils.copyProperties(project, vo);
@@ -124,9 +149,11 @@ public class ProjectServiceImpl implements ProjectService {
 
     @Override
     public List<ProjectVO> listAll() {
+        Long tenantId = TenantScope.requiredTenantId();
         Long userId = BaseContext.getCurrentId();
         List<Project> projects = projectMapper.selectList(
                 new LambdaQueryWrapper<Project>()
+                        .eq(Project::getTenantId, tenantId)
                         .eq(Project::getUserId, userId)
                         .orderByDesc(Project::getCreateTime)
         );
@@ -141,6 +168,7 @@ public class ProjectServiceImpl implements ProjectService {
             List<Tender> tenders = tenderMapper.selectList(
                     new LambdaQueryWrapper<Tender>()
                             .eq(Tender::getProjectId, project.getId())
+                            .eq(Tender::getTenantId, tenantId)
                             .orderByDesc(Tender::getVersion)
             );
 
@@ -158,6 +186,7 @@ public class ProjectServiceImpl implements ProjectService {
                 AuditTask task = auditTaskMapper.selectOne(
                         new LambdaQueryWrapper<AuditTask>()
                                 .eq(AuditTask::getBidId, tender.getId())
+                                .eq(AuditTask::getTenantId, tenantId)
                                 .orderByDesc(AuditTask::getCreateTime)
                                 .last("LIMIT 1")
                 );
@@ -189,9 +218,11 @@ public class ProjectServiceImpl implements ProjectService {
 
     @Override
     public List<ProjectVO> getMyProjects() {
+        Long tenantId = TenantScope.requiredTenantId();
         Long userId = BaseContext.getCurrentId();
         List<Project> projects = projectMapper.selectList(
                 new LambdaQueryWrapper<Project>()
+                        .eq(Project::getTenantId, tenantId)
                         .eq(Project::getUserId, userId)
                         .orderByDesc(Project::getCreateTime)
         );
@@ -208,9 +239,11 @@ public class ProjectServiceImpl implements ProjectService {
 
     @Override
     public boolean exists(String projectName) {
+        Long tenantId = TenantScope.requiredTenantId();
         // 判断是否已存在该名字的项目
         QueryWrapper<Project> projectQueryWrapper = new QueryWrapper<>();
-        projectQueryWrapper.eq("project_name", projectName);
+        projectQueryWrapper.eq("tenant_id", tenantId)
+                .eq("project_name", projectName);
         Project project = projectMapper.selectOne(projectQueryWrapper);
         return project != null;
     }
@@ -222,6 +255,7 @@ public class ProjectServiceImpl implements ProjectService {
         return auditTaskMapper.selectOne(
                 new LambdaQueryWrapper<AuditTask>()
                         .eq(AuditTask::getBidId, bidId)
+                        .eq(AuditTask::getTenantId, TenantScope.requiredTenantId())
                         .orderByDesc(AuditTask::getCreateTime)
                         .last("LIMIT 1")
         );

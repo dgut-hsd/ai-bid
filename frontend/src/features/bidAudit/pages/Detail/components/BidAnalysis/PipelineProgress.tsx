@@ -1,9 +1,10 @@
 import React from 'react';
-import { Typography, Spin } from 'antd';
+import { Typography, Spin, Button } from 'antd';
 import {
   LoadingOutlined,
   CheckCircleOutlined,
   CloseCircleOutlined,
+  ArrowRightOutlined,
 } from '@ant-design/icons';
 
 const { Text } = Typography;
@@ -11,6 +12,8 @@ const { Text } = Typography;
 interface PipelineProgressProps {
   currentStage: string;
   isComplete: boolean;
+  /** 审核完成后手动跳转到「审核结果」的回调（不传则不显示入口） */
+  onViewResults?: () => void;
 }
 
 /** 将 backend stage 映射为用户可读的简短描述 */
@@ -30,14 +33,39 @@ const stageLabel = (stage: string, isComplete: boolean): string => {
  * 审核进度指示 — 后端审核是同步阻塞调用，无细粒度进度，
  * 因此使用不间断旋转动画表示"进行中"。
  */
-const PipelineProgress: React.FC<PipelineProgressProps> = ({ currentStage, isComplete }) => {
+const PipelineProgress: React.FC<PipelineProgressProps> = ({ currentStage, isComplete, onViewResults }) => {
   const label = stageLabel(currentStage, isComplete);
 
+  // 审核完成：不自动跳页，改为在「审核过程」页给一条醒目的完成横幅 + 手动入口，
+  // 用户可以继续看当前卡片，想看结果时自己点。
   if (isComplete) {
     return (
-      <div style={{ padding: '6px 0', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
-        <CheckCircleOutlined style={{ color: '#52c41a', fontSize: 14 }} />
-        <Text style={{ fontSize: 13 }}>{label}</Text>
+      <div
+        style={{
+          padding: '12px 14px',
+          marginBottom: 6,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          background: '#f6ffed',
+          border: '1px solid #b7eb8f',
+          borderRadius: 8,
+        }}
+      >
+        <CheckCircleOutlined style={{ color: '#52c41a', fontSize: 26 }} />
+        <Text strong style={{ fontSize: 20, lineHeight: 1.2, color: '#389e0d', letterSpacing: 1 }}>
+          {label}
+        </Text>
+        {onViewResults && (
+          <Button
+            type="link"
+            size="small"
+            style={{ marginLeft: 'auto', padding: 0, color: '#389e0d' }}
+            onClick={onViewResults}
+          >
+            查看审核结果 <ArrowRightOutlined />
+          </Button>
+        )}
       </div>
     );
   }

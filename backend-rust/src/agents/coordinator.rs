@@ -27,7 +27,7 @@
 use crate::agents::bus::AgentBus;
 use crate::agents::react_loop::{LlmClient, ReActLoop};
 use crate::agents::registry::AgentRegistry;
-use crate::agents::review_event::{FindingLifecycle, ReviewEvent, ReviewEventBus};
+use crate::agents::review_event::{FindingChange, FindingLifecycle, ReviewEvent, ReviewEventBus};
 use crate::agents::risk_taxonomy;
 use crate::agents::session_graph::SessionGraph;
 use crate::agents::tools::ToolRegistry;
@@ -458,24 +458,18 @@ impl Coordinator {
                 message: "法条引用对抗验证中...".to_string(),
             });
             let lv_count = self.legal_verify(&mut merged).await;
-            // 逐条发射通过验证的 finding（进入 L1 主视图）
+            // 逐条确认通过验证的 finding（进入 L1 主视图）
+            // B-2 已在 execute_agents 发射 finding_added；此处改用 finding_updated 避免重复，
+            // 并保留"法条验证通过 → 确认为 Verified"的语义（update 而非 re-add）
             for f in merged.iter().filter(|f| !f.no_risk) {
-                emit(&ReviewEvent::FindingAdded {
+                emit(&ReviewEvent::FindingUpdated {
                     risk_id: f.risk_id.clone(),
-                    severity: severity_str(&f.severity).to_string(),
-                    is_critical: f.is_critical,
-                    critical_reason: f.critical_reason.clone(),
-                    risk_type: f.risk_type.clone(),
-                    agent: f.agent.clone(),
-                    confidence: f.confidence as f64,
-                    clause_ids: f.clause_ids.clone(),
-                    source_quote: f.source_quote.chars().take(500).collect(),
-                    legal_basis: f.legal_basis.clone(),
-                    reason: f.reason.chars().take(500).collect(),
-                    suggestion: f.suggestion.clone(),
-                    lifecycle: FindingLifecycle::Verified,
-                    page_number: f.page_number,
-                    section_path: f.section_path.clone(),
+                    changes: vec![FindingChange {
+                        field: "lifecycle".to_string(),
+                        old_value: None,
+                        new_value: Some("verified".to_string()),
+                    }],
+                    reason: "法条验证通过，确认为有效风险".to_string(),
                 });
             }
             lv_count
@@ -1127,10 +1121,35 @@ impl Coordinator {
                             clauses_total,
                             raw_findings,
                             status: "completed".to_string(),
+                    });
+                }
+
+                // B-2 流式发射：每个 Agent 审查完成即把其发现推向前端
+                // 不再等 MERGE/LEGAL_VERIFY，也不依赖 enable_legal_verify 开关
+                // 重复/被合并项由 merge_findings_v3 后续发 finding_removed 自动清理
+                if let Some(ref events) = review_events {
+                    for f in findings.iter().filter(|f| !f.no_risk) {
+                        events.emit(&ReviewEvent::FindingAdded {
+                            risk_id: f.risk_id.clone(),
+                            severity: severity_str(&f.severity).to_string(),
+                            is_critical: f.is_critical,
+                            critical_reason: f.critical_reason.clone(),
+                            risk_type: f.risk_type.clone(),
+                            agent: f.agent.clone(),
+                            confidence: f.confidence as f64,
+                            clause_ids: f.clause_ids.clone(),
+                            source_quote: f.source_quote.chars().take(500).collect(),
+                            legal_basis: f.legal_basis.clone(),
+                            reason: f.reason.chars().take(500).collect(),
+                            suggestion: f.suggestion.clone(),
+                            lifecycle: FindingLifecycle::Verified,
+                            page_number: f.page_number,
+                            section_path: f.section_path.clone(),
                         });
                     }
+                }
 
-                    // 将发现写入 SessionGraph（共享工作区）
+                // 将发现写入 SessionGraph（共享工作区）
                     for finding in &findings {
                         if !finding.no_risk {
                             let law_refs = finding.legal_basis.clone();

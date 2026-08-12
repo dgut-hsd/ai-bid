@@ -661,6 +661,8 @@ impl ReActLoop {
         let mut found_actionable_law = false; // 是否已找到可直接支撑判断的法规
         let mut post_law_search_count = 0u32; // 找到法规后仍继续搜索的次数
         let mut seen_law_refs: std::collections::HashSet<String> = std::collections::HashSet::new(); // 已见过的法规引用（用于判断搜索是否带来新信息）
+        // ★ 优化：法规证据充分后，下一轮强制锁定 output_finding，避免 Auto 模式下 LLM 继续调用工具空转
+        let mut force_output_next = false;
 
         // ── 条款头日志 ──
         let _print_lock = self.print_lock.as_ref().map(|l| l.lock().unwrap());
@@ -843,7 +845,13 @@ impl ReActLoop {
 
             // ── Turn 剩余轮次预警 + tool_choice 控制 ──
             let remaining = max_turns as u32 - turn;
-            let tool_choice = if remaining <= 1 {
+            let tool_choice = if force_output_next {
+                // ★ 优化：法规证据已充分 → 本轮直接强制 output_finding，提前收尾
+                force_output_next = false;
+                ToolChoice::Specific {
+                    name: "output_finding".to_string(),
+                }
+            } else if remaining <= 1 {
                 // 最后一轮：锁定 output_finding，引擎收回终止控制权
                 ToolChoice::Specific {
                     name: "output_finding".to_string(),
@@ -1691,6 +1699,8 @@ impl ReActLoop {
                             }
 
                             // ★ 确认搜索拦截：已找到法规 + 又做了 1 次无新法规的搜索 → 停
+                            // ★ 优化：同时设置 force_output_next，下一轮强制锁定 output_finding，
+                            //   避免 Auto 模式下 LLM 又调用其他工具，浪费额外 LLM 调用。
                             if found_actionable_law && post_law_search_count >= 1 {
                                 conversation.push(ChatMessage::Tool {
                                     tool_call_id: tc.id.clone(),
@@ -1699,9 +1709,10 @@ impl ReActLoop {
                                 conversation.push(ChatMessage::System {
                                     content: "🛑 你已经找到了可以支撑判断的法规依据，本次搜索没有带来新的法规引用。\n\
                                         法条本身就是最高依据，不需要案例「佐证」或重复搜索确认。\n\
-                                        禁止再调用 web_search。立即调用 output_finding 输出结论。"
+                                        下一轮将强制你输出结论。立即整理已有信息，调用 output_finding。"
                                         .to_string(),
                                 });
+                                force_output_next = true;
                                 continue;
                             }
 
@@ -2152,7 +2163,9 @@ impl ReActLoop {
             if let Some(cached) = cache.get(&cache_key) {
                 return cached.clone();
             }
-            // 2) 模糊 bigram Jaccard（query vs cache key），阈值 ≥ 0.25
+            // 2) 模糊 bigram Jaccard（query vs cache key），阈值 ≥ 0.4
+            //    ★ 优化：0.25 → 0.4，收紧模糊命中，避免语义相距较远的查询
+            //      误命中缓存返回不相关结果，诱导 Agent 重复搜索。
             if !query.is_empty() && !cache.is_empty() {
                 let q_chars: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
                 let q_bigrams: std::collections::HashSet<String> = q_chars
@@ -2172,7 +2185,7 @@ impl ReActLoop {
                         let union = q_bigrams.union(&k_bigrams).count();
                         if union > 0 {
                             let score = intersection as f64 / union as f64;
-                            if score > best_score && score >= 0.25 {
+                            if score > best_score && score >= 0.4 {
                                 best_score = score;
                                 best_value = Some(v);
                             }

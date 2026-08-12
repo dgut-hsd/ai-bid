@@ -1,9 +1,9 @@
-# Milvus 2.6.11 单机版 Compose 配置（适配国内镜像源）
+# 依赖服务 Compose：MySQL + Redis + doc-converter + Qdrant（原 Milvus 4 服务已删除）
 services:
+  # MySQL（保留原配置，供 Spring Boot 使用）
   mysql:
     container_name: ${ST_MYSQL_CONTAINER:-smart-mysql}
     image: ${ST_MYSQL_IMAGE:-mysql:8.0}
-    #command: --default-authentication-plugin=mysql_native_password
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${ST_MYSQL_ROOT_PASSWORD:-1234}
@@ -14,9 +14,11 @@ services:
     volumes:
       - ${ST_DATA_ROOT:-/opt/smart-tender/data}/mysql:/var/lib/mysql
     networks:
-      - milvus-network
+      - qdrant-network
 
-  # Etcd 配置中心（国内镜像源可加速拉取）
+  # Redis（保留原配置，供 Spring Boot 使用）
+
+  # Etcd 配置中心（Milvus 依赖）
   etcd:
     container_name: milvus-etcd
     image: milvusdb/etcd:3.5.5-r2
@@ -38,7 +40,7 @@ services:
     networks:
       - milvus-network
 
-  # MinIO 存储服务
+  # MinIO 存储服务（Milvus 依赖）
   minio:
     container_name: milvus-minio
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
@@ -73,8 +75,6 @@ services:
       - "19530:19530"
       - "9091:9091"
     depends_on:
-            # mysql:
-            #condition: service_started
       etcd:
         condition: service_healthy
       minio:
@@ -87,9 +87,8 @@ services:
     container_name: milvus-attu
     image: zilliz/attu:v2.3.8
     ports:
-      - "3000:3000"
+      - "3002:3000"
     environment:
-      # Attu 连接的 Milvus 地址，使用 Docker 内部服务名
       MILVUS_URL: milvus-standalone:19530
       MILVUS_USERNAME: ""
       MILVUS_PASSWORD: ""
@@ -109,23 +108,57 @@ services:
     volumes:
       - ${ST_DATA_ROOT:-/opt/smart-tender/data}/redis:/data
     networks:
-      - milvus-network
+      - qdrant-network
 
-  # 文档转换服务（JODConverter + LibreOffice）
-  doc-converter:
-    container_name: doc-converter
-    image: ghcr.io/jodconverter/jodconverter-examples:rest
+  # 文档转换服务（保留原配置，JODConverter + LibreOffice）
+  # 注：ghcr.io/jodconverter 镜像国内拉取困难，暂时注释；docx 转换走 Rust 侧
+  # doc-converter 已停用期间，docx/doc 上传可依赖 Rust docx_convert_service 直接转换
+  # doc-converter:
+  #   container_name: doc-converter
+  #   image: ghcr.io/jodconverter/jodconverter-examples:rest
+  #   ports:
+  #     - "8088:8080"
+  #   environment:
+  #     SPRING_SERVLET_MULTIPART_MAX_FILE_SIZE: 50MB
+  #     SPRING_SERVLET_MULTIPART_MAX_REQUEST_SIZE: 50MB
+  #   networks:
+  #     - qdrant-network
+
+  # Qdrant 向量数据库（单进程，无需 etcd/MinIO）
+  qdrant:
+    container_name: smart-qdrant
+    image: qdrant/qdrant:v1.17.0
     ports:
-      - "8088:8080"
+      - "6333:6333"   # HTTP REST + Web Dashboard
+      - "6334:6334"   # gRPC（qdrant-client 走此端口）
+    volumes:
+      - ${ST_DATA_ROOT:-/opt/smart-tender/data}/qdrant/storage:/qdrant/storage
+    networks:
+      - qdrant-network
+
+  # Neo4j 图数据库（知识图谱存储）
+  neo4j:
+    container_name: my-neo4j
+    image: neo4j:5.21
     environment:
-      SPRING_SERVLET_MULTIPART_MAX_FILE_SIZE: 50MB
-      SPRING_SERVLET_MULTIPART_MAX_REQUEST_SIZE: 50MB
+      NEO4J_AUTH: neo4j/b1234567
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - ${ST_DATA_ROOT:-/opt/smart-tender/data}/neo4j/data:/data
+      - ${ST_DATA_ROOT:-/opt/smart-tender/data}/neo4j/logs:/logs
+      - ${ST_DATA_ROOT:-/opt/smart-tender/data}/neo4j/plugins:/plugins
     networks:
       - milvus-network
 
-# 自定义网络（避免端口冲突）
 networks:
+  qdrant-network:
+    name: qdrant-network
+    driver: bridge
   milvus-network:
     name: milvus-network
     driver: bridge
-

@@ -20,6 +20,9 @@ import java.time.LocalDateTime;
 public class Tender implements Serializable {
     @TableId(value = "id", type = IdType.AUTO)
     private Long id;
+
+    @TableField("tenant_id")
+    private Long tenantId;
     private String fileName;
     private String filePath;
     private Long fileSize;

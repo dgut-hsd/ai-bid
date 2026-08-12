@@ -33,9 +33,14 @@ export const DashboardPage: React.FC = () => {
    const { styles } = useStyles();
    const queryClient = useQueryClient();
 
-   const [queryParams, setQueryParams] = useUrlState({
+   const [queryParams, setQueryParams] = useUrlState<{
+      page: number;
+      size: number;
+      statusFilter: 'all' | 'pending' | 'passed';
+   }>({
       page: 1,
       size: 9,
+      statusFilter: 'all',
    });
 
    const [isNewProjectModalOpen, setIsNewProjectModalOpen] = useState(false);
@@ -70,6 +75,23 @@ export const DashboardPage: React.FC = () => {
 
       return { pending, passed };
    }, [listData]);
+
+   // 待审核 / 已审核 筛选（与 design.md §「列表筛选存于 URL」一致，statusFilter 进入 query）
+   const statusFilter = queryParams.statusFilter ?? 'all';
+   const filteredData = useMemo(() => {
+      if (statusFilter === 'all') return listData || [];
+      return (listData || []).filter((item) =>
+         statusFilter === 'pending' ? item.parseStatus !== 2 : item.parseStatus === 2
+      );
+   }, [listData, statusFilter]);
+
+   const handleFilterClick = (key: 'pending' | 'passed') => {
+      // 切筛选时重置到第 1 页，避免当前页超出筛选后的总页数导致空列表
+      setQueryParams({
+         statusFilter: statusFilter === key ? 'all' : key,
+         page: 1,
+      });
+   };
 
    // 新建项目的 Hook
    const { mutate: submitCreateProject, isPending: isCreating } = useMutation({
@@ -107,15 +129,33 @@ export const DashboardPage: React.FC = () => {
          <div className={styles.mainContent}>
             <div className={styles.leftColumn}>
                <div className={styles.statCardsContainer}>
-                  {Object.entries(STATUS_CONFIG).map(([key, config]) => (
-                     <DashboardStatCard
-                        key={key}
-                        label={config.label}
-                        value={stats[key] || 0}
-                        color={config.color}
-                        icon={config.icon}
-                     />
-                  ))}
+                  {Object.entries(STATUS_CONFIG).map(([key, config]) => {
+                     const active = statusFilter === key;
+                     return (
+                        <div
+                           key={key}
+                           onClick={() => handleFilterClick(key as 'pending' | 'passed')}
+                           style={{
+                              cursor: 'pointer',
+                              borderRadius: 6,
+                              border: active
+                                 ? '2px solid #52c41a'
+                                 : '2px solid transparent',
+                              boxShadow: active
+                                 ? '0 0 0 2px rgba(82,196,26,0.15)'
+                                 : undefined,
+                              transition: 'border-color 0.2s, box-shadow 0.2s',
+                           }}
+                        >
+                           <DashboardStatCard
+                              label={config.label}
+                              value={stats[key] || 0}
+                              color={config.color}
+                              icon={config.icon}
+                           />
+                        </div>
+                     );
+                  })}
                </div>
 
                <div className={styles.headerActions}>
@@ -136,9 +176,9 @@ export const DashboardPage: React.FC = () => {
                   />
                ) : (
                   <DashboardTable
-                     data={listData || []}
+                     data={filteredData}
                      loading={isListLoading && !listData}
-                     total={listData?.length || 0}
+                     total={filteredData.length}
                      currentPage={queryParams.page}
                      pageSize={queryParams.size}
                      onPageChange={handlePageChange}

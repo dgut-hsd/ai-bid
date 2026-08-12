@@ -214,7 +214,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                             CompletableFuture.runAsync(() -> {
                                 try {
                                     auditTaskMapper.advanceReviewProgress(
-                                            taskId, progress, LocalDateTime.now());
+                                            taskId, task.getTenantId(), progress, LocalDateTime.now());
                                 } catch (Exception e) {
                                     log.warn("advanceReviewProgress async failed: {}", e.getMessage());
                                 }
@@ -346,7 +346,8 @@ public class AuditEngineServiceImpl implements AuditEngineService {
         }
 
         log.info("═══ [审核 Stage 3/4] findings → SSE + DB: taskId={} ═══", task.getTaskId());
-        auditTaskMapper.advanceReviewProgress(task.getTaskId(), 70, LocalDateTime.now());
+        auditTaskMapper.advanceReviewProgress(
+                task.getTaskId(), task.getTenantId(), 70, LocalDateTime.now());
 
         List<RustRiskFinding> activeFindings = new ArrayList<>();
         // 先删除旧数据，确保恢复操作可安全重试。
@@ -388,7 +389,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
         }
 
         LocalDateTime completedAt = LocalDateTime.now();
-        auditTaskMapper.markCompleted(task.getTaskId(), completedAt);
+        auditTaskMapper.markCompleted(task.getTaskId(), task.getTenantId(), completedAt);
         task.setTaskStatus(AuditTaskStatusEnum.COMPLETED.getCode());
         task.setStage(AuditStageEnum.SUMMARY.name());
         task.setProgress(100);
@@ -479,14 +480,16 @@ public class AuditEngineServiceImpl implements AuditEngineService {
         task.setProgress(progress);
         if (task.getStartTime() == null) task.setStartTime(LocalDateTime.now());
         task.setUpdatedAt(LocalDateTime.now());
-        auditTaskMapper.updateById(task);
+        auditTaskMapper.update(task, new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getId, task.getId())
+                .eq(AuditTask::getTenantId, task.getTenantId()));
         emitSafe(task.getTaskId(), SseEventTypeEnum.PROGRESS, toStatusVO(task));
     }
 
     private void failTask(AuditTask task, String errorMsg) {
         LocalDateTime failedAt = LocalDateTime.now();
         String safeError = crop(errorMsg);
-        auditTaskMapper.markFailed(task.getTaskId(), safeError, failedAt);
+        auditTaskMapper.markFailed(task.getTaskId(), task.getTenantId(), safeError, failedAt);
         task.setTaskStatus(AuditTaskStatusEnum.FAILED.getCode());
         task.setErrorMsg(safeError);
         task.setEndTime(failedAt);

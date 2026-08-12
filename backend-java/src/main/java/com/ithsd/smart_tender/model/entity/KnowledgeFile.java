@@ -32,6 +32,9 @@ public class KnowledgeFile implements Serializable {
     @TableId(type = IdType.AUTO)
     private Long id;
 
+    @TableField("tenant_id")
+    private Long tenantId;
+
     /**
      * 文件名
      */

@@ -21,6 +21,8 @@ backend-java/replay_pid*.log
 # ── 前端 (React) ──
 frontend/node_modules
 frontend/dist
+frontend/.vite/
+coverage/
 
 # ── Rust 构建产物（根级） ──
 target/
@@ -28,6 +30,8 @@ target/
 # ── 共享 ──
 .env
 .env.*
+!.env.example
+!**/.env.example
 
 # ── 运行时产物 ──
 output/
@@ -35,8 +39,17 @@ outputs/
 tmp/
 logs/
 .pnpm-store/
+.pytest_cache/
+.mypy_cache/
+__pycache__/
+*.py[cod]
 .runtime-data/
+env/
 data/
+
+# ── Python 缓存 ──
+__pycache__/
+*.pyc
 
 # ── 日志文件 ──
 *.log
@@ -55,3 +68,6 @@ Desktop.ini
 *.swp
 *.swo
 *~
+
+# ── 本地需求与实施笔记 ──
+docs/多租户系统实施计划.md

@@ -3,6 +3,9 @@ package com.ithsd.smart_tender.service.impl;
 
 import com.ithsd.smart_tender.common.BaseContext;
 import com.ithsd.smart_tender.common.BizException;
+import com.ithsd.smart_tender.common.TenantContext;
+import com.ithsd.smart_tender.common.TenantAuthException;
+import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
 import com.ithsd.smart_tender.mapper.KnowledgeFileMapper;
@@ -48,7 +51,6 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -100,6 +102,8 @@ class AuditTaskServiceImplTest {
     // ── 测试常量 ─────────────────────────────────────────────────────
 
     private static final Long CURRENT_USER_ID = 1L;
+    private static final Long CURRENT_TENANT_ID = 20001L;
+    private static final Long ANOTHER_TENANT_ID = 20002L;
     private static final Long ANOTHER_USER_ID = 2L;
     private static final Long TENDER_UPLOADER_ID = 3L;
     private static final String TASK_ID = "task_1712345678_a1b2c3d4";
@@ -112,10 +116,19 @@ class AuditTaskServiceImplTest {
     @BeforeEach
     void setUp() {
         BaseContext.setCurrentId(CURRENT_USER_ID);
+        TenantContext.set(new TenantRequestContext(
+                CURRENT_USER_ID, CURRENT_TENANT_ID, "OWNER", 1L, "audit-task-test"));
+        lenient().when(tenderMapper.selectOne(any()))
+                .thenReturn(Tender.builder()
+                        .id(BID_ID)
+                        .tenantId(CURRENT_TENANT_ID)
+                        .uploadUserId(TENDER_UPLOADER_ID)
+                        .build());
     }
 
     @AfterEach
     void tearDown() {
+        TenantContext.clear();
         BaseContext.removeCurrentId();
     }
 
@@ -217,7 +230,7 @@ class AuditTaskServiceImplTest {
                     .id(BID_ID)
                     .uploadUserId(TENDER_UPLOADER_ID)
                     .build();
-            when(tenderMapper.selectById(BID_ID)).thenReturn(tender);
+            when(tenderMapper.selectOne(any())).thenReturn(tender);
 
             ArgumentCaptor<AuditTask> captor = ArgumentCaptor.forClass(AuditTask.class);
             when(auditTaskMapper.insert(captor.capture())).thenReturn(1);
@@ -255,6 +268,52 @@ class AuditTaskServiceImplTest {
         }
     }
 
+    @Test
+    void tenantIsolation_IgnoresClientTenantAndBlocksOtherTenantTask() {
+        TenantContext.set(new TenantRequestContext(
+                CURRENT_USER_ID, ANOTHER_TENANT_ID, "OWNER", 1L, "audit-task-test-b"));
+        Tender otherTenantTender = Tender.builder()
+                .id(BID_ID)
+                .tenantId(ANOTHER_TENANT_ID)
+                .uploadUserId(TENDER_UPLOADER_ID)
+                .build();
+        when(tenderMapper.selectOne(any())).thenReturn(otherTenantTender);
+
+        CreateAuditTaskRequest request = new CreateAuditTaskRequest();
+        request.setBidId(BID_ID);
+        request.setTenantId(CURRENT_TENANT_ID);
+
+        try (MockedStatic<TransactionSynchronizationManager> tsm =
+                     mockStatic(TransactionSynchronizationManager.class)) {
+            tsm.when(() -> TransactionSynchronizationManager.registerSynchronization(any()))
+                    .thenAnswer(invocation -> null);
+            ArgumentCaptor<AuditTask> captor = ArgumentCaptor.forClass(AuditTask.class);
+            when(auditTaskMapper.insert(captor.capture())).thenReturn(1);
+
+            auditTaskService.createTask(request);
+
+            assertEquals(ANOTHER_TENANT_ID, captor.getValue().getTenantId());
+        }
+
+        TenantContext.set(new TenantRequestContext(
+                CURRENT_USER_ID, CURRENT_TENANT_ID, "OWNER", 1L, "audit-task-test-a"));
+        when(auditTaskMapper.selectOne(any())).thenReturn(null);
+
+        TenantAuthException readError = assertThrows(TenantAuthException.class,
+                () -> auditTaskService.getStatus(TASK_ID));
+        TenantAuthException processingError = assertThrows(TenantAuthException.class,
+                () -> auditTaskService.markTaskProcessing(TASK_ID));
+        TenantAuthException failedError = assertThrows(TenantAuthException.class,
+                () -> auditTaskService.markTaskFailed(TASK_ID, "越权修改"));
+        assertEquals(404, readError.getStatus());
+        assertEquals("RESOURCE_NOT_FOUND", readError.getErrorCode());
+        assertEquals(404, processingError.getStatus());
+        assertEquals("RESOURCE_NOT_FOUND", processingError.getErrorCode());
+        assertEquals(404, failedError.getStatus());
+        assertEquals("RESOURCE_NOT_FOUND", failedError.getErrorCode());
+        verify(auditTaskMapper, never()).update(any(), any());
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // getStatus 测试
     // ═══════════════════════════════════════════════════════════════════
@@ -276,10 +335,8 @@ class AuditTaskServiceImplTest {
                 .build();
 
         when(auditTaskMapper.selectOne(any())).thenReturn(task);
-        // selectCount: 1 次 null + 3 次 wrapper
-        when(auditTaskMapper.selectCount(argThat(Objects::isNull))).thenReturn(42L);
         when(auditTaskMapper.selectCount(argThat(x -> x != null)))
-                .thenReturn(5L, 3L, 1L);
+                .thenReturn(42L, 5L, 3L, 1L);
 
         AuditTaskStatusVO vo = auditTaskService.getStatus(TASK_ID);
 
@@ -296,16 +353,16 @@ class AuditTaskServiceImplTest {
     }
 
     /**
-     * getStatus 任务不存在时抛出 404 BizException。
+     * getStatus 任务不存在时抛出 404 资源错误。
      */
     @Test
     void getStatus_shouldThrow404WhenTaskNotFound() {
         when(auditTaskMapper.selectOne(any())).thenReturn(null);
 
-        BizException ex = assertThrows(BizException.class,
+        TenantAuthException ex = assertThrows(TenantAuthException.class,
                 () -> auditTaskService.getStatus(TASK_ID));
-        assertEquals(404, ex.getCode());
-        assertEquals("任务不存在", ex.getMessage());
+        assertEquals(404, ex.getStatus());
+        assertEquals("RESOURCE_NOT_FOUND", ex.getErrorCode());
     }
 
     /**
@@ -327,7 +384,7 @@ class AuditTaskServiceImplTest {
                 .id(BID_ID)
                 .uploadUserId(ANOTHER_USER_ID)
                 .build();
-        when(tenderMapper.selectById(BID_ID)).thenReturn(tender);
+        when(tenderMapper.selectOne(any())).thenReturn(tender);
 
         BizException ex = assertThrows(BizException.class,
                 () -> auditTaskService.getStatus(TASK_ID));
@@ -354,11 +411,10 @@ class AuditTaskServiceImplTest {
                 .build();
 
         when(auditTaskMapper.selectOne(any())).thenReturn(task);
-        when(tenderMapper.selectById(BID_ID)).thenReturn(
+        when(tenderMapper.selectOne(any())).thenReturn(
                 Tender.builder().id(BID_ID).uploadUserId(TENDER_UPLOADER_ID).build());
-        when(auditTaskMapper.selectCount(argThat(Objects::isNull))).thenReturn(10L);
         when(auditTaskMapper.selectCount(argThat(x -> x != null)))
-                .thenReturn(2L, 1L, 0L);
+                .thenReturn(10L, 2L, 1L, 0L);
 
         AuditTaskStatusVO vo = auditTaskService.getStatus(TASK_ID);
 
@@ -383,9 +439,8 @@ class AuditTaskServiceImplTest {
                 .build();
 
         when(auditTaskMapper.selectOne(any())).thenReturn(task);
-        when(auditTaskMapper.selectCount(argThat(Objects::isNull))).thenReturn(5L);
         when(auditTaskMapper.selectCount(argThat(x -> x != null)))
-                .thenReturn(2L, 1L, 0L);
+                .thenReturn(5L, 2L, 1L, 0L);
 
         AuditTaskStatusVO vo = auditTaskService.getStatus(TASK_ID);
         assertEquals(TASK_ID, vo.getTaskId());
@@ -433,7 +488,7 @@ class AuditTaskServiceImplTest {
         rustResult.setResult(review);
 
         when(auditTaskMapper.selectOne(any())).thenReturn(task);
-        when(tenderMapper.selectById(BID_ID)).thenReturn(tender);
+        when(tenderMapper.selectOne(any())).thenReturn(tender);
         when(rustApiClient.getReviewResult(RUST_DOC_ID)).thenReturn(rustResult);
 
         ResultVO result = auditTaskService.getResult(TASK_ID, null, null, null);
@@ -490,7 +545,7 @@ class AuditTaskServiceImplTest {
         rustResult.setResult(review);
 
         when(auditTaskMapper.selectOne(any())).thenReturn(task);
-        when(tenderMapper.selectById(BID_ID)).thenReturn(tender);
+        when(tenderMapper.selectOne(any())).thenReturn(tender);
         when(rustApiClient.getReviewResult(RUST_DOC_ID)).thenReturn(rustResult);
 
         ResultVO result = auditTaskService.getResult(TASK_ID, null, null, null);
@@ -559,7 +614,7 @@ class AuditTaskServiceImplTest {
                 .build();
 
         when(auditTaskMapper.selectOne(any())).thenReturn(task);
-        when(tenderMapper.selectById(BID_ID)).thenReturn(tender);
+        when(tenderMapper.selectOne(any())).thenReturn(tender);
         when(rustApiClient.getReviewResult(RUST_DOC_ID))
                 .thenThrow(new RuntimeException("Rust 服务不可用"));
         when(auditIssueMapper.selectList(any())).thenReturn(List.of(issue));
@@ -603,7 +658,7 @@ class AuditTaskServiceImplTest {
                 .build();
 
         when(auditTaskMapper.selectOne(any())).thenReturn(task);
-        when(tenderMapper.selectById(BID_ID)).thenReturn(tender);
+        when(tenderMapper.selectOne(any())).thenReturn(tender);
 
         ResultVO result = auditTaskService.getResult(TASK_ID, null, null, null);
 
@@ -653,7 +708,7 @@ class AuditTaskServiceImplTest {
         rustResult.setResult(review);
 
         when(auditTaskMapper.selectOne(any())).thenReturn(task);
-        when(tenderMapper.selectById(BID_ID)).thenReturn(tender);
+        when(tenderMapper.selectOne(any())).thenReturn(tender);
         when(rustApiClient.getReviewResult(RUST_DOC_ID)).thenReturn(rustResult);
 
         ResultVO result = auditTaskService.getResult(TASK_ID, null, null, null);
@@ -689,7 +744,7 @@ class AuditTaskServiceImplTest {
         rowWednesday.put("day_date", monday.plusDays(2).format(fmt));
         rowWednesday.put("count", 5L);
 
-        when(auditTaskMapper.countByWeek(List.of(BID_ID, BID_ID_2)))
+        when(auditTaskMapper.countByWeek(anyLong(), eq(List.of(BID_ID, BID_ID_2))))
                 .thenReturn(List.of(rowMonday, rowWednesday));
 
         Map<String, Long> result = auditTaskService.countByWeek();
@@ -736,7 +791,7 @@ class AuditTaskServiceImplTest {
         assertNotNull(result);
         assertEquals(7, result.size());
         result.values().forEach(v -> assertEquals(0L, v));
-        verify(auditTaskMapper, never()).countByWeek(any());
+        verify(auditTaskMapper, never()).countByWeek(anyLong(), any());
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -766,7 +821,7 @@ class AuditTaskServiceImplTest {
         bbox.setPage(1);
 
         when(auditTaskMapper.selectOne(any())).thenReturn(task);
-        when(tenderMapper.selectById(BID_ID)).thenReturn(tender);
+        when(tenderMapper.selectOne(any())).thenReturn(tender);
         when(rustApiClient.getBlockBboxes(RUST_DOC_ID, "block-001,block-002"))
                 .thenReturn(List.of(bbox));
 
@@ -793,7 +848,7 @@ class AuditTaskServiceImplTest {
                 .build();
 
         when(auditTaskMapper.selectOne(any())).thenReturn(task);
-        when(tenderMapper.selectById(BID_ID)).thenReturn(null);
+        when(tenderMapper.selectOne(any())).thenReturn(null);
 
         List<RustBlockBBoxResponse> result =
                 auditTaskService.getBlockBboxes(TASK_ID, "block-001");
@@ -822,7 +877,7 @@ class AuditTaskServiceImplTest {
                 .build();
 
         when(auditTaskMapper.selectOne(any())).thenReturn(task);
-        when(tenderMapper.selectById(BID_ID)).thenReturn(tender);
+        when(tenderMapper.selectOne(any())).thenReturn(tender);
 
         List<RustBlockBBoxResponse> result =
                 auditTaskService.getBlockBboxes(TASK_ID, "block-001");
@@ -859,7 +914,7 @@ class AuditTaskServiceImplTest {
         auditTaskService.markTaskProcessing(TASK_ID);
 
         ArgumentCaptor<AuditTask> captor = ArgumentCaptor.forClass(AuditTask.class);
-        verify(auditTaskMapper).updateById(captor.capture());
+        verify(auditTaskMapper).update(captor.capture(), any());
 
         AuditTask updated = captor.getValue();
         assertEquals(AuditTaskStatusEnum.PROCESSING.getCode(), updated.getTaskStatus(),
@@ -889,7 +944,7 @@ class AuditTaskServiceImplTest {
 
         auditTaskService.markTaskProcessing(TASK_ID);
 
-        verify(auditTaskMapper, never()).updateById(any());
+        verify(auditTaskMapper, never()).update(any(), any());
     }
 
     /**
@@ -914,7 +969,7 @@ class AuditTaskServiceImplTest {
         auditTaskService.markTaskFailed(TASK_ID, "上传失败：文件格式不支持");
 
         ArgumentCaptor<AuditTask> captor = ArgumentCaptor.forClass(AuditTask.class);
-        verify(auditTaskMapper).updateById(captor.capture());
+        verify(auditTaskMapper).update(captor.capture(), any());
 
         AuditTask updated = captor.getValue();
         assertEquals(AuditTaskStatusEnum.FAILED.getCode(), updated.getTaskStatus(),
@@ -940,7 +995,7 @@ class AuditTaskServiceImplTest {
 
         auditTaskService.markTaskFailed(TASK_ID, "some error");
 
-        verify(auditTaskMapper, never()).updateById(any());
+        verify(auditTaskMapper, never()).update(any(), any());
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1037,9 +1092,8 @@ class AuditTaskServiceImplTest {
                 .build();
 
         when(auditTaskMapper.selectOne(any())).thenReturn(task);
-        when(auditTaskMapper.selectCount(argThat(Objects::isNull))).thenReturn(10L);
         when(auditTaskMapper.selectCount(argThat(x -> x != null)))
-                .thenReturn(3L, 2L, 0L);
+                .thenReturn(10L, 3L, 2L, 0L);
 
         var emitter = new org.springframework.web.servlet.mvc.method.annotation.SseEmitter();
         when(sseHub.subscribe(TASK_ID)).thenReturn(emitter);

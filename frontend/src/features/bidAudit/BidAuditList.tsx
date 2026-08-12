@@ -36,6 +36,17 @@ export const BidAuditList: React.FC = () => {
       error: auditListError,
    } = useQuery(auditListOptions.queryList(queryParams));
 
+   // 按上传时间倒序：刚上传的标书直接置顶，不用在列表里翻找
+   const sortedRecords = React.useMemo(() => {
+      const records = auditListData?.records;
+      if (!records || records.length === 0) return records ?? [];
+      return [...records].sort((a, b) => {
+         const ta = new Date(a.uploadTime || 0).getTime() || 0;
+         const tb = new Date(b.uploadTime || 0).getTime() || 0;
+         return tb - ta;
+      });
+   }, [auditListData]);
+
    const handleSearch = (filterValues: Partial<AuditListQueryParams>) => {
       setQueryParams({ ...filterValues, page: 1 });
    };
@@ -100,7 +111,7 @@ export const BidAuditList: React.FC = () => {
          {auditListData && (
             <AuditTable
                styles={styles}
-               data={auditListData.records}
+               data={sortedRecords}
                total={auditListData.total}
                isFetching={isAuditListFetching}
                page={queryParams.page}

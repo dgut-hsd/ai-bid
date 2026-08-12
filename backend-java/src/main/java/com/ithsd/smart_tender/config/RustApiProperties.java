@@ -30,6 +30,9 @@ public class RustApiProperties {
     /** 招标文件云端审核前脱敏模式。当前生产默认 low，可显式设为 off。 */
     private String desensitizationMode = "low";
 
+    /** Java → Rust 内部请求签名密钥；未配置时内部请求必须拒绝发送。 */
+    private String internalSecret;
+
     // ── getters / setters ──────────────────────────────────────────
 
     public String getBaseUrl() {
@@ -78,6 +81,14 @@ public class RustApiProperties {
 
     public void setDesensitizationMode(String desensitizationMode) {
         this.desensitizationMode = desensitizationMode;
+    }
+
+    public String getInternalSecret() {
+        return internalSecret;
+    }
+
+    public void setInternalSecret(String internalSecret) {
+        this.internalSecret = internalSecret;
     }
 
     // ── 派生方法 ──────────────────────────────────────────────────
