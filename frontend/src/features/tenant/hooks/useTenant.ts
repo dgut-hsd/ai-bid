@@ -1,88 +1,94 @@
 /**
- * 租户管理 Hook
+ * Tenant list and session switching.
  *
- * 封装租户列表拉取 + 切换租户逻辑。
- * 切租户流程（飞书交接文档）：调 switch-tenant → 拿新 AuthSession →
- * dispatch switchTenant（清旧缓存+写新会话）→ 刷新页面（断 SSE+清 React 状态）。
+ * A successful switch replaces the complete auth session before clearing all
+ * React Query state. The subsequent reload is intentional: it closes any
+ * active SSE readers that belong to the old token/session.
  */
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useEffect } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useDispatch, useSelector } from 'react-redux';
 import { App } from 'antd';
 import { tenantApi } from '../api/tenant';
-import { switchTenant as switchTenantAction, setTenantList } from '@/store/slices/authSlice';
+import {
+  setAuthSession,
+  setCurrentTenantId,
+  setTenantList,
+} from '@/store/slices/authSlice';
 import type { RootState } from '@/store';
 import type { SwitchTenantParams } from '../types';
+
+function errorMessage(error: unknown, fallback: string): string {
+  if (typeof error === 'object' && error !== null) {
+    const record = error as {
+      response?: { data?: { msg?: string } };
+      message?: string;
+    };
+    return record.response?.data?.msg || record.message || fallback;
+  }
+  return fallback;
+}
 
 export const useTenant = () => {
   const dispatch = useDispatch();
   const queryClient = useQueryClient();
   const { message } = App.useApp();
-  const { currentTenantId, tenantList, isAuthenticated } = useSelector(
+  const { currentTenantId, tenantList, isAuthenticated, token } = useSelector(
     (state: RootState) => state.auth
   );
 
-  // ── 拉取租户列表 ──────────────────────────────────────────────────
   const tenantsQuery = useQuery({
-    queryKey: ['tenants'],
+    queryKey: ['tenants', token],
     queryFn: async () => {
-      const resp = await tenantApi.getTenants();
-      if (resp.code === 200 && resp.data) {
-        dispatch(setTenantList(resp.data.items));
-        return resp.data;
+      const response = await tenantApi.getTenants();
+      if (response.code === 200 && response.data) {
+        return response.data;
       }
-      throw new Error(resp.msg || '获取租户列表失败');
+      throw new Error(response.msg || '获取租户列表失败');
     },
-    enabled: isAuthenticated,
-    staleTime: 5 * 60 * 1000, // 5 分钟不重复拉
+    enabled: isAuthenticated && Boolean(token),
+    staleTime: 5 * 60 * 1000,
   });
 
-  // ── 切换租户 ──────────────────────────────────────────────────────
+  // Keep server list synchronization in the observer lifecycle. A tenant
+  // switch clears this query; an in-flight old response must not dispatch its
+  // previous current_tenant_id back into the new session.
+  useEffect(() => {
+    if (!tenantsQuery.data) return;
+    dispatch(setTenantList(tenantsQuery.data.items));
+    dispatch(setCurrentTenantId(tenantsQuery.data.current_tenant_id));
+  }, [dispatch, tenantsQuery.data]);
+
   const switchMutation = useMutation({
     mutationFn: (params: SwitchTenantParams) => tenantApi.switchTenant(params),
-    onSuccess: (resp) => {
-      if (resp.code === 200 && resp.data) {
-        const session = resp.data;
-
-        // 真实模式：dispatch switchTenant（清旧缓存+写新会话）→ 刷新页面断 SSE
-        dispatch(
-          switchTenantAction({
-            token: session.token,
-            refreshToken: session.refresh_token,
-            tenantId: session.tenant_id,
-            userInfo: {
-              // 保留 user_id 原值，避免 UUID 经 Number() 变成 0
-              id: session.user_id,
-              username: session.username,
-              realName: session.real_name || session.username,
-            },
-          })
-        );
+    onSuccess: (response) => {
+      if (response.code === 200 && response.data) {
+        dispatch(setAuthSession({ session: response.data }));
+        // Clear every cached query because existing keys may not all encode
+        // tenant identity. This also removes stale dashboard/SSE snapshots.
         queryClient.clear();
         message.success('租户切换成功，正在刷新…');
-        setTimeout(() => {
+        window.setTimeout(() => {
           window.location.reload();
         }, 500);
       } else {
-        message.error(resp.msg || '租户切换失败');
+        message.error(response.msg || '租户切换失败');
       }
     },
-    onError: (error: any) => {
-      const errMsg =
-        error?.response?.data?.msg || error?.message || '租户切换失败';
-      message.error(errMsg);
+    onError: (error: unknown) => {
+      message.error(errorMessage(error, '租户切换失败'));
     },
   });
 
-  // ── 当前租户名（从列表里找，避免额外请求） ────────────────────────
   const currentTenant =
-    tenantList.find((t) => t.tenant_id === currentTenantId) ||
-    tenantsQuery.data?.items.find((t) => t.tenant_id === currentTenantId);
+    tenantList.find((tenant) => tenant.tenant_id === currentTenantId) ||
+    tenantsQuery.data?.items.find((tenant) => tenant.tenant_id === currentTenantId);
 
   return {
     tenantList,
     currentTenant,
     currentTenantId,
-    isLoading: tenantsQuery.isLoading,
+    isLoading: tenantsQuery.isLoading && tenantList.length === 0,
     isSwitching: switchMutation.isPending,
     switchTenant: (tenantId: string) =>
       switchMutation.mutate({ tenant_id: tenantId }),

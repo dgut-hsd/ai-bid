@@ -239,6 +239,7 @@ export const useAuditTask = (bidId?: number) => {
       if (!taskId || isComplete || !hydrated || !shouldConnectStream) return;
 
       let isMounted = true;
+      const controller = new AbortController(); // 卸载时 abort SSE，避免后台重连泄漏
 
       const lastEventId = (
          (typeof window !== 'undefined'
@@ -378,11 +379,13 @@ export const useAuditTask = (bidId?: number) => {
             if (!isMounted) return;
             console.error('[AuditTask] SSE 异常:', err);
             setError('实时数据连接中断，请刷新页面');
-         }
+         },
+         controller.signal
       );
 
       return () => {
          isMounted = false;
+         controller.abort(); // 组件卸载 → 立即终止 SSE 连接与重连循环
       };
    }, [taskId, isComplete, hydrated, shouldConnectStream]);
 

@@ -73,10 +73,14 @@ export const connectStream = async (
    lastEventId: string,
    onMessage: (type: SseEventType, data: unknown) => void,
    onComplete: () => void,
-   onError: (err: Error) => void
+   onError: (err: Error) => void,
+   signal?: AbortSignal
 ) => {
    // ── 单次 SSE 连接（由外层重试循环调用） ───────────────────
    const doConnect = async (): Promise<boolean> => {
+      // 主动取消：组件卸载后不再发起连接
+      if (signal?.aborted) return true;
+
       // 每次重连从 localStorage 读最新 lastEventId（前一次连接可能已写入了更新的 id）
       let currentLastId = lastEventId;
       try {
@@ -95,6 +99,7 @@ export const connectStream = async (
             'Last-Event-ID': currentLastId,
             Accept: 'text/event-stream',
          },
+         signal, // 组件卸载时 abort，立即终止底层连接
       });
 
       if (!response.ok) throw new Error(`SSE 连接失败: ${response.status}`);
@@ -167,18 +172,23 @@ export const connectStream = async (
             }
          }
       }
-      // read() done: true 但未收到 complete 事件 — 视为正常结束
-      onComplete();
-      return true;
+
+      // read() 返回 done（流关闭）但未收到 complete 事件 ——
+      // 视为连接断开（网络中断 / 服务端提前关闭），交由外层重试循环重连；
+      // 注意：不要误调用 onComplete()，否则会把"未完成"错误地标记为"审计完成"。
+      if (signal?.aborted) return true;
+      throw new Error('SSE 流结束但未收到 complete 事件，尝试重连');
    };
 
    // ── 重试循环（指数退避，最多 5 次） ──────────────────────
    let retries = 0;
    while (retries <= SSE_MAX_RETRIES) {
+      if (signal?.aborted) return; // 已取消，停止重试
       try {
          const normalEnd = await doConnect();
-         if (normalEnd) return; // 正常结束，停止重试
+         if (normalEnd) return; // 正常结束（或已取消），停止重试
       } catch (error) {
+         if (signal?.aborted) return; // 取消导致的异常，忽略
          retries++;
          if (retries > SSE_MAX_RETRIES) {
             onError(error as Error);

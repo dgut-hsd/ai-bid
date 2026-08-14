@@ -6,7 +6,13 @@
  */
 import request from '@/api/request';
 import type { BaseResponse } from '@/api/types';
+import {
+  normalizeAuthResponse,
+  normalizeResponse,
+  normalizeTenantListResponse,
+} from '@/features/login/api/session';
 import type {
+  ApiResponse,
   AuthSession,
   TenantListResponse,
   TenantSummary,
@@ -19,8 +25,12 @@ export const tenantApi = {
   // ─── 认证相关 ──────────────────────────────────────────────────────
 
   /** 切换租户 — 切完整体替换登录会话，旧 token 失效 */
-  switchTenant: (data: SwitchTenantParams): Promise<BaseResponse<AuthSession>> => {
-    return request.post('/api/auth/switch-tenant', data);
+  switchTenant: async (data: SwitchTenantParams): Promise<ApiResponse<AuthSession>> => {
+    const response = await request.post<unknown, BaseResponse<unknown>>(
+      '/api/auth/switch-tenant',
+      data
+    );
+    return normalizeAuthResponse(response);
   },
 
   /** 刷新令牌 — Bearer，无请求体，返回新 AuthSession */
@@ -31,8 +41,9 @@ export const tenantApi = {
   // ─── 租户管理 ──────────────────────────────────────────────────────
 
   /** 获取租户列表（含 current_tenant_id） */
-  getTenants: (): Promise<BaseResponse<TenantListResponse>> => {
-    return request.get('/api/tenants');
+  getTenants: async (): Promise<ApiResponse<TenantListResponse>> => {
+    const response = await request.get<unknown, BaseResponse<unknown>>('/api/tenants');
+    return normalizeResponse(response, normalizeTenantListResponse);
   },
 
   /** 创建租户 */
