@@ -1,9 +1,0 @@
-{
-  "total_clauses": 3,
-  "agent_clause_counts": {
-    "FactCheckAgent": 3
-  },
-  "high_risk_count": 0,
-  "legal_verify_count": 0,
-  "blind_spot_findings": 6
-}

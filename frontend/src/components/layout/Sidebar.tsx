@@ -5,6 +5,7 @@ import {
    LayoutDashboard,
    FileSearch,
    BookOpen,
+   Building2,
 } from 'lucide-react';
 
 import { useSidebarStyle } from './style';
@@ -16,6 +17,7 @@ const NAV_ITEMS = [
    { key: '/dashboard', icon: <LayoutDashboard size={18} />, label: '工作台' },
    { key: '/bidReview', icon: <FileSearch size={18} />, label: '审核列表' },
    { key: '/library', icon: <BookOpen size={18} />, label: '标准库管理' },
+   { key: '/tenant-manage', icon: <Building2 size={18} />, label: '租户管理' },
 ];
 
 export const Sidebar: React.FC<{ collapsed: boolean }> = ({ collapsed }) => {
@@ -28,6 +30,9 @@ export const Sidebar: React.FC<{ collapsed: boolean }> = ({ collapsed }) => {
 
       if (pathname.startsWith('/bidReview')) {
          return ['/bidReview'];
+      }
+      if (pathname.startsWith('/tenant-manage')) {
+         return ['/tenant-manage'];
       }
       return [pathname];
    };

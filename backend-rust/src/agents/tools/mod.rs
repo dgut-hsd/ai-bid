@@ -19,9 +19,23 @@
 //! - [`search_contradiction`] — 矛盾检测（隐性升级/悬空引用/数据矛盾/逻辑冲突）
 //! - [`extract_obligations`] — 投标人义务聚合（发现分散排斥）
 //!
-//! ### V2+（待实现）
-//! - `compare_versions` — 标书版本 Diff
-//! - `detect_boilerplate` — 模板残骸识别
+//! ## V2+（已实现）
+//! - [`compare_versions`] — 标书版本 Diff（LCS 文本差异 + 高风险变更标记）
+//! - [`detect_boilerplate`] — 模板残骸识别（悬空引用 + 异常实体 + 多余章节）
+//!
+//! ## V3 合规审查（4 个 — 已实现）
+//! - [`verify_procurement_method`] — 采购方式适用条件校验（法定门槛表 + 合规判定）
+//! - [`verify_bid_deposit`] — 保证金合规校验（投标/履约保证金比例 + 上限 + 形式 + 退还时限）
+//! - [`verify_announcement_period`] — 公告期限校验（等标期 + 文件发售期 + 日期差计算）
+//! - [`verify_bid_preparation_period`] — 投标准备期校验（投诉第一高发事由 + 风险等级评估）
+//!
+//! ## V4 评审标准审查（4 个 — 本次新增）
+//! - [`validate_scoring_formula`] — 价格分公式校验（权重 + 公式类型 + 基准价操纵风险）
+//! - [`validate_weight_distribution`] — 权重分配合规检查（求和验证 + 价格分范围 + 缺失维度）
+//! - [`detect_subjective_scoring`] — 主观评分检测（关键词 + 区间跨度 + 量化细则）
+//! - [`check_scoring_completeness`] — 评分标准完整性检查（分值闭合 + 维度完整 + 细则覆盖率）
+//! - [`check_imported_products`] — 进口产品管理检查（关键词检测 + 进口审批 + 标准引用区分）
+//! - [`verify_consortium_rules`] — 联合体投标规则检查（允许性 + 资质叠加 + 牵头方 + 协议 + 矛盾检测）
 //!
 //! ## 架构
 //!
@@ -34,9 +48,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod answer_user;
+pub mod bid_evaluation_test;
 pub mod calculate_timeline;
 pub mod check_cross_reference;
+pub mod compare_versions;
 pub mod compare_with_template;
+pub mod detect_boilerplate;
 pub mod extract_obligations;
 pub mod output_finding;
 pub mod output_verification_batch;
@@ -45,6 +62,16 @@ pub mod search_contradiction;
 pub mod search_document;
 pub mod search_knowledge;
 pub mod validate_calculation;
+pub mod verify_announcement_period;
+pub mod verify_bid_deposit;
+pub mod verify_bid_preparation_period;
+pub mod verify_procurement_method;
+pub mod check_imported_products;
+pub mod check_scoring_completeness;
+pub mod detect_subjective_scoring;
+pub mod validate_scoring_formula;
+pub mod validate_weight_distribution;
+pub mod verify_consortium_rules;
 
 // ─── AgentTool trait ──────────────────────────────────────────
 
@@ -90,7 +117,11 @@ impl ToolRegistry {
     /// 注册一个工具。
     pub fn register(&mut self, tool: Box<dyn AgentTool>) {
         let name = tool.name().to_string();
-        self.tools.insert(name, tool);
+        eprintln!("  [ToolRegistry] register: {} ", name);
+        let replaced = self.tools.insert(name.clone(), tool).is_some();
+        if replaced {
+            eprintln!("  [ToolRegistry] !! 覆盖已存在的工具: {}", name);
+        }
     }
 
     /// 为所有工具增加统一的预算与单次调用超时控制。
@@ -116,12 +147,37 @@ impl ToolRegistry {
 
     /// 获取所有工具的 definitions（发送给 LLM）。
     pub fn definitions(&self) -> Vec<serde_json::Value> {
-        self.tools.values().map(|t| t.definition()).collect()
+        let defs = self.tools.values().map(|t| t.definition()).collect();
+        eprintln!(
+            "  [ToolRegistry] definitions: 共 {} 个工具",
+            self.tools.len()
+        );
+        defs
     }
 
     /// 获取指定名称列表的 tools definitions（按 AgentDefinition.tool_names 过滤）。
     /// 未在 tool_names 中列出的工具不会暴露给 LLM。
     pub fn definitions_filtered(&self, tool_names: &[String]) -> Vec<serde_json::Value> {
+        let granted: Vec<&String> = tool_names
+            .iter()
+            .filter(|n| self.tools.contains_key(*n))
+            .collect();
+        let missing: Vec<&String> = tool_names
+            .iter()
+            .filter(|n| !self.tools.contains_key(*n))
+            .collect();
+        if !missing.is_empty() {
+            eprintln!(
+                "  [ToolRegistry] ⚠ Agent 申请的工具未注册: {:?}",
+                missing
+            );
+        }
+        eprintln!(
+            "  [ToolRegistry] definitions_filtered: Agent 申请 {} 个 → 实际下发 {} 个: {:?}",
+            tool_names.len(),
+            granted.len(),
+            granted
+        );
         self.tools
             .iter()
             .filter(|(name, _)| tool_names.contains(name))
@@ -131,12 +187,28 @@ impl ToolRegistry {
 
     /// 获取指定名称的工具引用。
     pub fn get(&self, name: &str) -> Option<&dyn AgentTool> {
-        self.tools.get(name).map(|t| t.as_ref())
+        let tool = self.tools.get(name).map(|t| t.as_ref());
+        if tool.is_some() {
+            eprintln!("  [ToolRegistry] get: {} → 命中", name);
+        } else {
+            eprintln!("  [ToolRegistry] get: {} → 未注册!", name);
+        }
+        tool
     }
 
     /// 检查工具是否存在。
     pub fn contains(&self, name: &str) -> bool {
         self.tools.contains_key(name)
+    }
+
+    /// 已注册工具数量。
+    pub fn len(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// 是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
     }
 
     /// 只保留指定名称的工具，删除其余。

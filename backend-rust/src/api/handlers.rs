@@ -30,6 +30,29 @@ use crate::agents::tools::{
     read_section::ReadSectionTool,
     search_document::SearchDocumentTool,
     search_knowledge::{DashScopeSearchBackend, SearchKnowledgeTool},
+    // V2+ 工具
+    compare_versions::CompareVersionsTool,
+    detect_boilerplate::DetectBoilerplateTool,
+    // V3 采购程序合规审查
+    verify_procurement_method::VerifyProcurementMethodTool,
+    verify_bid_deposit::VerifyBidDepositTool,
+    verify_announcement_period::VerifyAnnouncementPeriodTool,
+    verify_bid_preparation_period::VerifyBidPreparationPeriodTool,
+    // V4 评审标准审查
+    validate_scoring_formula::ValidateScoringFormulaTool,
+    validate_weight_distribution::ValidateWeightDistributionTool,
+    detect_subjective_scoring::DetectSubjectiveScoringTool,
+    check_scoring_completeness::CheckScoringCompletenessTool,
+    check_imported_products::CheckImportedProductsTool,
+    verify_consortium_rules::VerifyConsortiumRulesTool,
+    // 零依赖计算/检查工具
+    calculate_timeline::CalculateTimelineTool,
+    // 依赖 chunk 数据的工具
+    check_cross_reference::CheckCrossReferenceTool,
+    extract_obligations::ExtractObligationsTool,
+    compare_with_template::{CompareWithTemplateTool, ChunkTextProvider, TemplateStore},
+    validate_calculation::ValidateCalculationTool,
+    search_contradiction::SearchContradictionTool,
 };
 use crate::agents::trace::TraceLog;
 use crate::agents::types::{
@@ -60,6 +83,17 @@ fn review_event_capacity() -> usize {
 }
 use crate::services::sectionize_service::{self, Section};
 
+/// Authenticated Java → Rust request identity made available to handlers via
+/// request extensions by the internal API middleware.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalRequestContext {
+    pub tenant_id: String,
+    pub user_id: String,
+    pub request_id: String,
+    pub timestamp: i64,
+    pub body_sha256: String,
+}
+
 // ─── 应用状态 ───────────────────────────────────────────────────────
 
 /// 服务全局共享状态。
@@ -81,6 +115,8 @@ pub struct AppState {
     pub review_event_buses: Arc<TokioMutex<HashMap<String, Arc<ReviewEventBus>>>>,
     /// 异步审查结果缓存：doc_id → CoordinatorOutput
     pub review_results: Arc<TokioMutex<HashMap<String, CoordinatorOutput>>>,
+    /// 异步审查的 token/成本统计：doc_id → ReviewUsage
+    pub review_usages: Arc<TokioMutex<HashMap<String, ReviewUsage>>>,
     /// 异步审查失败信息：doc_id → 错误消息
     pub review_errors: Arc<TokioMutex<HashMap<String, String>>>,
     /// 正在执行的审核任务：doc_id（用于并发控制，防止重复提交）
@@ -137,6 +173,7 @@ impl AppState {
             embed_engine,
             review_event_buses: Arc::new(TokioMutex::new(HashMap::new())),
             review_results: Arc::new(TokioMutex::new(HashMap::new())),
+            review_usages: Arc::new(TokioMutex::new(HashMap::new())),
             review_errors: Arc::new(TokioMutex::new(HashMap::new())),
             active_reviews: Arc::new(TokioMutex::new(HashSet::new())),
         })
@@ -226,6 +263,19 @@ pub struct ReviewResponse {
     pub graph_snapshot: Option<crate::agents::types::GraphSnapshot>,
 }
 
+/// 单份文档一次审核的 LLM 消耗与成本估算（benchmark / 前端统计用）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReviewUsage {
+    /// LLM 调用次数（该文档整次审核聚合）
+    pub llm_calls: usize,
+    /// 输入 token 总数（该文档整次审核聚合）
+    pub tokens_input: u64,
+    /// 输出 token 总数（该文档整次审核聚合）
+    pub tokens_output: u64,
+    /// 估算成本（CNY，按当前模型单价）
+    pub cost_cny: f64,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ReviewResultResponse {
     pub status: String,
@@ -233,6 +283,9 @@ pub struct ReviewResultResponse {
     pub result: Option<ReviewResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 该文档审核的 LLM token 消耗与成本估算（审核成功后提供）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ReviewUsage>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -875,6 +928,7 @@ async fn run_review_pipeline(
     let ec_for_tools = embed_client_for_tools.clone();
 
     let tools_factory = Arc::new(move || {
+        eprintln!("[handlers] ── 创建 Agent 工具集 ToolRegistry ──");
         let mut registry = ToolRegistry::new();
         if let Some(ref ec) = ec_for_tools {
             registry.register(Box::new(SearchDocumentTool::new(
@@ -892,6 +946,58 @@ async fn run_review_pipeline(
             registry.register(Box::new(SearchKnowledgeTool::with_dashscope(ds.clone())));
         }
         registry.register(Box::new(OutputFindingTool));
+        // V2+ 工具
+        registry.register(Box::new(CompareVersionsTool::new(
+            chunk_map_for_tools.clone(),
+            chunk_order_for_tools.clone(),
+        )));
+        registry.register(Box::new(DetectBoilerplateTool::new(
+            chunk_map_for_tools.clone(),
+            chunk_order_for_tools.clone(),
+        )));
+        // V3 采购程序合规审查
+        registry.register(Box::new(VerifyProcurementMethodTool));
+        registry.register(Box::new(VerifyBidDepositTool));
+        registry.register(Box::new(VerifyAnnouncementPeriodTool));
+        registry.register(Box::new(VerifyBidPreparationPeriodTool));
+        // V4 评审标准审查
+        registry.register(Box::new(ValidateScoringFormulaTool));
+        registry.register(Box::new(ValidateWeightDistributionTool));
+        registry.register(Box::new(DetectSubjectiveScoringTool));
+        registry.register(Box::new(CheckScoringCompletenessTool));
+        registry.register(Box::new(CheckImportedProductsTool));
+        registry.register(Box::new(VerifyConsortiumRulesTool));
+        // 零依赖计算工具
+        registry.register(Box::new(CalculateTimelineTool));
+        // 依赖 chunk 数据的工具
+        registry.register(Box::new(CheckCrossReferenceTool::new(
+            chunk_map_for_tools.clone(),
+            chunk_order_for_tools.clone(),
+        )));
+        registry.register(Box::new(ExtractObligationsTool::new(
+            chunk_map_for_tools.clone(),
+            chunk_order_for_tools.clone(),
+        )));
+        // 模板比对（需要 ChunkTextProvider）
+        let template_text_provider = Arc::new(ChunkTextProvider {
+            chunks: chunk_map_for_tools.clone(),
+        });
+        registry.register(Box::new(CompareWithTemplateTool::new(
+            Arc::new(TemplateStore::with_builtin_templates()),
+            template_text_provider,
+        )));
+        // 数值计算校验
+        registry.register(Box::new(ValidateCalculationTool));
+        // 矛盾检测
+        registry.register(Box::new(SearchContradictionTool::new(
+            chunk_map_for_tools.clone(),
+            chunk_order_for_tools.clone(),
+            None,
+        )));
+        eprintln!(
+            "[handlers] ── 工具集注册完成: 共 {} 个工具 ──",
+            registry.len()
+        );
         registry
     });
 
@@ -947,7 +1053,43 @@ async fn run_review_pipeline(
                     finding.page_number = Some(chunk.page_start + 1);
                     finding.section_path = Some(chunk.section_path.clone());
                     finding.context = Some(chunk.text.chars().take(500).collect());
-                    finding.block_ids = chunk.source_block_ids.clone();
+
+                    // 过滤 block_ids：只保留验证过的非占位 bbox 的 block，
+                    // 避免整页高亮导致"框太大"问题。
+                    // 占位 bbox 来自 blocks_from_text()（lopdf 失败降级路径），
+                    // 特征是 x0==0.0 && x1==400.0 且高度 ≤20pt。
+                    let source_quote = finding.source_quote.clone();
+                    let valid_blocks: Vec<String> = chunk
+                        .source_block_ids
+                        .iter()
+                        .filter(|bid| {
+                            chunk.bbox_refs.iter().any(|r| {
+                                let is_same = &r.block_id == *bid;
+                                let is_placeholder =
+                                    r.bbox.x0 == 0.0 && r.bbox.x1 == 400.0
+                                        && (r.bbox.bottom - r.bbox.top) <= 20.1;
+                                is_same && !is_placeholder
+                            })
+                        })
+                        .cloned()
+                        .collect();
+
+                    // 如果经过滤后为空（全是占位 bbox），则不退化为文本匹配，
+                    // 保持空数组让前端走文本高亮路径。
+                    // 如果仍有过多有效 block（如大 section），取最多前 5 个。
+                    let max_blocks = 5usize;
+                    finding.block_ids = if valid_blocks.len() > max_blocks {
+                        // 优选与 source_quote 文本相关的 block
+                        let truncated: Vec<String> = valid_blocks
+                            .into_iter()
+                            .take(max_blocks)
+                            .collect();
+                        truncated
+                    } else {
+                        valid_blocks
+                    };
+
+                    let _ = source_quote; // 预留后续按文本相关性排序
                 }
             }
             let findings_with_blocks = output
@@ -1000,36 +1142,8 @@ async fn run_review_pipeline(
                 }
             }
 
-            // 存入 review_results 供 GET /result 查询
-            {
-                let mut results = state.review_results.lock().await;
-                results.insert(doc_id.clone(), output.clone());
-            }
-
-            // 写盘: {doc_id}_result.json — 重启后磁盘 fallback
-            {
-                let dir = data_path_str("output/findings");
-                let _ = std::fs::create_dir_all(&dir);
-                let result_path = format!("{}/{}_result.json", dir, doc_id);
-                let persisted = ReviewResultResponse {
-                    status: result_status.clone(),
-                    result: Some(ReviewResponse {
-                        document_id: doc_id.clone(),
-                        findings: output.findings.clone(),
-                        routing_summary: output.routing_summary.clone(),
-                        execution_summary: output.execution_summary.clone(),
-                        graph_snapshot: output.graph_snapshot.clone(),
-                    }),
-                    error: None,
-                };
-                if let Ok(json) = serde_json::to_string_pretty(&persisted) {
-                    let _ = std::fs::write(&result_path, json);
-                    println!("[DISK] result → {}", result_path);
-                }
-            }
-
-            // ── 指标：写盘 ──
-            {
+            // ── 指标：finalize（拿到 token/成本 totals，构造 usage）──
+            let usage = {
                 let mut collector = metrics.lock().await;
                 collector.set_findings_detail(&output.findings);
                 collector.record_stage(
@@ -1074,6 +1188,45 @@ async fn run_review_pipeline(
                 if let Ok(json) = serde_json::to_string_pretty(&run_metrics) {
                     let _ = std::fs::write(&run_path, json);
                     println!("[METRICS] → {}", run_path);
+                }
+
+                let totals = &run_metrics.llm_efficiency.totals;
+                ReviewUsage {
+                    llm_calls: totals.llm_calls,
+                    tokens_input: totals.tokens_input,
+                    tokens_output: totals.tokens_output,
+                    cost_cny: totals.cost_cny,
+                }
+            };
+
+            // 存入 review_results + review_usages 供 GET /result 查询
+            {
+                let mut results = state.review_results.lock().await;
+                results.insert(doc_id.clone(), output.clone());
+                let mut usages = state.review_usages.lock().await;
+                usages.insert(doc_id.clone(), usage.clone());
+            }
+
+            // 写盘: {doc_id}_result.json — 重启后磁盘 fallback（含 usage）
+            {
+                let dir = data_path_str("output/findings");
+                let _ = std::fs::create_dir_all(&dir);
+                let result_path = format!("{}/{}_result.json", dir, doc_id);
+                let persisted = ReviewResultResponse {
+                    status: result_status.clone(),
+                    result: Some(ReviewResponse {
+                        document_id: doc_id.clone(),
+                        findings: output.findings.clone(),
+                        routing_summary: output.routing_summary.clone(),
+                        execution_summary: output.execution_summary.clone(),
+                        graph_snapshot: output.graph_snapshot.clone(),
+                    }),
+                    usage: Some(usage.clone()),
+                    error: None,
+                };
+                if let Ok(json) = serde_json::to_string_pretty(&persisted) {
+                    let _ = std::fs::write(&result_path, json);
+                    println!("[DISK] result → {}", result_path);
                 }
             }
 
@@ -1248,6 +1401,7 @@ pub async fn get_review_result(
     {
         let results = state.review_results.lock().await;
         if let Some(output) = results.get(&doc_id) {
+            let usage = state.review_usages.lock().await.get(&doc_id).cloned();
             return Ok(Json(ReviewResultResponse {
                 status: output.execution_summary.status.as_str().to_string(),
                 result: Some(ReviewResponse {
@@ -1257,6 +1411,7 @@ pub async fn get_review_result(
                     execution_summary: output.execution_summary.clone(),
                     graph_snapshot: output.graph_snapshot.clone(),
                 }),
+                usage,
                 error: None,
             }));
         }
@@ -1269,6 +1424,7 @@ pub async fn get_review_result(
             return Ok(Json(ReviewResultResponse {
                 status: "failed".to_string(),
                 result: None,
+                usage: None,
                 error: Some(msg.clone()),
             }));
         }
@@ -1281,6 +1437,7 @@ pub async fn get_review_result(
             return Ok(Json(ReviewResultResponse {
                 status: "pending".to_string(),
                 result: None,
+                usage: None,
                 error: None,
             }));
         }
@@ -1336,6 +1493,7 @@ pub async fn chat_with_document(
     };
 
     let mut chat_tools = ToolRegistry::new();
+    eprintln!("[handlers] ── 创建 ChatAgent 对话工具集 ──");
     if let Some(ref ec) = embed_client {
         chat_tools.register(Box::new(SearchDocumentTool::new(
             doc.doc_index.clone(),
@@ -1350,6 +1508,10 @@ pub async fn chat_with_document(
         chat_tools.register(Box::new(SearchKnowledgeTool::with_dashscope(ds.clone())));
     }
     chat_tools.register(Box::new(AnswerUserTool));
+    eprintln!(
+        "[handlers] ── ChatAgent 工具集注册完成: 共 {} 个工具 ──",
+        chat_tools.len()
+    );
 
     let chat_config = ChatAgentConfig::default();
     let chat_agent = ChatAgent::new(
@@ -1450,6 +1612,7 @@ pub async fn chat_with_document_stream(
         };
 
         let mut chat_tools = ToolRegistry::new();
+        eprintln!("[handlers] ── 创建 ChatAgent 对话工具集 (stream) ──");
         if let Some(ref ec) = embed_client {
             chat_tools.register(Box::new(SearchDocumentTool::new(
                 doc.doc_index.clone(),
@@ -1464,6 +1627,10 @@ pub async fn chat_with_document_stream(
             chat_tools.register(Box::new(SearchKnowledgeTool::with_dashscope(ds.clone())));
         }
         chat_tools.register(Box::new(AnswerUserTool));
+        eprintln!(
+            "[handlers] ── ChatAgent 工具集注册完成 (stream): 共 {} 个工具 ──",
+            chat_tools.len()
+        );
 
         let chat_config = ChatAgentConfig::default();
         let chat_agent = match ChatAgent::new(
@@ -2174,6 +2341,7 @@ mod tests {
             embed_engine: "remote".to_string(),
             review_event_buses: Arc::new(TokioMutex::new(HashMap::new())),
             review_results: Arc::new(TokioMutex::new(HashMap::new())),
+            review_usages: Arc::new(TokioMutex::new(HashMap::new())),
             review_errors: Arc::new(TokioMutex::new(HashMap::new())),
             active_reviews: Arc::new(TokioMutex::new(HashSet::new())),
         };

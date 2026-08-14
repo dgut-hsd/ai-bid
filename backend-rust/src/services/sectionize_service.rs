@@ -24,9 +24,10 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use crate::domain::raw_document::{BBox, BlockType, RawDocument, RawTable};
+use crate::domain::raw_document::{BlockType, RawDocument, RawPage, RawTable};
 #[cfg(test)]
 use crate::paths::data_path_str;
 
@@ -1521,97 +1522,339 @@ pub fn detect_pipe_tables(raw_doc: &mut RawDocument) -> usize {
     total_detected
 }
 
-// ─── 跨页表格合并 ─────────────────────────────────────────────
+// ─── 跨页表格合并（状态机 + 多维度签名匹配）───────────────────
 
-/// 合并跨页断裂的表格。
+/// 合并阈值：签名匹配得分 ≥ 此值即视为同一表格。
+const MERGE_THRESHOLD: f64 = 0.45;
+
+/// 表头剥离阈值：源表首行与锚点表头的相似度 ≥ 此值时剥离重复表头。
+const HEADER_STRIP_THRESHOLD: f64 = 0.70;
+
+/// 最大容忍间隙页数：超过此值链条终止。
+const MAX_GAP: u32 = 2;
+
+/// 签名各维度权重（之和为 1.0）。
+const COL_COUNT_WEIGHT: f64 = 0.40;
+const HEADER_WEIGHT: f64 = 0.35;
+const NUMERIC_WEIGHT: f64 = 0.15;
+const CELL_LEN_WEIGHT: f64 = 0.10;
+
+/// 表格结构签名，用于跨页匹配时判断两张表是否属于同一逻辑表格。
+struct TableSignature {
+    col_count: usize,
+    /// 首行每列归一化后的文本（trim + 小写）。
+    header_fingerprint: Vec<String>,
+    /// 每列是否主要为数值（>50% 非空单元格含数字）。
+    numeric_cols: Vec<bool>,
+    /// 每列非空单元格的平均字符长度。
+    avg_cell_lens: Vec<f64>,
+}
+
+// ─── 签名计算与匹配 ──────────────────────────────────────────
+
+fn normalize_cell(s: &str) -> String {
+    s.trim().to_string()
+}
+
+fn is_numeric_cell(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let digits = s.chars().filter(|c| c.is_ascii_digit()).count();
+    let total = s.chars().count();
+    total > 0 && (digits as f64 / total as f64) > 0.3
+}
+
+fn compute_signature(table: &RawTable) -> TableSignature {
+    let col_count = table.rows.first().map(|r| r.len()).unwrap_or(0);
+    if col_count == 0 || table.rows.is_empty() {
+        return TableSignature {
+            col_count: 0,
+            header_fingerprint: vec![],
+            numeric_cols: vec![],
+            avg_cell_lens: vec![],
+        };
+    }
+
+    let header_fingerprint: Vec<String> = table.rows[0]
+        .iter()
+        .map(|c| normalize_cell(c.as_deref().unwrap_or("")))
+        .collect();
+
+    let numeric_cols: Vec<bool> = (0..col_count)
+        .map(|col| {
+            let (total, numeric) = table.rows.iter().fold((0usize, 0usize), |(t, n), row| {
+                match row.get(col).and_then(|c| c.as_deref()) {
+                    Some(s) if !s.trim().is_empty() => {
+                        (t + 1, n + if is_numeric_cell(s) { 1 } else { 0 })
+                    }
+                    _ => (t, n),
+                }
+            });
+            total > 0 && (numeric as f64 / total as f64) > 0.5
+        })
+        .collect();
+
+    let avg_cell_lens: Vec<f64> = (0..col_count)
+        .map(|col| {
+            let lens: Vec<usize> = table
+                .rows
+                .iter()
+                .filter_map(|r| {
+                    r.get(col)
+                        .and_then(|c| c.as_deref())
+                        .map(|s| s.chars().count())
+                        .filter(|&l| l > 0)
+                })
+                .collect();
+            if lens.is_empty() {
+                0.0
+            } else {
+                lens.iter().sum::<usize>() as f64 / lens.len() as f64
+            }
+        })
+        .collect();
+
+    TableSignature { col_count, header_fingerprint, numeric_cols, avg_cell_lens }
+}
+
+/// 比较两行（表头）的相似度，按列逐一比较，返回匹配率 [0, 1]。
+fn header_row_similarity(a: &[Option<String>], b: &[Option<String>]) -> f64 {
+    let min_len = a.len().min(b.len());
+    if min_len == 0 {
+        return 0.0;
+    }
+    let matches = a[..min_len]
+        .iter()
+        .zip(&b[..min_len])
+        .filter(|(ca, cb)| {
+            normalize_cell(ca.as_deref().unwrap_or(""))
+                == normalize_cell(cb.as_deref().unwrap_or(""))
+        })
+        .count();
+    matches as f64 / min_len as f64
+}
+
+/// 两集合的 Jaccard 相似度。
+fn jaccard_similarity(a: &[String], b: &[String]) -> f64 {
+    let set_a: HashSet<&String> = a.iter().collect();
+    let set_b: HashSet<&String> = b.iter().collect();
+    let intersection = set_a.intersection(&set_b).count();
+    let union = set_a.union(&set_b).count();
+    if union == 0 {
+        1.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
+fn match_signatures(a: &TableSignature, b: &TableSignature) -> f64 {
+    if a.col_count == 0 || b.col_count == 0 {
+        return 0.0;
+    }
+
+    let mut score = 0.0;
+
+    // 1. 列数匹配
+    let col_diff = (a.col_count as i32 - b.col_count as i32).abs();
+    if col_diff == 0 {
+        score += COL_COUNT_WEIGHT;
+    } else if col_diff == 1 {
+        score += COL_COUNT_WEIGHT * 0.4;
+    }
+
+    // 2. 表头指纹
+    let header_sim = jaccard_similarity(&a.header_fingerprint, &b.header_fingerprint);
+    score += HEADER_WEIGHT * header_sim;
+
+    // 3. 数值列模式
+    let min_cols = a.numeric_cols.len().min(b.numeric_cols.len());
+    if min_cols > 0 {
+        let matches = a.numeric_cols[..min_cols]
+            .iter()
+            .zip(&b.numeric_cols[..min_cols])
+            .filter(|(na, nb)| na == nb)
+            .count();
+        score += NUMERIC_WEIGHT * (matches as f64 / min_cols as f64);
+    }
+
+    // 4. 列均长分布
+    let min_len = a.avg_cell_lens.len().min(b.avg_cell_lens.len());
+    if min_len > 0 {
+        let len_sim: f64 = a.avg_cell_lens[..min_len]
+            .iter()
+            .zip(&b.avg_cell_lens[..min_len])
+            .map(|(la, lb)| {
+                let max_len = la.max(*lb);
+                if max_len < 1.0 { 1.0 } else { 1.0 - (la - lb).abs() / max_len }
+            })
+            .sum::<f64>()
+            / min_len as f64;
+        score += CELL_LEN_WEIGHT * len_sim.max(0.0);
+    }
+
+    score
+}
+
+// ─── 续表标记检测 ────────────────────────────────────────────
+
+/// 扫描页面的 text 和 blocks，检测中文续表标记。
+fn scan_continued_marker(page: &RawPage) -> bool {
+    let patterns = ["（续上表）", "续上表", "续表", "接上页", "续前表"];
+    for pat in &patterns {
+        if page.text.contains(pat) {
+            return true;
+        }
+    }
+    for block in &page.blocks {
+        for pat in &patterns {
+            if block.text.contains(pat) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// ─── 合并主函数 ──────────────────────────────────────────────
+
+/// 合并跨页断裂的表格（状态机 + 多维度签名匹配）。
 ///
-/// PDF 提取器按页提取表格，同一逻辑表格跨页时会被拆成多个独立 RawTable。
-/// 此函数检测连续页面上结构一致（列数相同、首列不重复表头）的表格并合并。
+/// # 改进（相比旧实现）
 ///
-/// # 合并条件
+/// - **两阶段设计**：阶段1 只读扫描构建链条，阶段2 统一执行合并，消除合并-删除
+///   导致的链条断裂
+/// - **TableSignature 多维度匹配**：列数 + 表头指纹 + 数值列模式 + 列均长，替代
+///   原先仅比较 `(0,0)` 单单元格的检测
+/// - **容忍最多 2 页间隙**：pdfplumber 漏检或中间页无表格时链条不中断
+/// - **重复表头自动剥离**：比较源表首行与锚点表头的相似度，≥阈值则丢弃重复表头
+/// - **续表标记识别**：检测"（续上表）""续表"等标记，降低匹配合并门槛
 ///
-/// 1. 连续两页（N, N+1）各有至少一张表
-/// 2. 页 N 的最后一张表与页 N+1 的第一张表**列数相同**
-/// 3. 页 N+1 的表首行首单元格 ≠ 页 N 的表首行首单元格（否则是重复表头，非延续）
+/// # 返回
 ///
-/// # 行为
-///
-/// - 将页 N+1 的首表行追加到页 N 的末表
-/// - 更新页 N 末表的 bbox 为两张表的并集
-/// - 从页 N+1 删除已合并的表
-/// - 递归尝试，直到无法再合并
+/// 成功合并的组数。
 pub fn merge_cross_page_tables(raw_doc: &mut RawDocument) -> usize {
     if raw_doc.pages.len() < 2 {
         return 0;
     }
 
-    let mut merge_count = 0;
     let page_count = raw_doc.pages.len();
+    let mut merge_count: usize = 0;
+    let mut consumed: HashSet<(usize, usize)> = HashSet::new();
 
-    // 遍历所有连续页面对
-    for n in 0..(page_count - 1) {
-        // 需要安全地同时借用 pages[n] 和 pages[n+1]
-        // 使用 split_at_mut 实现
-        let (left_pages, right_pages) = raw_doc.pages.split_at_mut(n + 1);
-        let page_n = &mut left_pages[n];
-        let page_n1 = &mut right_pages[0];
+    // ── 阶段1：状态机链条发现 ──────────────────────────────────
+    for start_page in 0..page_count {
+        let table_count = raw_doc.pages[start_page].tables.len();
+        for start_ti in 0..table_count {
+            if consumed.contains(&(start_page, start_ti)) {
+                continue;
+            }
 
-        if page_n.tables.is_empty() || page_n1.tables.is_empty() {
-            continue;
-        }
+            let anchor_sig = compute_signature(&raw_doc.pages[start_page].tables[start_ti]);
+            if anchor_sig.col_count == 0 {
+                continue;
+            }
+            let anchor_header = raw_doc.pages[start_page].tables[start_ti]
+                .rows
+                .first()
+                .cloned();
 
-        let last_idx = page_n.tables.len() - 1;
+            let mut chain: Vec<(usize, usize)> = vec![(start_page, start_ti)];
+            let mut gap_count: u32 = 0;
+            let mut gap_has_marker: bool = false;
 
-        // 先提取比较所需的信息（不可变借用）
-        let cols_n = page_n.tables[last_idx]
-            .rows
-            .first()
-            .map(|r| r.len())
-            .unwrap_or(0);
-        let cols_n1 = page_n1.tables[0].rows.first().map(|r| r.len()).unwrap_or(0);
-        if cols_n == 0 || cols_n != cols_n1 {
-            continue;
-        }
+            for next_page in (start_page + 1)..page_count {
+                // 检测当前页是否有续表标记
+                if scan_continued_marker(&raw_doc.pages[next_page]) {
+                    gap_has_marker = true;
+                }
 
-        let first_cell_n = page_n.tables[last_idx]
-            .rows
-            .first()
-            .and_then(|r| r.first())
-            .and_then(|c| c.as_deref())
-            .unwrap_or("")
-            .to_string();
-        let first_cell_n1 = page_n1.tables[0]
-            .rows
-            .first()
-            .and_then(|r| r.first())
-            .and_then(|c| c.as_deref())
-            .unwrap_or("")
-            .to_string();
-        if first_cell_n == first_cell_n1 && !first_cell_n.is_empty() {
-            continue;
-        }
+                let mut found = false;
+                for (ti, table) in raw_doc.pages[next_page].tables.iter().enumerate() {
+                    if consumed.contains(&(next_page, ti)) {
+                        continue;
+                    }
+                    if table.rows.is_empty() {
+                        continue;
+                    }
 
-        // 提取 n1 表的行（take 避免 clone）；bbox 引用读取
-        let n1_rows = std::mem::take(&mut page_n1.tables[0].rows);
-        let n1_bbox_ref = &page_n1.tables[0].bbox; // 借用，不移出
+                    let sig = compute_signature(table);
+                    if sig.col_count == 0 {
+                        continue;
+                    }
 
-        // 更新 bbox 为两张表的并集
-        {
-            let bbox_n = &page_n.tables[last_idx].bbox;
-            if let (Some(bb_n), Some(bb_n1)) = (bbox_n, n1_bbox_ref) {
-                page_n.tables[last_idx].bbox = Some(BBox {
-                    x0: bb_n.x0.min(bb_n1.x0),
-                    top: bb_n.top.min(bb_n1.top),
-                    x1: bb_n.x1.max(bb_n1.x1),
-                    bottom: bb_n.bottom.max(bb_n1.bottom),
-                });
+                    let score = match_signatures(&anchor_sig, &sig);
+
+                    // 续表标记降低合并门槛（约 0.25）
+                    let threshold = if gap_has_marker {
+                        MERGE_THRESHOLD * 0.55
+                    } else {
+                        MERGE_THRESHOLD
+                    };
+
+                    if score >= threshold {
+                        chain.push((next_page, ti));
+                        found = true;
+                        gap_count = 0;
+                        gap_has_marker = false;
+                        break;
+                    }
+                }
+
+                if !found {
+                    gap_count += 1;
+                    if gap_count > MAX_GAP {
+                        break;
+                    }
+                }
+            }
+
+            // ── 阶段2：执行合并 ──────────────────────────────────
+            if chain.len() > 1 {
+                let (dest_page, dest_ti) = chain[0];
+
+                for &(src_page, src_ti) in &chain[1..] {
+                    let src_rows = std::mem::take(
+                        &mut raw_doc.pages[src_page].tables[src_ti].rows,
+                    );
+
+                    if src_rows.is_empty() {
+                        continue;
+                    }
+
+                    // 判断是否剥离重复表头
+                    let strip = match (&anchor_header, src_rows.first()) {
+                        (Some(ah), Some(sr)) => {
+                            header_row_similarity(ah, sr) >= HEADER_STRIP_THRESHOLD
+                        }
+                        _ => false,
+                    };
+
+                    let effective_rows: Vec<Vec<Option<String>>> = if strip {
+                        src_rows.into_iter().skip(1).collect()
+                    } else {
+                        src_rows
+                    };
+
+                    if !effective_rows.is_empty() {
+                        raw_doc.pages[dest_page].tables[dest_ti]
+                            .rows
+                            .extend(effective_rows);
+                    }
+
+                    consumed.insert((src_page, src_ti));
+                    merge_count += 1;
+                }
+
+                consumed.insert((start_page, start_ti));
             }
         }
+    }
 
-        page_n.tables[last_idx].rows.extend(n1_rows);
-        // n1 表已被清空（rows taken），移除它
-        page_n1.tables.remove(0);
-        merge_count += 1;
+    // ── 清理：移除空壳表格 ─────────────────────────────────────
+    for page in raw_doc.pages.iter_mut() {
+        page.tables.retain(|t| !t.rows.is_empty());
     }
 
     merge_count
@@ -1777,6 +2020,7 @@ fn format_table_as_markdown(table: &RawTable) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::raw_document::{BBox, RawBlock, RawPage};
 
     #[test]
     fn test_is_page_noise() {
@@ -2154,5 +2398,327 @@ mod tests {
             "✅ 跨页表格合并测试通过: {} 组合并，合并前后表格数 {:?} → {:?}",
             merged, tables_before, tables_after
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 修复验证测试：跨页表格合并的 4 个已修复问题
+    // ═══════════════════════════════════════════════════════════════
+
+    // ── 辅助构造器 ──────────────────────────────────────────────
+
+    /// 用行列字符串构造 RawTable。空字符串 → None 单元格。
+    fn t(id: &str, rows: Vec<Vec<&str>>) -> RawTable {
+        RawTable {
+            id: id.to_string(),
+            bbox: None,
+            rows: rows
+                .into_iter()
+                .map(|r| {
+                    r.into_iter()
+                        .map(|c| if c.is_empty() { None } else { Some(c.to_string()) })
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    /// 构造只有表格的 RawPage（blocks/words 用空数组填充）。
+    fn pg(index: usize, tables: Vec<RawTable>) -> RawPage {
+        RawPage {
+            page_index: index,
+            width: 595.0,
+            height: 842.0,
+            text: String::new(),
+            words: vec![],
+            blocks: vec![],
+            tables,
+            lines: vec![],
+            rects: vec![],
+        }
+    }
+
+    /// 带 blocks 文本的页面构造器（用于测试续表标记等场景）。
+    fn pg_with_blocks(index: usize, tables: Vec<RawTable>, block_texts: Vec<&str>) -> RawPage {
+        let blocks: Vec<RawBlock> = block_texts
+            .iter()
+            .enumerate()
+            .map(|(i, &text)| RawBlock {
+                id: format!("b_{}_{}", index, i),
+                block_type: BlockType::Paragraph,
+                text: text.to_string(),
+                bbox: BBox { x0: 90.0, top: 100.0, x1: 500.0, bottom: 120.0 },
+            })
+            .collect();
+        RawPage {
+            page_index: index,
+            width: 595.0,
+            height: 842.0,
+            text: block_texts.join("\n"),
+            words: vec![],
+            blocks,
+            tables,
+            lines: vec![],
+            rects: vec![],
+        }
+    }
+
+    fn doc(pages: Vec<RawPage>) -> RawDocument {
+        RawDocument { document_id: "test".to_string(), source_path: String::new(), pages }
+    }
+
+    /// 获取表中所有非空单元格文本，用于断言。
+    fn cells(table: &RawTable) -> Vec<String> {
+        table.rows.iter()
+            .flat_map(|r| r.iter())
+            .filter_map(|c| c.as_deref())
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 修复 1：三页及以上跨页完整合并
+    // ─────────────────────────────────────────────────────────────
+    //
+    // 场景：一张设备清单跨 3 页：
+    //   页0: [表头] + rows 1-3
+    //   页1: rows 4-6（续行，无表头）
+    //   页2: rows 7-9（续行，无表头）
+    // ✅ 修复后：3 页合并为 1 张表，共 10 行（1 表头 + 9 数据）
+
+    #[test]
+    fn test_fix_1_three_page_chain_merged() {
+        let mut doc = doc(vec![
+            pg(0, vec![t("t_0_0", vec![
+                vec!["序号", "设备名称", "数量"],
+                vec!["1", "智慧黑板", "12"],
+                vec!["2", "扩声音箱", "24"],
+                vec!["3", "控制主机", "6"],
+            ])]),
+            pg(1, vec![t("t_1_0", vec![
+                vec!["4", "无线话筒", "12"],
+                vec!["5", "电源时序器", "6"],
+                vec!["6", "交换机", "3"],
+            ])]),
+            pg(2, vec![t("t_2_0", vec![
+                vec!["7", "机柜", "3"],
+                vec!["8", "线材辅料", "1"],
+                vec!["9", "安装调试", "1"],
+            ])]),
+        ]);
+
+        let merged = merge_cross_page_tables(&mut doc);
+
+        // ✅ 修复后：3 页全部合并（2 次合并：0+1, 0+2）
+        assert_eq!(merged, 2,
+            "【修复1】应有 2 次合并（页0+页1, 页0+页2），实际: {}", merged);
+
+        // ✅ 页0 的表有完整 10 行（1 表头 + 9 数据）
+        assert_eq!(doc.pages[0].tables[0].rows.len(), 10,
+            "【修复1】合并后应有 10 行，实际: {}",
+            doc.pages[0].tables[0].rows.len());
+
+        // ✅ 页1 和页2 的空壳表格已被清理
+        assert!(doc.pages[1].tables.is_empty(),
+            "【修复1】页1 的表格应已被合并并清理");
+        assert!(doc.pages[2].tables.is_empty(),
+            "【修复1】页2 的表格应已被合并并清理");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 修复 3+4：重复表头检测并剥离
+    // ─────────────────────────────────────────────────────────────
+    //
+    // 场景：
+    //   页0: [序号, 名称, 数量] [1, A, 10] [2, B, 5]
+    //   页1: [序号, 名称, 数量] [3, C, 8]  ← 首行是重复表头
+    // ✅ 修复后：两页正常合并，页1 的重复表头行被自动剥离
+
+    #[test]
+    fn test_fix_3_and_4_duplicate_header_stripped() {
+        let mut doc = doc(vec![
+            pg(0, vec![t("t_0_0", vec![
+                vec!["序号", "名称", "数量"],
+                vec!["1", "设备A", "10"],
+                vec!["2", "设备B", "5"],
+            ])]),
+            pg(1, vec![t("t_1_0", vec![
+                vec!["序号", "名称", "数量"],  // ← 重复表头
+                vec!["3", "设备C", "8"],
+            ])]),
+        ]);
+
+        let merged = merge_cross_page_tables(&mut doc);
+
+        // ✅ 修复后：正常合并
+        assert_eq!(merged, 1,
+            "【修复3+4】应有 1 次合并，实际: {}", merged);
+
+        // ✅ 合并后 4 行 = 1 表头 + 3 数据行（页1的重复表头已被剥离）
+        assert_eq!(doc.pages[0].tables[0].rows.len(), 4,
+            "【修复3+4】合并后应有 4 行（表头行+3数据行），重复表头已剥离，实际: {}",
+            doc.pages[0].tables[0].rows.len());
+
+        // ✅ 页1 表格已被清理
+        assert!(doc.pages[1].tables.is_empty(),
+            "【修复3+4】页1 的表格应已被合并并清理");
+
+        // ✅ 验证数据完整性：所有 3 行数据都在
+        let all_cells = cells(&doc.pages[0].tables[0]);
+        assert!(all_cells.iter().any(|c| c == "设备A"));
+        assert!(all_cells.iter().any(|c| c == "设备B"));
+        assert!(all_cells.iter().any(|c| c == "设备C"));
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 修复 3：多维度签名匹配——首格相同但表头整体不同 → 应合并
+    // ─────────────────────────────────────────────────────────────
+    //
+    // 场景：两页的首格恰好都是"东莞理工学院"，但这是数据值巧合，
+    // 不是重复表头。多维度签名匹配（列数+数值模式+列长分布）应识别
+    // 为同一张表。
+    // ✅ 修复后：正常合并，不因首格相同而拒绝
+
+    #[test]
+    fn test_fix_3_same_first_cell_merged() {
+        let mut doc = doc(vec![
+            pg(0, vec![t("t_0_0", vec![
+                vec!["东莞理工学院", "智慧教室改造", "500万"],
+                vec!["东莞理工学院", "实验室建设", "300万"],
+                vec!["东莞理工学院", "多媒体教室", "150万"],
+            ])]),
+            pg(1, vec![t("t_1_0", vec![
+                vec!["东莞理工学院", "设备采购", "200万"],
+                vec!["东莞理工学院", "网络升级", "80万"],
+            ])]),
+        ]);
+
+        let merged = merge_cross_page_tables(&mut doc);
+
+        // ✅ 修复后：多维度签名匹配通过，正常合并
+        assert_eq!(merged, 1,
+            "【修复3】应有 1 次合并（多维度签名匹配），实际: {}", merged);
+
+        // ✅ 合并后 5 行
+        assert_eq!(doc.pages[0].tables[0].rows.len(), 5,
+            "【修复3】合并后应有 5 行，实际: {}",
+            doc.pages[0].tables[0].rows.len());
+
+        // ✅ 页1 表格已清理
+        assert!(doc.pages[1].tables.is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 修复 3+4 变体：空白差异的重复表头被归一化后正确剥离
+    // ─────────────────────────────────────────────────────────────
+    //
+    // 场景：页1 表头有前后空格（" 序号 "），与页0 表头（"序号"）
+    // 归一化后相同 → 应被检测为重复表头并剥离。
+    // ✅ 修复后：合并成功，空白表头被剥离，3 行（1 表头 + 2 数据）
+
+    #[test]
+    fn test_fix_3_whitespace_header_stripped() {
+        let mut doc = doc(vec![
+            pg(0, vec![t("t_0_0", vec![
+                vec!["序号", "名称"],
+                vec!["1", "设备A"],
+            ])]),
+            pg(1, vec![t("t_1_0", vec![
+                vec![" 序号 ", "名称"],  // ← 空白差异的重复表头
+                vec!["2", "设备B"],
+            ])]),
+        ]);
+
+        let merged = merge_cross_page_tables(&mut doc);
+
+        // ✅ 修复后：合并成功
+        assert_eq!(merged, 1,
+            "【修复3+4变体】应有 1 次合并，实际: {}", merged);
+
+        // ✅ 合并后 3 行（表头 + 2 数据），重复表头已剥离
+        assert_eq!(doc.pages[0].tables[0].rows.len(), 3,
+            "【修复3+4变体】合并后应有 3 行（表头已在归一化后剥离），实际: {}",
+            doc.pages[0].tables[0].rows.len());
+
+        // ✅ 残留检查：不应存在含空白表头的行
+        let all_cells = cells(&doc.pages[0].tables[0]);
+        assert!(!all_cells.iter().any(|c| c.contains(" 序号 ")),
+            "【修复3+4变体】' 序号 ' 重复表头已被剥离，不应出现在数据中");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 修复 5：续表标记识别 + 间隙容忍
+    // ─────────────────────────────────────────────────────────────
+    //
+    // 场景：页0 有表，页1 无表但有"（续上表）"文本，页2 有表的延续。
+    // ✅ 修复后：续表标记降低匹配合并门槛，页0 与页2 成功合并。
+
+    #[test]
+    fn test_fix_5_continued_marker_bridges_gap() {
+        let mut doc = doc(vec![
+            pg(0, vec![t("t_0_0", vec![
+                vec!["序号", "名称"],
+                vec!["1", "设备A"],
+                vec!["2", "设备B"],
+            ])]),
+            // 页1：无表格，只有"（续上表）"文本
+            pg_with_blocks(1, vec![], vec!["（续上表）"]),
+            // 页2：表格延续
+            pg(2, vec![t("t_2_0", vec![
+                vec!["3", "设备C"],
+                vec!["4", "设备D"],
+            ])]),
+        ]);
+
+        let merged = merge_cross_page_tables(&mut doc);
+
+        // ✅ 修复后：续表标记降低门槛 + 间隙容忍，页0 与页2 合并
+        assert_eq!(merged, 1,
+            "【修复5】续表标记应降低匹配合并门槛，合并页0与页2，实际: {}",
+            merged);
+
+        // ✅ 合并后 5 行（1 表头 + 4 数据）
+        assert_eq!(doc.pages[0].tables[0].rows.len(), 5,
+            "【修复5】合并后应有 5 行，实际: {}",
+            doc.pages[0].tables[0].rows.len());
+
+        // ✅ 页2 表格已清理
+        assert!(doc.pages[2].tables.is_empty(),
+            "【修复5】页2 的表格应已被合并并清理");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 修复 5 变体：续表标记覆盖列数不匹配
+    // ─────────────────────────────────────────────────────────────
+    //
+    // 场景：页0 表格 4 列，页1 续表被误识别为 3 列（合并单元格），
+    // 但页1 有"（续上表）"标记。
+    // ✅ 修复后：续表标记降低阈值 + 列数差异 ±1 容错，成功合并。
+
+    #[test]
+    fn test_fix_5_marker_overrides_col_mismatch() {
+        let mut doc = doc(vec![
+            pg(0, vec![t("t_0_0", vec![
+                vec!["序号", "项目", "金额", "备注"],
+                vec!["1", "教室改造", "500万", ""],
+            ])]),
+            // 页1：被误识别为 3 列，但有"（续上表）"标记
+            pg_with_blocks(1, vec![
+                t("t_1_0", vec![
+                    vec!["2", "设备采购", "200万"],  // 只有 3 列
+                ]),
+            ], vec!["（续上表）"]),
+        ]);
+
+        let merged = merge_cross_page_tables(&mut doc);
+
+        // ✅ 修复后：续表标记降低阈值 + 列数 ±1 容错 → 合并成功
+        assert_eq!(merged, 1,
+            "【修复5变体】续表标记+列数容错应成功合并，实际: {}",
+            merged);
+
+        // ✅ 合并后 3 行（1 表头 + 2 数据）
+        assert_eq!(doc.pages[0].tables[0].rows.len(), 3,
+            "【修复5变体】合并后应有 3 行，实际: {}",
+            doc.pages[0].tables[0].rows.len());
     }
 }

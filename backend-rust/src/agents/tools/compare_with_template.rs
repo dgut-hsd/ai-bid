@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::domain::chunk::Chunk;
 use super::AgentTool;
 
 /// 存储的标准模板。
@@ -285,6 +286,202 @@ impl TemplateStore {
                 "商务评审".to_string(),
             ],
         });
+
+        // ── 投标文件格式模板 ──
+        self.register(StandardTemplate {
+            template_type: "投标文件格式模板".to_string(),
+            name: "政府采购投标文件格式标准模板".to_string(),
+            required_items: vec![
+                TemplateItem {
+                    item: "投标函格式要求".to_string(),
+                    severity: "high".to_string(),
+                    legal_basis: "《政府采购货物和服务招标投标管理办法》第32条".to_string(),
+                },
+                TemplateItem {
+                    item: "装订与密封要求".to_string(),
+                    severity: "high".to_string(),
+                    legal_basis: "政府采购标准文件格式规范".to_string(),
+                },
+                TemplateItem {
+                    item: "签字盖章要求".to_string(),
+                    severity: "high".to_string(),
+                    legal_basis: "《政府采购货物和服务招标投标管理办法》第33条".to_string(),
+                },
+                TemplateItem {
+                    item: "副本数量要求".to_string(),
+                    severity: "medium".to_string(),
+                    legal_basis: "政府采购标准文件格式规范".to_string(),
+                },
+                TemplateItem {
+                    item: "电子版文件要求".to_string(),
+                    severity: "medium".to_string(),
+                    legal_basis: "《关于促进政府采购公平竞争优化营商环境的通知》".to_string(),
+                },
+                TemplateItem {
+                    item: "投标有效期要求".to_string(),
+                    severity: "high".to_string(),
+                    legal_basis: "《政府采购货物和服务招标投标管理办法》第23条".to_string(),
+                },
+                TemplateItem {
+                    item: "联合体协议格式（如适用）".to_string(),
+                    severity: "medium".to_string(),
+                    legal_basis: "《政府采购法》第24条".to_string(),
+                },
+                TemplateItem {
+                    item: "法定代表人授权委托书格式".to_string(),
+                    severity: "high".to_string(),
+                    legal_basis: "政府采购标准文件格式规范".to_string(),
+                },
+            ],
+            forbidden_patterns: vec![
+                "格式自拟".to_string(),
+                "自行决定".to_string(),
+                "不强制要求".to_string(),
+                "无需签字".to_string(),
+                "无需盖章".to_string(),
+            ],
+            expected_fields: vec![
+                "投标函".to_string(),
+                "装订".to_string(),
+                "密封".to_string(),
+                "签字".to_string(),
+                "盖章".to_string(),
+                "副本".to_string(),
+                "有效期".to_string(),
+            ],
+        });
+
+        // ── 采购需求描述规范 ──
+        self.register(StandardTemplate {
+            template_type: "采购需求描述规范".to_string(),
+            name: "政府采购采购需求描述规范模板".to_string(),
+            required_items: vec![
+                TemplateItem {
+                    item: "技术参数完整性与明确性".to_string(),
+                    severity: "high".to_string(),
+                    legal_basis: "《政府采购需求管理办法》第8条".to_string(),
+                },
+                TemplateItem {
+                    item: "验收标准明确性".to_string(),
+                    severity: "high".to_string(),
+                    legal_basis: "《政府采购需求管理办法》第12条".to_string(),
+                },
+                TemplateItem {
+                    item: "服务内容与范围界定".to_string(),
+                    severity: "medium".to_string(),
+                    legal_basis: "《政府采购需求管理办法》第9条".to_string(),
+                },
+                TemplateItem {
+                    item: "交付物清单".to_string(),
+                    severity: "medium".to_string(),
+                    legal_basis: "政府采购标准合同文本".to_string(),
+                },
+                TemplateItem {
+                    item: "质量标准与验收方法".to_string(),
+                    severity: "high".to_string(),
+                    legal_basis: "《政府采购需求管理办法》第12条".to_string(),
+                },
+                TemplateItem {
+                    item: "履约期限与进度安排".to_string(),
+                    severity: "medium".to_string(),
+                    legal_basis: "《政府采购需求管理办法》第11条".to_string(),
+                },
+            ],
+            forbidden_patterns: vec![
+                "指定.*品牌".to_string(),
+                "指定.*型号".to_string(),
+                "唯一.*专利".to_string(),
+                "特定.*供应商".to_string(),
+                "量身定做".to_string(),
+                "排他性".to_string(),
+            ],
+            expected_fields: vec![
+                "技术参数".to_string(),
+                "验收标准".to_string(),
+                "服务范围".to_string(),
+                "交付物".to_string(),
+                "质量标准".to_string(),
+                "履约期限".to_string(),
+            ],
+        });
+
+        // ── 政府采购负面清单模板 ──
+        self.register(StandardTemplate {
+            template_type: "政府采购负面清单模板".to_string(),
+            name: "政府采购负面行为清单（财政部发布）".to_string(),
+            required_items: vec![
+                TemplateItem {
+                    item: "未设置供应商规模门槛（注册资本/资产总额/营业收入等）".to_string(),
+                    severity: "high".to_string(),
+                    legal_basis: "《政府采购法实施条例》第20条(二)".to_string(),
+                },
+                TemplateItem {
+                    item: "未将特定行政区域业绩作为资格条件或评分因素".to_string(),
+                    severity: "high".to_string(),
+                    legal_basis: "《政府采购法实施条例》第20条(四)".to_string(),
+                },
+                TemplateItem {
+                    item: "未指定特定品牌或供应商".to_string(),
+                    severity: "high".to_string(),
+                    legal_basis: "《政府采购法》第22条".to_string(),
+                },
+                TemplateItem {
+                    item: "未将非国家强制认证作为资格条件".to_string(),
+                    severity: "high".to_string(),
+                    legal_basis: "《政府采购法实施条例》第20条(八)".to_string(),
+                },
+                TemplateItem {
+                    item: "未要求提供厂家授权函作为资格条件".to_string(),
+                    severity: "high".to_string(),
+                    legal_basis: "《政府采购货物和服务招标投标管理办法》第17条".to_string(),
+                },
+            ],
+            forbidden_patterns: vec![
+                // 30+ 禁止性模式
+                "注册资本".to_string(),
+                "资产总额".to_string(),
+                "营业收入".to_string(),
+                "从业人员".to_string(),
+                "纳税额".to_string(),
+                "本地.*业绩".to_string(),
+                "本地.*注册".to_string(),
+                "所在地.*资格".to_string(),
+                "指定.*品牌".to_string(),
+                "指定.*型号".to_string(),
+                "唯一.*授权".to_string(),
+                "原厂.*授权".to_string(),
+                "厂家.*授权函".to_string(),
+                "制造商.*证明".to_string(),
+                "专利.*证书".to_string(),
+                "非.*认证".to_string(),
+                "行业协会.*证书".to_string(),
+                "企业.*排名".to_string(),
+                "地方.*奖项".to_string(),
+                "省内.*荣誉".to_string(),
+                "评委.*酌情".to_string(),
+                "自行.*掌握".to_string(),
+                "综合.*判断".to_string(),
+                "无.*量化".to_string(),
+                "没有.*细则".to_string(),
+                "最终.*解释权".to_string(),
+                "以.*意见为准".to_string(),
+                "无条件.*接受".to_string(),
+                "不得.*异议".to_string(),
+                "放弃.*权利".to_string(),
+                "全部.*责任".to_string(),
+                "一切.*责任".to_string(),
+                "永久.*归".to_string(),
+                "无限.*期".to_string(),
+                "单方.*变更".to_string(),
+                "无.*上限".to_string(),
+            ],
+            expected_fields: vec![
+                "资格条件".to_string(),
+                "评分标准".to_string(),
+                "合同条款".to_string(),
+                "技术要求".to_string(),
+            ],
+        });
     }
 }
 
@@ -306,6 +503,20 @@ pub struct CompareWithTemplateTool {
 pub trait ClauseTextProvider: Send + Sync {
     fn get_text(&self, chunk_id: &str) -> Option<String>;
     fn get_section_path(&self, chunk_id: &str) -> Option<Vec<String>>;
+}
+
+/// `ClauseTextProvider` 的真实实现 — 从 `Arc<HashMap<String, Chunk>>` 中提取文本。
+pub struct ChunkTextProvider {
+    pub chunks: Arc<HashMap<String, Chunk>>,
+}
+
+impl ClauseTextProvider for ChunkTextProvider {
+    fn get_text(&self, chunk_id: &str) -> Option<String> {
+        self.chunks.get(chunk_id).map(|c| c.text.clone())
+    }
+    fn get_section_path(&self, chunk_id: &str) -> Option<Vec<String>> {
+        self.chunks.get(chunk_id).map(|c| c.section_path.clone())
+    }
 }
 
 impl CompareWithTemplateTool {
@@ -572,6 +783,9 @@ mod tests {
         assert!(store.get("资格条件标准模板").is_some());
         assert!(store.get("合同必须条款模板").is_some());
         assert!(store.get("评审标准模板").is_some());
+        assert!(store.get("投标文件格式模板").is_some());
+        assert!(store.get("采购需求描述规范").is_some());
+        assert!(store.get("政府采购负面清单模板").is_some());
     }
 
     #[test]

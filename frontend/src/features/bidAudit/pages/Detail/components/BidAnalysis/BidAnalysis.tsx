@@ -6,6 +6,7 @@ import {
   ReloadOutlined,
   ExportOutlined,
   EyeOutlined,
+  LoadingOutlined,
 } from '@ant-design/icons';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useStyles } from '../../style';
@@ -82,23 +83,21 @@ const BidAnalysis: React.FC<BidAnalysisProps> = ({
   const { id: routeBidId } = useParams<{ id: string }>();
   const rightPanelRef = React.useRef<HTMLDivElement>(null);
   const [activeTab, setActiveTab] = useState<DetailTab>(() => {
-    // 有进行中的任务 → 默认看过程；否则看结果
-    return isAuditing ? 'process' : 'results';
+    // 已审过的项目（本地有 taskId 记录）→ 默认进「审核结果」；
+    // 未审过的项目（无 taskId）→ 默认进「审核过程」（含「开始审核」按钮）。
+    // 进行中 / 已完成的状态由下方副作用在 hydrating 后校准，避免闪错。
+    return taskId ? 'results' : 'process';
   });
   const [drawerIssue, setDrawerIssue] = useState<AuditIssue | null>(null);
 
-  // 审核开始时自动切到"审核过程"；审核完成时自动切到"审核结果"
+  // 审核开始时自动切到"审核过程"。
+  // 注意：审核完成后【不再】自动跳到"审核结果"——用户可能正在看过程里的某张卡片，
+  // 突然跳走体验很差。完成状态改为在"审核过程"页底部用醒目提示 + 手动入口呈现。
   useEffect(() => {
     if (isAuditing && !isComplete) {
       setActiveTab('process');
     }
   }, [isAuditing]);
-
-  useEffect(() => {
-    if (isComplete) {
-      setActiveTab('results');
-    }
-  }, [isComplete]);
 
   const handleIssueClick = useCallback((issue: AuditIssue) => {
     setDrawerIssue(issue);
@@ -135,7 +134,11 @@ const BidAnalysis: React.FC<BidAnalysisProps> = ({
           )}
 
           {(isAuditing || isComplete) && (
-            <PipelineProgress currentStage={currentStage} isComplete={isComplete} />
+            <PipelineProgress
+              currentStage={currentStage}
+              isComplete={isComplete}
+              onViewResults={() => setActiveTab('results')}
+            />
           )}
 
           {/* 未开始时显示"开始审核" */}
@@ -165,6 +168,21 @@ const BidAnalysis: React.FC<BidAnalysisProps> = ({
       ),
       children: (
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: 0 }}>
+          {isAuditing && (
+            // 审核进行中：结果区实时渲染逐条发现（卡片随 SSE finding_added 事件增量出现）。
+            // 「审核过程」页的条款动态地图仍承载整体进度；此处顶部保留一个轻量计数提示。
+            <div
+              style={{
+                flexShrink: 0,
+                padding: '6px 8px',
+                fontSize: 13,
+                color: '#8c8c8c',
+              }}
+            >
+              <LoadingOutlined style={{ marginRight: 6 }} />
+              正在智能分析标书，已发现 {issues.length} 条风险线索…
+            </div>
+          )}
           <div style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
             <AnalysisList
               issues={issues}

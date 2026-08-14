@@ -28,6 +28,10 @@ pub struct CheckCrossReferenceArgs {
     /// 引用类型
     #[serde(default)]
     pub reference_type: Option<String>,
+    /// 引用方声称的关键词列表（用于验证内容是否匹配）
+    /// 如"详见附件三 技术参数表" → claims=["技术参数", "参数表"]
+    #[serde(default)]
+    pub reference_claims: Vec<String>,
 }
 
 /// 交叉引用检查结果。
@@ -55,7 +59,6 @@ enum RefStatus {
     Valid,
     Dangling,
     Ambiguous,
-    #[allow(dead_code)]
     ContentMismatch,
 }
 
@@ -64,6 +67,7 @@ struct CandidateRef {
     chunk_id: String,
     section_path: Vec<String>,
     match_reason: String,
+    match_score: u32,
     text_preview: String,
 }
 
@@ -114,29 +118,38 @@ impl CheckCrossReferenceTool {
         let mut keywords = Vec::new();
         keywords.push(expr.to_string());
 
-        // 生成数字变体
-        let has_num: String = expr.chars().filter(|c| c.is_ascii_digit()).collect();
-        if !has_num.is_empty() {
-            // 中文数字转阿拉伯数字
-            let cn_nums = [
-                ("一", "1"),
-                ("二", "2"),
-                ("三", "3"),
-                ("四", "4"),
-                ("五", "5"),
-                ("六", "6"),
-                ("七", "7"),
-                ("八", "8"),
-                ("九", "9"),
-                ("十", "10"),
-            ];
-            let mut variant = expr.to_string();
-            for (cn, ar) in &cn_nums {
-                variant = variant.replace(cn, ar);
-            }
-            if variant != *expr {
-                keywords.push(variant);
-            }
+        // 中文数字转阿拉伯数字（状态机解析，"十二"→"12"、"二十"→"20"、"十一"→"11"）
+        let cn_digits: Vec<char> = expr.chars().filter(|c| {
+            matches!(c, '一'..='九' | '十' | '百' | '零')
+        }).collect();
+        let mut cn_to_ar = String::new();
+        let mut last_digit = 0u32;
+        let mut acc = 0u32;
+        let mut in_num = false;
+        for &c in &cn_digits {
+            let val = match c {
+                '一' => 1, '二' => 2, '三' => 3, '四' => 4,
+                '五' => 5, '六' => 6, '七' => 7, '八' => 8, '九' => 9,
+                '十' => { last_digit = if last_digit == 0 { 1 } else { last_digit }; acc += last_digit * 10; last_digit = 0; in_num = true; continue; }
+                '百' => { last_digit = if last_digit == 0 { 1 } else { last_digit }; acc += last_digit * 100; last_digit = 0; in_num = true; continue; }
+                '零' => { in_num = true; continue; }
+                _ => continue,
+            };
+            last_digit = val;
+            in_num = true;
+        }
+        acc += last_digit;
+        if in_num {
+            cn_to_ar = acc.to_string();
+        }
+
+        let has_ar_num: String = expr.chars().filter(|c| c.is_ascii_digit()).collect();
+        if !has_ar_num.is_empty() && !cn_to_ar.is_empty() {
+            keywords.push(cn_to_ar);
+        } else if !has_ar_num.is_empty() && cn_to_ar.is_empty() {
+            // 只有阿拉伯数字无中文数字,不需要额外变体
+        } else if !cn_to_ar.is_empty() {
+            keywords.push(cn_to_ar);
         }
 
         (ref_type, keywords)
@@ -216,14 +229,19 @@ impl CheckCrossReferenceTool {
                         chunk_id: chunk_id.clone(),
                         section_path: chunk.section_path.clone(),
                         match_reason: best_match_reason,
+                        match_score: best_score,
                         text_preview: chunk.text.chars().take(200).collect(),
                     });
                 }
             }
         }
 
-        // 按匹配分数排序（CandidateRef 没有 score 字段，用 match_reason 的长度作为启发式）
-        candidates.sort_by(|a, b| b.match_reason.len().cmp(&a.match_reason.len()));
+        // 按匹配分数降序排列（文本精确匹配 > section_path 匹配）
+        candidates.sort_by(|a, b| {
+            b.match_score
+                .cmp(&a.match_score)
+                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+        });
 
         candidates
     }
@@ -262,6 +280,11 @@ impl AgentTool for CheckCrossReferenceTool {
                             "type": "string",
                             "enum": ["attachment", "section", "clause", "table", "appendix"],
                             "description": "引用类型，可选。不提供则自动推断。"
+                        },
+                        "reference_claims": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "引用方声称的内容关键词列表，用于验证目标内容是否匹配。如'详见附件3 技术参数表' → [\"技术参数\", \"参数表\"]"
                         }
                     },
                     "required": ["source_chunk", "reference_expression"]
@@ -295,7 +318,7 @@ impl AgentTool for CheckCrossReferenceTool {
                 )),
             )
         } else if candidates.len() == 1 {
-            // 唯一候选 → valid，但还需检查 source_chunk 是否存在
+            // 唯一候选 → 先检查 source_chunk 是否存在
             if !self.chunks.contains_key(&parsed.source_chunk) {
                 (
                     RefStatus::Dangling,
@@ -303,6 +326,56 @@ impl AgentTool for CheckCrossReferenceTool {
                     None,
                     Some(format!("源 chunk '{}' 不存在", parsed.source_chunk)),
                 )
+            } else if !parsed.reference_claims.is_empty() {
+                // ★ ContentMismatch 检测：有唯一候选目标，但内容是否匹配引用方声称的关键词？
+                let c = &candidates[0];
+                let target_text = self
+                    .chunks
+                    .get(&c.chunk_id)
+                    .map(|ch| &ch.text)
+                    .unwrap_or(&c.text_preview);
+
+                let mut matched_claims = Vec::new();
+                let mut unmatched_claims = Vec::new();
+                for claim in &parsed.reference_claims {
+                    if target_text.contains(claim.as_str()) {
+                        matched_claims.push(claim.clone());
+                    } else {
+                        unmatched_claims.push(claim.clone());
+                    }
+                }
+
+                if unmatched_claims.is_empty() {
+                    // 所有声称关键词都匹配 → Valid
+                    (
+                        RefStatus::Valid,
+                        Some(c.chunk_id.clone()),
+                        Some(c.section_path.clone()),
+                        None,
+                    )
+                } else {
+                    // 部分／全部关键词不匹配 → ContentMismatch
+                    let detail = if matched_claims.is_empty() {
+                        format!(
+                            "引用声称的内容（{}）在目标中均未找到。目标实际标题为 '{}'，内容摘要：'{}'",
+                            unmatched_claims.join("、"),
+                            c.section_path.join(" > "),
+                            c.text_preview
+                        )
+                    } else {
+                        format!(
+                            "部分声称匹配({})，但以下关键词未找到：{}。请确认引用目标是否正确。",
+                            matched_claims.join("、"),
+                            unmatched_claims.join("、")
+                        )
+                    };
+                    (
+                        RefStatus::ContentMismatch,
+                        Some(c.chunk_id.clone()),
+                        Some(c.section_path.clone()),
+                        Some(detail),
+                    )
+                }
             } else {
                 let c = &candidates[0];
                 (
@@ -465,5 +538,23 @@ mod tests {
         let candidates =
             tool.search_targets("附件五 供应商声明", "attachment", &["附件五".to_string()]);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_content_mismatch_detection() {
+        let tool = make_tool();
+        let (ref_type, keywords) =
+            CheckCrossReferenceTool::parse_reference("附件三", Some("attachment"));
+        let candidates = tool.search_targets("附件三", &ref_type, &keywords);
+        assert!(!candidates.is_empty(), "应找到附件三");
+
+        // 验证 ContentMismatch 逻辑：附件三的实际内容是"资格证明文件清单"
+        // 如果引用方声称它包含"技术参数表"，应当检测为不匹配
+        let target_text = tool.chunks.get(&candidates[0].chunk_id).unwrap();
+        let has_tech_param = target_text.text.contains("技术参数");
+        // 附件三是资格证明，不应该包含"技术参数"
+        assert!(!has_tech_param, "附件三不应包含'技术参数'");
+        // 但确认附件三确实存在且包含"资格证明"
+        assert!(target_text.text.contains("资格证明"));
     }
 }

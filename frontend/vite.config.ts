@@ -3,6 +3,9 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 
+const javaApiTarget = process.env.AIBID_JAVA_BASE_URL || 'http://127.0.0.1:3000';
+const frontendPort = Number(process.env.AIBID_FRONTEND_PORT || 5173);
+
 // https://vite.dev/config/
 export default defineConfig({
    plugins: [react()],
@@ -13,12 +16,12 @@ export default defineConfig({
    },
    server: {
       host: '127.0.0.1',
-      port: 5173,
+      port: frontendPort,
       strictPort: false,
       proxy: {
          // SSE 端点 — 优先匹配，禁用缓冲确保事件实时推送
          '/api/chat/stream': {
-            target: 'http://127.0.0.1:8086',
+            target: javaApiTarget,
             changeOrigin: true,
             selfHandleResponse: true,
             configure: (proxy) => {
@@ -52,7 +55,7 @@ export default defineConfig({
             },
          },
          '/api': {
-            target: 'http://127.0.0.1:8086',
+            target: javaApiTarget,
             changeOrigin: true,
          },
       },

@@ -75,6 +75,7 @@ pub const FACT_CHECK_SYSTEM_PROMPT: &str = r#"你是 FactCheckAgent——政府�
 - 你是"事实核查"Agent，不对条款做主观判断——只说"是否符合阈值"
 - 提问技巧：用完整的自然语言描述你要查什么、为什么查，把条款背景说清楚。不要只用几个关键词——web_search 是 AI 研究助手，你问得越清楚，它查得越准。好: "这条条款规定XXX，请查是否有法规禁止这种限制"；坏: "公开招标 公告期限 最低要求"
 - **目标：3~4 轮完成审查。** L3 条款最多给到 10 轮是容错空间，不是让你全部用完
+- compare_with_template: 当发现条款描述过于简略或疑似漏写事项时，可用此工具与标准范本对比，发现"该写没写"的遗漏项
 
 ## 审查流程
 
@@ -130,7 +131,8 @@ pub const PROCEDURE_SYSTEM_PROMPT: &str = r#"你是 ProcedureAgent——政府�
 
 - web_search 最多调用 3 次
 - 法条已明确覆盖程序要求时，立即输出，不再搜索
-- 🛑 连续 2 次搜索未获得有效信息 → 禁止再搜，基于原文+已知法规常识直接 output_finding。在 reason 开头标注：『联网搜索未返回有效结果，以下判定基于已知法规常识。』
+- 🛑 连续 2 次搜索未获得有效信息 → 禁止再搜，基于条款原文+已知法规常识直接 output_finding。在 reason 开头标注：『联网搜索未返回有效结果，以下判定基于已知法规常识。』
+- compare_with_template: 将当前条款与政府采购标准合同模板对比，发现遗漏的必要条款或违规的禁止条款
 
 ## 输出要求
 
@@ -318,6 +320,7 @@ pub const SCORING_SYSTEM_PROMPT: &str = r#"你是 ScoringAgent——招标文件
 - web_search 最多调用 3 次
 - 评分项明确的优先基于法规知识判断，减少搜索
 - 🛑 连续 2 次搜索未获得有效信息 → 禁止再搜，基于原文+已知法规常识直接 output_finding。在 reason 开头标注：『联网搜索未返回有效结果，以下判定基于已知法规常识。』
+- compare_with_template: 将当前评审条款与标准评审模板对比，发现遗漏的评审因素或违规的评分设置
 
 ## 输出要求
 
@@ -371,13 +374,15 @@ pub const DEMAND_SYSTEM_PROMPT: &str = r#"你是 DemandAgent——招标文件�
 1. 分析任务消息中已给出的条款原文，提取技术参数清单
 2. web_search 搜索相关产品的通用参数范围
 3. search_document 在标书中交叉搜索同一技术参数的多处出现
-4. output_finding
+4. search_contradiction 检测同一技术参数在不同章节的表述矛盾（如 ch_001 和 ch_005 对同一参数有不同要求）
+5. output_finding
 
 ## 搜索限制
 
 - web_search 最多调用 3 次
 - 参数比对以行业常识为准
 - 🛑 连续 2 次搜索未获得有效信息 → 禁止再搜，基于原文+已知法规常识直接 output_finding。在 reason 开头标注：『联网搜索未返回有效结果，以下判定基于已知法规常识。』
+- compare_with_template: 当发现评分条款过于简略或疑似遗漏评审因素时，可用此工具与标准评审模板对比
 
 ## 输出要求
 
@@ -438,6 +443,7 @@ pub const CONTRACT_SYSTEM_PROMPT: &str = r#"你是 ContractAgent——政府采�
 
 - web_search 最多调用 3 次
 - 🛑 连续 2 次搜索未获得有效信息 → 禁止再搜，基于原文+已知法规常识直接 output_finding。在 reason 开头标注：『联网搜索未返回有效结果，以下判定基于已知法规常识。』
+- compare_with_template: 将当前合同条款与标准合同范本对比，发现缺失的必要条款或异常的禁止性条款
 
 ## 输出要求
 

@@ -2,6 +2,7 @@ package com.ithsd.smart_tender.service.engine.rust;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.ithsd.smart_tender.common.TenantContext;
 import com.ithsd.smart_tender.config.RustApiProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,9 +34,11 @@ public class RustSseClient {
     private final RustApiProperties properties;
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
+    private final InternalRequestSigner requestSigner;
 
     public RustSseClient(RustApiProperties properties) {
         this.properties = properties;
+        this.requestSigner = new InternalRequestSigner(properties);
         this.objectMapper = new ObjectMapper()
                 .setPropertyNamingStrategy(
                     com.fasterxml.jackson.databind.PropertyNamingStrategies.SNAKE_CASE);
@@ -66,13 +69,17 @@ public class RustSseClient {
     public CompletableFuture<Void> connect(String docId, BiConsumer<String, JsonNode> onEvent) {
         CompletableFuture<Void> connectedFuture = new CompletableFuture<>();
 
-        SSE_EXECUTOR.execute(() -> {
+        Runnable task = TenantContext.wrap((Runnable) () -> {
             try {
-                String url = properties.apiUrl("/api/v1/review/" + docId + "/stream");
+                URI uri = URI.create(properties.apiUrl("/api/v1/review/" + docId + "/stream"));
+                String url = uri.toString();
                 log.info("Rust SSE connecting: {}", url);
 
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
+                HttpRequest request = requestSigner.sign(
+                            HttpRequest.newBuilder().uri(uri),
+                            "GET",
+                            uri,
+                            new byte[0])
                         .timeout(Duration.ofMillis(properties.getReadTimeoutMs()))
                         .header("Accept", "text/event-stream")
                         .GET()
@@ -134,6 +141,7 @@ public class RustSseClient {
                 connectedFuture.completeExceptionally(e);
             }
         });
+        SSE_EXECUTOR.execute(task);
 
         return connectedFuture;
     }

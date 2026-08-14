@@ -1,6 +1,7 @@
 package com.ithsd.smart_tender.model.entity;
 
 import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import lombok.AllArgsConstructor;
@@ -19,6 +20,9 @@ import java.time.LocalDateTime;
 public class Project implements Serializable {
     @TableId(value = "id", type = IdType.AUTO)
     private Long id;
+
+    @TableField("tenant_id")
+    private Long tenantId;
 
     private Long userId;
 

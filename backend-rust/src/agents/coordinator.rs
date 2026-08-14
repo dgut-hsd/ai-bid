@@ -30,7 +30,7 @@ use crate::agents::execution_control::{
 };
 use crate::agents::react_loop::{LlmClient, ReActLoop};
 use crate::agents::registry::AgentRegistry;
-use crate::agents::review_event::{FindingLifecycle, ReviewEvent, ReviewEventBus};
+use crate::agents::review_event::{FindingChange, FindingLifecycle, ReviewEvent, ReviewEventBus};
 use crate::agents::risk_taxonomy;
 use crate::agents::session_graph::SessionGraph;
 use crate::agents::tools::ToolRegistry;
@@ -512,7 +512,21 @@ impl Coordinator {
                 )
                 .await
                 {
-                    Ok(count) => count,
+                    Ok(count) => {
+                        // B-2 已在 execute_agents 发射 finding_added；此处更新生命周期，避免重复新增。
+                        for f in merged.iter().filter(|f| !f.no_risk) {
+                            emit(&ReviewEvent::FindingUpdated {
+                                risk_id: f.risk_id.clone(),
+                                changes: vec![FindingChange {
+                                    field: "lifecycle".to_string(),
+                                    old_value: None,
+                                    new_value: Some("verified".to_string()),
+                                }],
+                                reason: "法条验证通过，确认为有效风险".to_string(),
+                            });
+                        }
+                        count
+                    }
                     Err(_) => {
                         execution_control.record_stage_failure(
                             ExecutionStage::LegalVerify,
@@ -522,26 +536,6 @@ impl Coordinator {
                         0
                     }
                 };
-                // 逐条发射通过验证的 finding（进入 L1 主视图）
-                for f in merged.iter().filter(|f| !f.no_risk) {
-                    emit(&ReviewEvent::FindingAdded {
-                        risk_id: f.risk_id.clone(),
-                        severity: severity_str(&f.severity).to_string(),
-                        is_critical: f.is_critical,
-                        critical_reason: f.critical_reason.clone(),
-                        risk_type: f.risk_type.clone(),
-                        agent: f.agent.clone(),
-                        confidence: f.confidence as f64,
-                        clause_ids: f.clause_ids.clone(),
-                        source_quote: f.source_quote.chars().take(500).collect(),
-                        legal_basis: f.legal_basis.clone(),
-                        reason: f.reason.chars().take(500).collect(),
-                        suggestion: f.suggestion.clone(),
-                        lifecycle: FindingLifecycle::Verified,
-                        page_number: f.page_number,
-                        section_path: f.section_path.clone(),
-                    });
-                }
                 lv_count
             } else {
                 0
@@ -756,6 +750,9 @@ impl Coordinator {
     ///
     /// Scout 对每条 clause 产出 Hypothesis（finding_role=Hypothesis），
     /// 通过 `add_hypothesis()` 轻量写入 SessionGraph，供 Phase 2 Agent 使用。
+    #[allow(dead_code)]
+    /// Scout 阶段 — 已被 review() 禁用（成本优化，见第 276 行 mark_scout_complete）。
+    /// 保留此函数供未来按需重新启用，当前为死代码。
     #[allow(dead_code)]
     async fn scout_phase(&self, clauses: &[ReviewClause]) {
         let scout_def = match self.registry.get(AgentId::Scout) {
@@ -1256,6 +1253,31 @@ impl Coordinator {
                                 "partial_failed".to_string()
                             },
                         });
+                    }
+
+                    // B-2 流式发射：每个 Agent 审查完成即把其发现推向前端
+                    // 不再等 MERGE/LEGAL_VERIFY，也不依赖 enable_legal_verify 开关
+                    // 重复/被合并项由 merge_findings_v3 后续发 finding_removed 自动清理
+                    if let Some(ref events) = review_events {
+                        for f in findings.iter().filter(|f| !f.no_risk) {
+                            events.emit(&ReviewEvent::FindingAdded {
+                                risk_id: f.risk_id.clone(),
+                                severity: severity_str(&f.severity).to_string(),
+                                is_critical: f.is_critical,
+                                critical_reason: f.critical_reason.clone(),
+                                risk_type: f.risk_type.clone(),
+                                agent: f.agent.clone(),
+                                confidence: f.confidence as f64,
+                                clause_ids: f.clause_ids.clone(),
+                                source_quote: f.source_quote.chars().take(500).collect(),
+                                legal_basis: f.legal_basis.clone(),
+                                reason: f.reason.chars().take(500).collect(),
+                                suggestion: f.suggestion.clone(),
+                                lifecycle: FindingLifecycle::Verified,
+                                page_number: f.page_number,
+                                section_path: f.section_path.clone(),
+                            });
+                        }
                     }
 
                     // 将发现写入 SessionGraph（共享工作区）

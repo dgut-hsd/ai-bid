@@ -7,10 +7,9 @@ import { PdfToolbar } from './PdfToolbar';
 import 'react-pdf/dist/Page/TextLayer.css';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 
-pdfjs.GlobalWorkerOptions.workerSrc = new URL(
-   'pdfjs-dist/build/pdf.worker.min.mjs',
-   import.meta.url
-).toString();
+import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+
+pdfjs.GlobalWorkerOptions.workerSrc = PdfWorker;
 
 interface PdfPreviewProps {
    fileUrl: string;
@@ -27,6 +26,7 @@ export type BBoxData = {
   x1: number;
   bottom: number;
   pageWidth: number;
+  page?: number; // ← 新增：该 BBox 属于哪一页
 };
 
 type HighlightBox = {
@@ -224,11 +224,10 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
 
    const [previewFailed, setPreviewFailed] = React.useState(false);
    const [highlightText, setHighlightText] = React.useState('');
-   const [highlightPage, setHighlightPage] = React.useState<number>(0);
-   const [highlightVersion, setHighlightVersion] = React.useState<number>(0);
    const [, setHighlightStatus] = React.useState<HighlightStatus>('idle');
    const [highlightBoxesByPage, setHighlightBoxesByPage] = React.useState<Record<number, HighlightBox[]>>({});
    const pdfDocRef = React.useRef<any | null>(null);
+   const pageDimRef = React.useRef<Record<number, { width: number; height: number }>>({}); //缓存每页"原生 PDF 点尺寸"，用于高亮坐标换算
    const pageTextIndexCacheRef = React.useRef<Record<string, PageTextIndex>>({});
    const highlightQueryRef = React.useRef('');
    const highlightTokensRef = React.useRef<string[]>([]);
@@ -599,10 +598,7 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
 
       return Array.from(new Array(numPages), (_, index) => {
          const pageNum = index + 1;
-         const pageKey =
-            pageNum === highlightPage
-               ? `page_${pageNum}_${highlightVersion}`
-               : `page_${pageNum}`;
+         const pageKey = `page_${pageNum}`;
          return (
             <div
                key={pageKey}
@@ -693,7 +689,6 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
          }
          if (best && best !== highlightQueryRef.current) {
             setHighlightText(best);
-            setHighlightVersion((v) => v + 1);
             window.setTimeout(async () => {
                const ok = await applyPdfJsHighlights(page, best, fallbackTokensRef.current, {
                   silent: false,
@@ -750,8 +745,6 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
             setHighlightStatus('idle');
             setHighlightBoxesByPage({});
             setHighlightText(normalized);
-            setHighlightPage(page);
-            setHighlightVersion((v) => v + 1);
             jumpToPage(page);
             const marker = `${page}|${normalized}`;
             if (pendingSecondaryMatchRef.current !== marker) {
@@ -786,7 +779,6 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
                      }
                   }
                   if (locatedPage > 0) {
-                     setHighlightPage(locatedPage);
                      jumpToPage(locatedPage);
                      scrollFirstHitIntoView(locatedPage);
                      return;
@@ -824,47 +816,58 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
          /** BBox-based 精确高亮：跳过文本搜索，直接按坐标渲染矩形 overlay。 */
          highlightBboxes: (page: number, bboxes: BBoxData[]) => {
             if (!bboxes.length || page == null || page < 0) return;
-            // 1. 清旧高亮，跳到目标页
-            setHighlightBoxesByPage({});
+
+            // 1. 跳到"主"目标页用于滚动定位；【不再清空】其它页已有高亮
             setHighlightStatus('idle');
-            setHighlightPage(page);
-            setHighlightVersion((v) => v + 1);
             jumpToPage(page);
 
-            // 2. 获取页面渲染后的实际尺寸，计算 PDF→DOM scale
+            // 2. 等 DOM 渲染完（pdfjs 异步），再读每页真实宽度
             window.setTimeout(() => {
-               const pageEl = containerRef.current?.querySelector(
-                  `[data-page-num="${page}"]`
-               ) as HTMLElement | null;
-               if (!pageEl) return;
-               const renderedWidth = pageEl.clientWidth;
-               if (renderedWidth <= 0) return;
+               if (!containerRef.current) return;
 
-               // 3. 将 PDF points → DOM 像素 (scale = renderedPx / originalPt)
-               const highlightBoxes: HighlightBox[] = bboxes.map((b, idx) => {
-                  const scaleFactor = renderedWidth / (b.pageWidth || 595);
-                  return {
+               // 2a. 按 b.page 分组（缺 page 的归到传入的 page 兜底）
+               const groups = new Map<number, BBoxData[]>();
+               bboxes.forEach((b) => {
+                  const p = b.page ?? page;
+                  if (!groups.has(p)) groups.set(p, []);
+                  groups.get(p)!.push(b);
+               });
+
+               // 2b. 逐页：查该页 DOM → 算 scaleFactor → 生成高亮框
+               const newBoxesByPage: Record<number, HighlightBox[]> = {};
+               groups.forEach((groupBboxes, pageNum) => {
+                  // 用 data-page-num 选中该页根元素（不是 canvas，是 pageItem div）
+                  const pageEl = containerRef.current?.querySelector(
+                     `[data-page-num="${pageNum}"]`
+                  ) as HTMLElement | null;
+                  if (!pageEl) return;                 // 该页还没渲染，跳过
+                  const renderedWidth = pageEl.clientWidth;
+                  if (renderedWidth <= 0) return;
+
+                  // 原生 PDF 点宽：后端 b.pageWidth 优先 → pageDimRef 兜底 → 595
+                  const nativeWidth =
+                     groupBboxes[0].pageWidth ||
+                     pageDimRef.current[pageNum]?.width ||
+                     595;
+                  const scaleFactor = renderedWidth / nativeWidth;
+
+                  newBoxesByPage[pageNum] = groupBboxes.map((b, idx) => ({
                      left: b.x0 * scaleFactor,
                      top: b.top * scaleFactor,
                      width: Math.max(1, (b.x1 - b.x0) * scaleFactor),
                      height: Math.max(1, (b.bottom - b.top) * scaleFactor),
-                     primary: idx === 0,
-                  };
+                     // 仅"主目标页"的第一个框是 primary（更醒目 + 滚动锚点）
+                     primary: pageNum === page && idx === 0,
+                  }));
                });
 
-               setHighlightBoxesByPage((prev) => ({
-                  ...prev,
-                  [page]: highlightBoxes,
-               }));
+               // 2c. 合并进现有高亮（保留其它页），而非清空全部
+               setHighlightBoxesByPage((prev) => ({ ...prev, ...newBoxesByPage }));
                setHighlightStatus('exact_hit');
-               console.info(
-                  '[pdf-highlight] engine=bbox page=%s boxes=%s scale=%.3f',
-                  page, highlightBoxes.length, highlightBoxes.length > 0
-                     ? (renderedWidth / (bboxes[0].pageWidth || 595))
-                     : 0
-               );
+               const total = Object.values(newBoxesByPage).reduce((s, a) => s + a.length, 0);
+               console.info('[pdf-highlight] engine=bbox groups=%s boxes=%s', groups.size, total);
 
-               // 4. 滚动到第一个高亮区域
+               // 3. 滚动到主目标页第一个高亮
                window.setTimeout(() => {
                   const hit = containerRef.current?.querySelector(
                      `[data-page-num="${page}"] [data-overlay-hit="1"]`
@@ -885,9 +888,19 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
             <>
                <div className={styles.pdfScrollArea} ref={containerRef}>
                   <Document
+                     key={fileUrl}
                      file={documentFile}
                      onLoadSuccess={(pdf) => {
                         pdfDocRef.current = pdf;
+                        const fillDims = async () => {                          // ① 定义一个异步函数
+                           const dims: Record<number, { width: number; height: number }> = {};
+                           for (let n = 1; n <= pdf.numPages; n++) {
+                              const vp = (await pdf.getPage(n)).getViewport({ scale: 1 }); // ② 拿第n页"原生点尺寸"
+                              dims[n] = { width: vp.width, height: vp.height };
+                           }
+                           pageDimRef.current = dims;                            // ③ 一次性写进 ref
+                        };
+                        fillDims();
                         pageTextIndexCacheRef.current = {};
                         setNumPages(pdf.numPages);
                      }}

@@ -52,6 +52,11 @@ impl AgentRegistry {
                     "search_document",
                     "read_section",
                     "output_finding",
+                    // 交叉引用完整性检查 + 模板比对
+                    "check_cross_reference",
+                    "compare_with_template",
+                    // 数值/计算校验
+                    "validate_calculation",
                 ],
             },
         );
@@ -79,6 +84,13 @@ impl AgentRegistry {
                     "search_document",
                     "read_section",
                     "output_finding",
+                    // V3 采购程序合规审查工具
+                    "verify_procurement_method",
+                    "verify_bid_deposit",
+                    "verify_announcement_period",
+                    "verify_bid_preparation_period",
+                    // 零依赖计算工具
+                    "calculate_timeline",
                 ],
             },
         );
@@ -97,6 +109,9 @@ impl AgentRegistry {
                     "search_document",
                     "read_section",
                     "output_finding",
+                    // 义务提取与排斥检测
+                    "extract_obligations",
+                    "check_cross_reference",
                 ],
             },
         );
@@ -117,6 +132,9 @@ impl AgentRegistry {
                     "search_document",
                     "read_section",
                     "output_finding",
+                    // 义务提取识别排他性组合
+                    "extract_obligations",
+                    "check_cross_reference",
                 ],
             },
         );
@@ -156,6 +174,12 @@ impl AgentRegistry {
                     "search_document",
                     "read_section",
                     "output_finding",
+                    // V4 评审标准审查工具
+                    "validate_scoring_formula",
+                    "validate_weight_distribution",
+                    "detect_subjective_scoring",
+                    "check_scoring_completeness",
+                    "verify_consortium_rules",
                 ],
             },
         );
@@ -176,6 +200,10 @@ impl AgentRegistry {
                     "search_document",
                     "read_section",
                     "output_finding",
+                    // V4 进口产品 + 联合体审查
+                    "check_imported_products",
+                    // 技术参数矛盾检测
+                    "search_contradiction",
                 ],
             },
         );
@@ -194,6 +222,7 @@ impl AgentRegistry {
                     "search_document",
                     "read_section",
                     "output_finding",
+                    "search_contradiction",
                 ],
             },
         );
@@ -247,12 +276,37 @@ impl AgentRegistry {
             },
         );
 
+        // 打印全部 Agent 的工具职责分配（排查调用链路）
+        eprintln!("[AgentRegistry] ── Agent 工具职责分配总览 ──");
+        for (id, def) in definitions.iter() {
+            eprintln!(
+                "[AgentRegistry]   {} ({}) → {} 个工具: {:?}",
+                def.display_name,
+                id,
+                def.tool_names.len(),
+                def.tool_names
+            );
+        }
+        eprintln!("[AgentRegistry] ──────────────────────────────");
+
         Self { definitions }
     }
 
     /// 按 AgentId 查找定义。
     pub fn get(&self, id: AgentId) -> Option<&AgentDefinition> {
-        self.definitions.get(&id)
+        let def = self.definitions.get(&id);
+        if let Some(d) = def {
+            eprintln!(
+                "[AgentRegistry] get: {} ({}) → 工具 {} 个: {:?}",
+                d.display_name,
+                id,
+                d.tool_names.len(),
+                d.tool_names
+            );
+        } else {
+            eprintln!("[AgentRegistry] get: {} → 未注册!", id);
+        }
+        def
     }
 
     /// 按引用查找 Agent 定义（避免移动 ownership）。

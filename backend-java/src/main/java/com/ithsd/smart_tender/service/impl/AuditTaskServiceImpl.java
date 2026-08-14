@@ -3,6 +3,7 @@ package com.ithsd.smart_tender.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ithsd.smart_tender.common.BaseContext;
 import com.ithsd.smart_tender.common.BizException;
+import com.ithsd.smart_tender.common.TenantAuthException;
 import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
 import com.ithsd.smart_tender.mapper.KnowledgeFileMapper;
@@ -85,8 +86,16 @@ public class AuditTaskServiceImpl implements AuditTaskService {
     @Override
     @Transactional
     public AuditTaskCreateVO createTask(CreateAuditTaskRequest request) {
+        Long tenantId = TenantScope.requiredTenantId();
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, request.getBidId())
+                .eq(Tender::getTenantId, tenantId));
+        if (tender == null) {
+            throw TenantScope.resourceNotFound();
+        }
         LocalDateTime now = LocalDateTime.now();
         AuditTask entity = AuditTask.builder()
+                .tenantId(tenantId)
                 .taskId(buildTaskId())
                 .bidId(request.getBidId())
                 .taskStatus(AuditTaskStatusEnum.PENDING.getCode())
@@ -98,9 +107,8 @@ public class AuditTaskServiceImpl implements AuditTaskService {
                 .updatedAt(now)
                 .build();
         Long auditUserId = BaseContext.getCurrentId();
-        if (auditUserId == null && request.getBidId() != null) {
-            Tender tender = tenderMapper.selectById(request.getBidId());
-            if (tender != null) auditUserId = tender.getUploadUserId();
+        if (auditUserId == null) {
+            auditUserId = tender.getUploadUserId();
         }
         entity.setAuditUserId(auditUserId);
         auditTaskMapper.insert(entity);
@@ -127,12 +135,17 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         vo.setProgress(task.getProgress());
         vo.setIssueCount(0); // 不再从 DB 读 issue count，前端从 /result 获取
         vo.setFailedStages(task.getFailedStages() == null ? List.of() : task.getFailedStages());
-        vo.setTotalFileCount(auditTaskMapper.selectCount(null));
+        Long tenantId = TenantScope.requiredTenantId();
+        vo.setTotalFileCount(auditTaskMapper.selectCount(new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getTenantId, tenantId)));
         vo.setPendingFileCount(defLong(auditTaskMapper.selectCount(new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getTenantId, tenantId)
                 .eq(AuditTask::getTaskStatus, AuditTaskStatusEnum.PENDING.getCode()))));
         vo.setProcessingFileCount(defLong(auditTaskMapper.selectCount(new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getTenantId, tenantId)
                 .eq(AuditTask::getTaskStatus, AuditTaskStatusEnum.PROCESSING.getCode()))));
         vo.setFailedFileCount(defLong(auditTaskMapper.selectCount(new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getTenantId, tenantId)
                 .eq(AuditTask::getTaskStatus, AuditTaskStatusEnum.FAILED.getCode()))));
         return vo;
     }
@@ -153,7 +166,9 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         }
 
         // 获取 Rust 侧 document_id
-        Tender tender = tenderMapper.selectById(task.getBidId());
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, task.getBidId())
+                .eq(Tender::getTenantId, TenantScope.requiredTenantId()));
         if (tender == null || !StringUtils.hasText(tender.getRustDocumentId())) {
             log.warn("getResult: no rustDocumentId for taskId={}, bidId={}", taskId, task.getBidId());
             ResultVO vo = new ResultVO();
@@ -261,7 +276,9 @@ public class AuditTaskServiceImpl implements AuditTaskService {
     public List<Long> getAuditIdsByBidIds(List<Long> bidIds) {
         if (bidIds.isEmpty()) return List.of();
         LambdaQueryWrapper<AuditTask> qw = new LambdaQueryWrapper<AuditTask>()
-                .select(AuditTask::getId).in(AuditTask::getBidId, bidIds);
+                .select(AuditTask::getId)
+                .in(AuditTask::getBidId, bidIds)
+                .eq(AuditTask::getTenantId, TenantScope.requiredTenantId());
         return auditTaskMapper.selectObjs(qw).stream()
                 .filter(Objects::nonNull).filter(obj -> obj instanceof Long)
                 .map(obj -> (Long) obj).toList();
@@ -279,7 +296,8 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         List<Long> bidIds = tenderService.getBidIdsByUserId(userId);
         if (bidIds.isEmpty()) return result;
 
-        List<Map<String, Object>> counts = auditTaskMapper.countByWeek(bidIds);
+        List<Map<String, Object>> counts = auditTaskMapper.countByWeek(
+                TenantScope.requiredTenantId(), bidIds);
         LocalDate today = LocalDate.now();
         LocalDate monday = today.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY));
         DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd");
@@ -303,7 +321,9 @@ public class AuditTaskServiceImpl implements AuditTaskService {
     @Transactional
     public void markTaskProcessing(String taskId) {
         AuditTask task;
-        try { task = loadTask(taskId); } catch (Exception e) {
+        try { task = loadTask(taskId); } catch (TenantAuthException e) {
+            throw e;
+        } catch (Exception e) {
             log.warn("markTaskProcessing: task not found taskId={}", taskId); return;
         }
         if (AuditTaskStatusEnum.COMPLETED.getCode().equals(task.getTaskStatus())
@@ -313,7 +333,9 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         if (task.getProgress() == null || task.getProgress() < 5) task.setProgress(5);
         if (task.getStartTime() == null) task.setStartTime(LocalDateTime.now());
         task.setUpdatedAt(LocalDateTime.now());
-        auditTaskMapper.updateById(task);
+        auditTaskMapper.update(task, new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getId, task.getId())
+                .eq(AuditTask::getTenantId, TenantScope.requiredTenantId()));
         emitSafe(taskId, SseEventTypeEnum.PROGRESS, getStatus(taskId));
     }
 
@@ -321,7 +343,9 @@ public class AuditTaskServiceImpl implements AuditTaskService {
     @Transactional
     public void markTaskFailed(String taskId, String errorMessage) {
         AuditTask task;
-        try { task = loadTask(taskId); } catch (Exception e) {
+        try { task = loadTask(taskId); } catch (TenantAuthException e) {
+            throw e;
+        } catch (Exception e) {
             log.warn("markTaskFailed: task not found taskId={}", taskId); return;
         }
         if (AuditTaskStatusEnum.COMPLETED.getCode().equals(task.getTaskStatus())) return;
@@ -331,7 +355,9 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         if (task.getProgress() == null) task.setProgress(0);
         task.setEndTime(LocalDateTime.now());
         task.setUpdatedAt(LocalDateTime.now());
-        auditTaskMapper.updateById(task);
+        auditTaskMapper.update(task, new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getId, task.getId())
+                .eq(AuditTask::getTenantId, TenantScope.requiredTenantId()));
         emitSafe(taskId, SseEventTypeEnum.PROGRESS, getStatus(taskId));
     }
 
@@ -362,9 +388,11 @@ public class AuditTaskServiceImpl implements AuditTaskService {
 
     private AuditTask loadTask(String taskId) {
         AuditTask task = auditTaskMapper.selectOne(
-                new LambdaQueryWrapper<AuditTask>().eq(AuditTask::getTaskId, taskId));
+                new LambdaQueryWrapper<AuditTask>()
+                        .eq(AuditTask::getTaskId, taskId)
+                        .eq(AuditTask::getTenantId, TenantScope.requiredTenantId()));
         if (task == null) {
-            throw new BizException(404, "任务不存在");
+            throw TenantScope.resourceNotFound();
         }
         // 验证资源归属：只有任务创建者或标书上传者才能访问
         Long currentUserId = BaseContext.getCurrentId();
@@ -382,7 +410,9 @@ public class AuditTaskServiceImpl implements AuditTaskService {
             return true;
         }
         if (task.getBidId() != null) {
-            Tender tender = tenderMapper.selectById(task.getBidId());
+            Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                    .eq(Tender::getId, task.getBidId())
+                    .eq(Tender::getTenantId, TenantScope.requiredTenantId()));
             if (tender != null && userId.equals(tender.getUploadUserId())) {
                 return true;
             }
@@ -503,7 +533,9 @@ public class AuditTaskServiceImpl implements AuditTaskService {
     @Override
     public List<RustBlockBBoxResponse> getBlockBboxes(String taskId, String blockIds) {
         AuditTask task = loadTask(taskId);
-        Tender tender = tenderMapper.selectById(task.getBidId());
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, task.getBidId())
+                .eq(Tender::getTenantId, TenantScope.requiredTenantId()));
         if (tender == null || !StringUtils.hasText(tender.getRustDocumentId())) {
             log.warn("getBlockBboxes: tender not found or no rustDocumentId, taskId={}, bidId={}",
                     taskId, task.getBidId());

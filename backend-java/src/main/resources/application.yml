@@ -47,6 +47,13 @@ spring:
       max-file-size: 50MB
       max-request-size: 50MB
 
+security:
+  jwt:
+    # Local/test fallback only; production profile requires ST_JWT_SECRET.
+    secret: ${ST_JWT_SECRET:local-test-only-jwt-secret-change-me}
+    ttl-millis: ${ST_JWT_TTL_MILLIS:86400000}
+    accept-legacy-user-id: false
+
 # 文件存储配置
 file:
   storage:

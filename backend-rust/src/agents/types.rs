@@ -35,9 +35,51 @@ pub enum RiskTier {
     High,
 }
 
+/// 从 `AIBID_TIER_MAX_TURNS` 解析各档轮次上限（"low:N,medium:N,high:N"）。
+/// 任一档被设置则整体生效，未设置档用内置默认；未设置或格式错误返回 None。
+fn tier_max_turns_from_env() -> Option<(usize, usize, usize)> {
+    let raw = std::env::var("AIBID_TIER_MAX_TURNS").ok()?;
+    let mut caps = (5usize, 8usize, 14usize);
+    let mut any = false;
+    for part in raw.split(',') {
+        let (key, value) = part.split_once(':')?;
+        let n: usize = value.trim().parse().ok()?;
+        match key.trim() {
+            "low" => {
+                caps.0 = n;
+                any = true;
+            }
+            "medium" => {
+                caps.1 = n;
+                any = true;
+            }
+            "high" => {
+                caps.2 = n;
+                any = true;
+            }
+            _ => {}
+        }
+    }
+    if any {
+        Some(caps)
+    } else {
+        None
+    }
+}
+
 impl RiskTier {
     /// 返回该级别的默认 max_turns。
+    ///
+    /// 可用环境变量 `AIBID_TIER_MAX_TURNS="low:N,medium:N,high:N"` 覆盖各档上限，
+    /// 用于「降轮次」实验 A/B 对比；未设置时用内置默认 5/8/14。
     pub fn max_turns(&self) -> usize {
+        if let Some((low, medium, high)) = tier_max_turns_from_env() {
+            return match self {
+                RiskTier::Low => low,
+                RiskTier::Medium => medium,
+                RiskTier::High => high,
+            };
+        }
         match self {
             RiskTier::Low => 5,
             RiskTier::Medium => 8,
@@ -847,7 +889,8 @@ impl AgentId {
             AgentId::FactCheck,
             AgentId::Procedure,
             AgentId::RuleEngine,
-            // SemanticRisk + Scoring 已禁用（成本优化：效率 < 0.16 findings/call）
+            AgentId::SemanticRisk,
+            AgentId::Scoring,
             AgentId::Demand,
             AgentId::Contract,
         ]

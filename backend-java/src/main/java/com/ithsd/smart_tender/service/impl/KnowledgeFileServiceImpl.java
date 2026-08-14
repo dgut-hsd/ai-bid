@@ -2,10 +2,13 @@ package com.ithsd.smart_tender.service.impl;
 
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.ithsd.smart_tender.common.TenantAuthException;
+import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.mapper.KnowledgeFileMapper;
 import com.ithsd.smart_tender.model.entity.KnowledgeFile;
 import com.ithsd.smart_tender.model.result.PageResult;
 import com.ithsd.smart_tender.service.KnowledgeFileService;
+import com.ithsd.smart_tender.service.TenantAuthorizationService;
 
 import com.ithsd.smart_tender.service.StoragePathService;
 import lombok.extern.slf4j.Slf4j;
@@ -15,6 +18,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -42,9 +46,22 @@ public class KnowledgeFileServiceImpl extends ServiceImpl<KnowledgeFileMapper, K
     @Autowired
     private StoragePathService storagePathService;
 
+    @Autowired
+    private TenantAuthorizationService authorization;
+
+    @Override
+    public KnowledgeFile getVisibleById(Long fileId) {
+        if (fileId == null) {
+            return null;
+        }
+        TenantRequestContext context = currentContext();
+        return knowledgeMapper.findByIdAndTenantId(fileId, context.tenantId());
+    }
+
     @Override
     @Transactional(rollbackFor = Exception.class)
     public void uploadFile(MultipartFile file, String fileName, String category, String tags, String applicableScope, String description, Integer status) {
+        TenantRequestContext context = currentContext();
 
 
         //解析文件格式按日期分文件夹存入本地
@@ -86,6 +103,7 @@ public class KnowledgeFileServiceImpl extends ServiceImpl<KnowledgeFileMapper, K
 
         //用 builder 构建实体类
         KnowledgeFile knowledgeFile = KnowledgeFile.builder()
+                .tenantId(context.tenantId())
                 .fileName(fileName)
                 .filePath(storedPath)
                 .fileSize(fileSize)
@@ -96,6 +114,7 @@ public class KnowledgeFileServiceImpl extends ServiceImpl<KnowledgeFileMapper, K
                 .applicableScope(applicableScope)
                 .status(status == null ? 1 : status)
                 .version(1)
+                .uploadUserId(context.userId())
                 .build();
 
         try {
@@ -124,6 +143,7 @@ public class KnowledgeFileServiceImpl extends ServiceImpl<KnowledgeFileMapper, K
         Page<KnowledgeFile> pageInfo = new Page<>(page, size);
         // 构建查询条件
         LambdaQueryWrapper<KnowledgeFile> queryWrapper = new LambdaQueryWrapper<>();
+        queryWrapper.eq(KnowledgeFile::getTenantId, currentContext().tenantId());
         
         // 确保参数非空
         if (category != null && !category.isEmpty()) {
@@ -188,6 +208,7 @@ public class KnowledgeFileServiceImpl extends ServiceImpl<KnowledgeFileMapper, K
         Page<KnowledgeFile> pageInfo = new Page<>(page, size);
         // 构建查询条件
         LambdaQueryWrapper<KnowledgeFile> queryWrapper = new LambdaQueryWrapper<>();
+        queryWrapper.eq(KnowledgeFile::getTenantId, currentContext().tenantId());
         
         // 关键词搜索
         if (keyword != null && !keyword.isEmpty()) {
@@ -279,27 +300,29 @@ public class KnowledgeFileServiceImpl extends ServiceImpl<KnowledgeFileMapper, K
     @Override
     @Transactional(rollbackFor = Exception.class)
     public void deleteKnowledgeFile(Long fileId) {
-        KnowledgeFile knowledgeFile = this.getById(fileId);
-        if (knowledgeFile != null) {
-            knowledgeFile.setStatus(2); // 2表示已删除
-            this.updateById(knowledgeFile);
+        KnowledgeFile knowledgeFile = getVisibleById(fileId);
+        if (knowledgeFile == null) {
+            throw resourceNotFound();
         }
+        knowledgeFile.setStatus(2); // 2表示已删除
+        requireScopedUpdate(knowledgeFile, currentContext().tenantId());
     }
     
     @Override
     @Transactional(rollbackFor = Exception.class)
     public void updateKnowledgeFile(Long fileId, MultipartFile file, String fileName, String category, String tags, String applicableScope, String description, Integer status) {
+        TenantRequestContext context = currentContext();
         // 获取旧文件信息
-        KnowledgeFile oldFile = this.getById(fileId);
+        KnowledgeFile oldFile = getVisibleById(fileId);
         if (oldFile == null) {
-            throw new RuntimeException("文件不存在");
+            throw resourceNotFound();
         }
         
         // 判断是否上传了新文件
         if (file != null && !file.isEmpty()) {
             // 将旧文件标记为历史版本（状态设置为 0）
             oldFile.setStatus(0);
-            this.updateById(oldFile);
+            requireScopedUpdate(oldFile, context.tenantId());
             
             // 生成新版本号
             int newVersion = oldFile.getVersion() + 1;
@@ -336,6 +359,7 @@ public class KnowledgeFileServiceImpl extends ServiceImpl<KnowledgeFileMapper, K
             
             //用 builder 构建实体类
             KnowledgeFile knowledgeFile = KnowledgeFile.builder()
+                    .tenantId(context.tenantId())
                     .fileName(originalFilename)
                     .filePath(storedPath)
                     .fileSize(fileSize)
@@ -346,6 +370,7 @@ public class KnowledgeFileServiceImpl extends ServiceImpl<KnowledgeFileMapper, K
                     .applicableScope(applicableScope)
                     .status(status == null ? 1 : status)
                     .version(newVersion)
+                    .uploadUserId(context.userId())
                     .build();
             
             try {
@@ -377,17 +402,46 @@ public class KnowledgeFileServiceImpl extends ServiceImpl<KnowledgeFileMapper, K
             if (status != null) {
                 oldFile.setStatus(status);
             }
-            this.updateById(oldFile);
+            requireScopedUpdate(oldFile, context.tenantId());
         }
     }
 
     @Override
     public void updateKnowledgeFileStatus(Long fileId, int status) {
-        KnowledgeFile knowledgeFile = this.getById(fileId);
-        if (knowledgeFile != null) {
-            knowledgeFile.setStatus(status);
-            knowledgeFile.setUpdateTime(LocalDateTime.now());
-            this.updateById(knowledgeFile);
+        KnowledgeFile knowledgeFile = getVisibleById(fileId);
+        if (knowledgeFile == null) {
+            throw resourceNotFound();
+        }
+        KnowledgeFile update = new KnowledgeFile();
+        update.setStatus(status);
+        update.setUpdateTime(LocalDateTime.now());
+        requireScopedUpdate(update, currentContext().tenantId(), fileId);
+    }
+
+    private TenantRequestContext currentContext() {
+        return authorization.requireCurrentTenant();
+    }
+
+    private TenantAuthException resourceNotFound() {
+        return new TenantAuthException(
+                404,
+                "RESOURCE_NOT_FOUND",
+                "Knowledge file not found",
+                currentContext().requestId()
+        );
+    }
+
+    private void requireScopedUpdate(KnowledgeFile entity, Long tenantId) {
+        requireScopedUpdate(entity, tenantId, entity.getId());
+    }
+
+    private void requireScopedUpdate(KnowledgeFile entity, Long tenantId, Long fileId) {
+        LambdaUpdateWrapper<KnowledgeFile> update = new LambdaUpdateWrapper<>();
+        update.eq(KnowledgeFile::getId, fileId)
+                .eq(KnowledgeFile::getTenantId, tenantId);
+        int affectedRows = knowledgeMapper.update(entity, update);
+        if (affectedRows != 1) {
+            throw resourceNotFound();
         }
     }
 

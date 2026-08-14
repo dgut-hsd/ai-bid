@@ -25,6 +25,9 @@ public class AuditTask implements Serializable {
     @TableId(value = "id", type = IdType.AUTO)
     private Long id;
 
+    @TableField("tenant_id")
+    private Long tenantId;
+
     private String taskId;
 
     private Long bidId;

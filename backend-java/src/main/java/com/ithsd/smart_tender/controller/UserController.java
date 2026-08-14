@@ -1,22 +1,23 @@
 package com.ithsd.smart_tender.controller;
 
+import com.ithsd.smart_tender.common.TenantContext;
+import com.ithsd.smart_tender.common.TenantRequestContext;
+import com.ithsd.smart_tender.model.dto.TenantSwitchDTO;
 import com.ithsd.smart_tender.model.dto.UserLoginDTO;
 import com.ithsd.smart_tender.model.dto.UserRegisterDTO;
-import com.ithsd.smart_tender.model.entity.User;
 import com.ithsd.smart_tender.model.result.Result;
-import com.ithsd.smart_tender.model.vo.UserInfoVO;
 import com.ithsd.smart_tender.model.vo.UserLoginVO;
+import com.ithsd.smart_tender.service.TenantAuthService;
 import com.ithsd.smart_tender.service.UserService;
-import com.ithsd.smart_tender.common.util.JwtUtil;
-import io.jsonwebtoken.Claims;
 import lombok.RequiredArgsConstructor;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.util.StringUtils;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 
-import java.util.HashMap;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/auth")
@@ -24,87 +25,51 @@ import java.util.concurrent.TimeUnit;
 public class UserController {
 
     private final UserService userService;
-    private final StringRedisTemplate stringRedisTemplate;
-
-    private static final String SECRET_KEY = "smart_tender_secret_key_123456";
-    private static final long EXPIRATION_TIME = 1000 * 60 * 60 * 24; // 24 hours
+    private final TenantAuthService tenantAuthService;
 
     @PostMapping("/login")
     public Result<UserLoginVO> login(@RequestBody UserLoginDTO userLoginDTO) {
-        User user = null;
-        System.out.println(userLoginDTO);
-        try {
-            user = userService.login(userLoginDTO);
-        } catch (Exception e) {
-            return Result.error(401, e.getMessage());
-        }
-
-
-        Map<String, Object> claims = new HashMap<>();
-        claims.put("userId", user.getId());
-        claims.put("username", user.getUsername());
-
-        String token = JwtUtil.createJWT(SECRET_KEY, EXPIRATION_TIME, claims);
-
-        stringRedisTemplate.opsForValue().set("login:token:" + token, user.getId().toString(), EXPIRATION_TIME, TimeUnit.MILLISECONDS);
-
-        UserInfoVO userInfoVO = UserInfoVO.builder()
-                .id(user.getId())
-                .username(user.getUsername())
-                .realName(user.getRealName())
-                .build();
-
-        UserLoginVO vo = UserLoginVO.builder()
-                .token(token)
-                .userInfo(userInfoVO)
-                .build();
-
-        return Result.success(vo);
+        return Result.success(tenantAuthService.login(userLoginDTO));
     }
 
     @PostMapping("/logout")
-    public Result logout(@RequestHeader("Authorization") String token) {
-        if (StringUtils.hasText(token) && token.startsWith("Bearer ")) {
-            token = token.substring(7);
-            stringRedisTemplate.delete("login:token:" + token);
-        }
+    public Result<Void> logout(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @RequestHeader(value = "X-Request-Id", required = false) String requestId
+    ) {
+        tenantAuthService.logout(authorization, resolveRequestId(requestId));
         return Result.success();
     }
 
     @PostMapping("/refresh")
-    public Result refresh(@RequestHeader("Authorization") String token) {
-        if (!StringUtils.hasText(token) || !token.startsWith("Bearer ")) {
-            return Result.error(401, "Invalid token format");
-        }
-        token = token.substring(7);
+    public Result<UserLoginVO> refresh(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @RequestHeader(value = "X-Request-Id", required = false) String requestId
+    ) {
+        return Result.success(tenantAuthService.refresh(authorization, resolveRequestId(requestId)));
+    }
 
-
-        try {
-            Claims claims = JwtUtil.parseJWT(SECRET_KEY, token);
-            String userId = stringRedisTemplate.opsForValue().get("login:token:" + token);
-            
-            if (userId == null) {
-                return Result.error(401, "Token invalid or expired");
-            }
-
-            String newToken = JwtUtil.createJWT(SECRET_KEY, EXPIRATION_TIME, claims);
-
-            stringRedisTemplate.delete("login:token:" + token);
-            stringRedisTemplate.opsForValue().set("login:token:" + newToken, userId, EXPIRATION_TIME, TimeUnit.MILLISECONDS);
-
-            Map<String, String> data = new HashMap<>();
-            data.put("token", newToken);
-            
-            return Result.success(data);
-
-        } catch (Exception e) {
-            return Result.error(401, "Token validation failed: " + e.getMessage());
-        }
+    @PostMapping("/switch-tenant")
+    public Result<UserLoginVO> switchTenant(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @RequestHeader(value = "X-Request-Id", required = false) String requestId,
+            @RequestBody(required = false) TenantSwitchDTO request
+    ) {
+        return Result.success(tenantAuthService.switchTenant(
+                authorization, request, resolveRequestId(requestId)));
     }
 
     @PostMapping("/register")
-    public Result register(@RequestBody UserRegisterDTO userRegisterDTO) {
+    public Result<Void> register(@RequestBody UserRegisterDTO userRegisterDTO) {
         userService.register(userRegisterDTO);
         return Result.success();
+    }
+
+    private String resolveRequestId(String requestId) {
+        if (StringUtils.hasText(requestId) && requestId.length() <= 64) {
+            return requestId;
+        }
+        TenantRequestContext context = TenantContext.get();
+        return context == null ? UUID.randomUUID().toString() : context.requestId();
     }
 }

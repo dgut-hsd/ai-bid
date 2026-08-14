@@ -5,6 +5,9 @@ import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.ithsd.smart_tender.common.BaseContext;
 import com.ithsd.smart_tender.common.BizException;
+import com.ithsd.smart_tender.common.TenantContext;
+import com.ithsd.smart_tender.common.TenantAuthException;
+import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
 import com.ithsd.smart_tender.mapper.ProjectMapper;
 import com.ithsd.smart_tender.mapper.TenderMapper;
@@ -79,14 +82,18 @@ class TenderServiceImplTest {
     private ArgumentCaptor<Project> projectCaptor;
 
     private static final Long CURRENT_USER_ID = 10001L;
+    private static final Long CURRENT_TENANT_ID = 20001L;
 
     @BeforeEach
     void setUp() {
         BaseContext.setCurrentId(CURRENT_USER_ID);
+        TenantContext.set(new TenantRequestContext(
+                CURRENT_USER_ID, CURRENT_TENANT_ID, "OWNER", 1L, "tender-test"));
     }
 
     @AfterEach
     void tearDown() {
+        TenantContext.clear();
         BaseContext.removeCurrentId();
     }
 
@@ -100,6 +107,7 @@ class TenderServiceImplTest {
         TenderDTO dto = new TenderDTO();
         dto.setBidName("测试标书");
         dto.setProjectId(100L);
+        dto.setTenantId(30002L);
         dto.setSupplierName("测试供应商");
         dto.setBudgetAmount(new BigDecimal("1000000"));
         dto.setFileCategory("标书");
@@ -119,7 +127,7 @@ class TenderServiceImplTest {
                 .id(100L)
                 .latestVersion(null)
                 .build();
-        when(projectMapper.selectById(100L)).thenReturn(project);
+        when(projectMapper.selectOne(any())).thenReturn(project);
 
         TenderVO result = tenderService.upload(file, dto);
 
@@ -144,12 +152,13 @@ class TenderServiceImplTest {
         assertEquals("bid", captured.getFileCategory());
         assertEquals(0, captured.getParseStatus());
         assertEquals(CURRENT_USER_ID, captured.getUploadUserId());
+        assertEquals(CURRENT_TENANT_ID, captured.getTenantId());
         assertEquals(1, captured.getVersion());
         assertEquals(100L, captured.getProjectId());
         assertNotNull(captured.getUploadTime());
 
-        verify(projectMapper).selectById(100L);
-        verify(projectMapper).updateById(projectCaptor.capture());
+        verify(projectMapper, times(2)).selectOne(any());
+        verify(projectMapper).update(projectCaptor.capture(), any());
         assertEquals(1, projectCaptor.getValue().getLatestVersion());
         assertEquals(0, projectCaptor.getValue().getParseStatus());
         assertNotNull(projectCaptor.getValue().getUpdateTime());
@@ -187,6 +196,11 @@ class TenderServiceImplTest {
 
         TenderDTO dto = new TenderDTO();
         dto.setProjectId(100L);
+        when(projectMapper.selectOne(any()))
+                .thenReturn(Project.builder()
+                        .id(100L)
+                        .tenantId(CURRENT_TENANT_ID)
+                        .build());
 
         Path destPath = Paths.get("data", "uploads", "tenders", "2024-01-01", "uuid.pdf")
                 .toAbsolutePath().normalize();
@@ -202,6 +216,23 @@ class TenderServiceImplTest {
                 () -> tenderService.upload(file, dto));
         assertEquals(500, ex.getCode());
         assertTrue(ex.getMessage().contains("文件目录创建失败"));
+    }
+
+    @Test
+    void upload_shouldThrow404_whenProjectBelongsToOtherTenant() {
+        MultipartFile file = new MockMultipartFile(
+                "file", "test.pdf", "application/pdf", "data".getBytes());
+        TenderDTO dto = new TenderDTO();
+        dto.setProjectId(999L);
+        dto.setTenantId(30002L);
+        when(projectMapper.selectOne(any())).thenReturn(null);
+
+        TenantAuthException ex = assertThrows(TenantAuthException.class,
+                () -> tenderService.upload(file, dto));
+
+        assertEquals(404, ex.getStatus());
+        assertEquals("RESOURCE_NOT_FOUND", ex.getErrorCode());
+        verify(tenderMapper, never()).insert(any());
     }
 
     @Test
@@ -228,7 +259,7 @@ class TenderServiceImplTest {
                 .id(101L)
                 .latestVersion(2)
                 .build();
-        when(projectMapper.selectById(101L)).thenReturn(project);
+        when(projectMapper.selectOne(any())).thenReturn(project);
 
         TenderVO result = tenderService.upload(file, dto);
 
@@ -260,7 +291,7 @@ class TenderServiceImplTest {
         when(storagePathService.buildTenderUploadPath("contract.pdf")).thenReturn(destPath);
         when(storagePathService.toStoredPath(destPath))
                 .thenReturn("tenders/2024-01-01/uuid.pdf");
-        when(projectMapper.selectById(102L)).thenReturn(Project.builder().id(102L).build());
+        when(projectMapper.selectOne(any())).thenReturn(Project.builder().id(102L).build());
 
         TenderVO result = tenderService.upload(file, dto);
 
@@ -289,7 +320,7 @@ class TenderServiceImplTest {
         when(storagePathService.buildTenderUploadPath("default.pdf")).thenReturn(destPath);
         when(storagePathService.toStoredPath(destPath))
                 .thenReturn("tenders/2024-01-01/uuid.pdf");
-        when(projectMapper.selectById(103L)).thenReturn(Project.builder().id(103L).build());
+        when(projectMapper.selectOne(any())).thenReturn(Project.builder().id(103L).build());
 
         TenderVO result = tenderService.upload(file, dto);
 
@@ -561,7 +592,7 @@ class TenderServiceImplTest {
                 .projectId(200L)
                 .build();
 
-        when(tenderMapper.selectById(tenderId)).thenReturn(tender);
+        when(tenderMapper.selectOne(any())).thenReturn(tender);
 
         AuditTask completedTask = AuditTask.builder()
                 .id(1L)
@@ -601,7 +632,7 @@ class TenderServiceImplTest {
                 .version(1)
                 .build();
 
-        when(tenderMapper.selectById(tenderId)).thenReturn(tender);
+        when(tenderMapper.selectOne(any())).thenReturn(tender);
 
         AuditTask processingTask = AuditTask.builder()
                 .id(2L)
@@ -620,12 +651,13 @@ class TenderServiceImplTest {
     }
 
     @Test
-    void getById_shouldReturnNull_whenTenderNotFound() {
-        when(tenderMapper.selectById(999L)).thenReturn(null);
+    void getById_shouldReturn404_whenTenderNotFound() {
+        when(tenderMapper.selectOne(any())).thenReturn(null);
 
-        TenderVO result = tenderService.getById(999L);
-
-        assertNull(result);
+        TenantAuthException ex = assertThrows(TenantAuthException.class,
+                () -> tenderService.getById(999L));
+        assertEquals(404, ex.getStatus());
+        assertEquals("RESOURCE_NOT_FOUND", ex.getErrorCode());
     }
 
     @Test
@@ -636,7 +668,7 @@ class TenderServiceImplTest {
                 .uploadUserId(999L) // different user
                 .build();
 
-        when(tenderMapper.selectById(tenderId)).thenReturn(tender);
+        when(tenderMapper.selectOne(any())).thenReturn(tender);
 
         BizException ex = assertThrows(BizException.class,
                 () -> tenderService.getById(tenderId));
@@ -656,7 +688,7 @@ class TenderServiceImplTest {
                 .projectName("测试项目")
                 .build();
 
-        when(projectMapper.selectById(projectId)).thenReturn(project);
+        when(projectMapper.selectOne(any())).thenReturn(project);
 
         Tender v1 = Tender.builder()
                 .id(1L)
@@ -699,12 +731,12 @@ class TenderServiceImplTest {
 
     @Test
     void getVersionsByProjectId_shouldThrow_whenProjectNotFound() {
-        when(projectMapper.selectById(999L)).thenReturn(null);
+        when(projectMapper.selectOne(any())).thenReturn(null);
 
-        BizException ex = assertThrows(BizException.class,
+        TenantAuthException ex = assertThrows(TenantAuthException.class,
                 () -> tenderService.getVersionsByProjectId(999L));
-        assertEquals(404, ex.getCode());
-        assertTrue(ex.getMessage().contains("项目不存在"));
+        assertEquals(404, ex.getStatus());
+        assertEquals("RESOURCE_NOT_FOUND", ex.getErrorCode());
     }
 
     @Test
@@ -715,7 +747,7 @@ class TenderServiceImplTest {
                 .userId(999L) // different user
                 .build();
 
-        when(projectMapper.selectById(projectId)).thenReturn(project);
+        when(projectMapper.selectOne(any())).thenReturn(project);
 
         BizException ex = assertThrows(BizException.class,
                 () -> tenderService.getVersionsByProjectId(projectId));
@@ -729,6 +761,8 @@ class TenderServiceImplTest {
         BaseContext.removeCurrentId();
 
         Long projectId = 100L;
+        when(projectMapper.selectOne(any())).thenReturn(
+                Project.builder().id(projectId).tenantId(CURRENT_TENANT_ID).build());
         List<TenderVO> result = tenderService.getVersionsByProjectId(projectId);
 
         // Without current user, the query proceeds without ownership check
@@ -845,7 +879,7 @@ class TenderServiceImplTest {
                 .uploadUserId(CURRENT_USER_ID)
                 .build();
 
-        when(tenderMapper.selectById(tenderId)).thenReturn(tender);
+        when(tenderMapper.selectOne(any())).thenReturn(tender);
 
         Path storedPath = Paths.get("data", "uploads", "tenders",
                 "2024-01-01", "to-delete.pdf").toAbsolutePath().normalize();
@@ -854,17 +888,20 @@ class TenderServiceImplTest {
 
         assertDoesNotThrow(() -> tenderService.delete(tenderId));
 
-        verify(tenderMapper).deleteById(tenderId);
+        verify(tenderMapper).delete(any());
         verify(storagePathService).resolveStoredPath("tenders/2024-01-01/to-delete.pdf");
     }
 
     @Test
-    void delete_shouldReturnSilently_whenTenderNotFound() {
-        when(tenderMapper.selectById(999L)).thenReturn(null);
+    void delete_shouldReturn404_whenTenderNotFound() {
+        when(tenderMapper.selectOne(any())).thenReturn(null);
 
-        assertDoesNotThrow(() -> tenderService.delete(999L));
+        TenantAuthException ex = assertThrows(TenantAuthException.class,
+                () -> tenderService.delete(999L));
+        assertEquals(404, ex.getStatus());
+        assertEquals("RESOURCE_NOT_FOUND", ex.getErrorCode());
 
-        verify(tenderMapper, never()).deleteById(any());
+        verify(tenderMapper, never()).delete(any());
         verify(storagePathService, never()).resolveStoredPath(any());
     }
 
@@ -877,14 +914,14 @@ class TenderServiceImplTest {
                 .uploadUserId(999L) // different user
                 .build();
 
-        when(tenderMapper.selectById(tenderId)).thenReturn(tender);
+        when(tenderMapper.selectOne(any())).thenReturn(tender);
 
         BizException ex = assertThrows(BizException.class,
                 () -> tenderService.delete(tenderId));
         assertEquals(403, ex.getCode());
         assertTrue(ex.getMessage().contains("无权删除"));
 
-        verify(tenderMapper, never()).deleteById(any());
+        verify(tenderMapper, never()).delete(any());
     }
 
     // ========================= getBidIdsByUserId =========================

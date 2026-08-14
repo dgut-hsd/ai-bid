@@ -1,6 +1,12 @@
 # ── 生产环境配置覆盖 ──
 server:
-  port: 8086
+  port: 3000
+
+security:
+  jwt:
+    secret: ${ST_JWT_SECRET:local-test-only-jwt-secret-change-me}
+    ttl-millis: ${ST_JWT_TTL_MILLIS:86400000}
+    accept-legacy-user-id: false
 
 file:
   storage:

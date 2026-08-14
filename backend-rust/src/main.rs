@@ -27,6 +27,29 @@ use ai_bid::agents::tools::search_document::SearchDocumentTool;
 use ai_bid::agents::tools::search_knowledge::{
     DashScopeSearchBackend, SearchBuffer, SearchKnowledgeTool,
 };
+// V2+ 工具
+use ai_bid::agents::tools::compare_versions::CompareVersionsTool;
+use ai_bid::agents::tools::detect_boilerplate::DetectBoilerplateTool;
+// 零依赖计算/检查工具
+use ai_bid::agents::tools::calculate_timeline::CalculateTimelineTool;
+// 依赖 chunk 数据的工具
+use ai_bid::agents::tools::check_cross_reference::CheckCrossReferenceTool;
+use ai_bid::agents::tools::extract_obligations::ExtractObligationsTool;
+use ai_bid::agents::tools::compare_with_template::{CompareWithTemplateTool, ChunkTextProvider, TemplateStore};
+use ai_bid::agents::tools::validate_calculation::ValidateCalculationTool;
+use ai_bid::agents::tools::search_contradiction::SearchContradictionTool;
+// V3 采购程序合规审查
+use ai_bid::agents::tools::verify_procurement_method::VerifyProcurementMethodTool;
+use ai_bid::agents::tools::verify_bid_deposit::VerifyBidDepositTool;
+use ai_bid::agents::tools::verify_announcement_period::VerifyAnnouncementPeriodTool;
+use ai_bid::agents::tools::verify_bid_preparation_period::VerifyBidPreparationPeriodTool;
+// V4 评审标准审查
+use ai_bid::agents::tools::validate_scoring_formula::ValidateScoringFormulaTool;
+use ai_bid::agents::tools::validate_weight_distribution::ValidateWeightDistributionTool;
+use ai_bid::agents::tools::detect_subjective_scoring::DetectSubjectiveScoringTool;
+use ai_bid::agents::tools::check_scoring_completeness::CheckScoringCompletenessTool;
+use ai_bid::agents::tools::check_imported_products::CheckImportedProductsTool;
+use ai_bid::agents::tools::verify_consortium_rules::VerifyConsortiumRulesTool;
 use ai_bid::agents::trace::TraceLog;
 use ai_bid::agents::types::{ChatAgentConfig, CoordinatorConfig, CoordinatorOutput, ReviewClause};
 use ai_bid::services::llm_client::create_llm_client;
@@ -517,10 +540,14 @@ async fn main() -> Result<()> {
     //   EMBED_ENGINE=local  → 本地 BGE-M3 数据并行（默认，需 models/ 缓存）
     //   EMBED_ENGINE=remote → 远程 text-embedding-v4（需 DASHSCOPE_API_KEY）
     //
-    // 本地模式 K 值（数据并行实例数）：
+    // 本地模式 K 值（数据并行实例数，由 AIBID_EMBED_PARALLELISM 覆盖）：
     //   K=1 → ~1.2GB          K=2 → ~2.4GB, ~1.8×（推荐）
     //   K=3 → ~3.6GB, ~2.5×   K=4 → ~4.8GB, ~3.2×
-    const EMBED_PARALLELISM: usize = 2;
+    // 低内存机器（<16GB）建议 K=1，避免与 Ollama + Neo4j 等并发时 OOM。
+    let embed_parallelism: usize = env::var("AIBID_EMBED_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
 
     let embed_engine = env::var("EMBED_ENGINE").unwrap_or_else(|_| "local".to_string());
     let is_remote = embed_engine == "remote";
@@ -544,13 +571,13 @@ async fn main() -> Result<()> {
     } else {
         println!(
             "正在生成 BGE-M3 Embedding（数据并行: {} 实例）...",
-            EMBED_PARALLELISM
+            embed_parallelism
         );
         ai_bid::services::embedding_service::embed_chunks_parallel(
             &chunks,
             &chunking_config,
             &sections_output.document_id,
-            EMBED_PARALLELISM,
+            embed_parallelism,
         )?
     };
 
@@ -673,7 +700,7 @@ async fn main() -> Result<()> {
         let shared_search_buffer: Option<Arc<SearchBuffer>> = if search_backend == "searxng" {
             let url =
                 env::var("SEARXNG_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-            Some(SearchBuffer::new(url))
+            Some(SearchBuffer::new(url, None))
         } else {
             None
         };
@@ -800,7 +827,7 @@ async fn main() -> Result<()> {
         let searxng_url =
             env::var("SEARXNG_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
         println!("  SearXNG 搜索后端: {} (SearchBuffer 已启用)", searxng_url);
-        Some(SearchBuffer::new(searxng_url))
+        Some(SearchBuffer::new(searxng_url, None))
     } else {
         None
     };
@@ -837,6 +864,7 @@ async fn main() -> Result<()> {
         let ds_search = shared_dashscope_search.clone();
         let buffer = shared_search_buffer.clone();
         move || {
+            eprintln!("[main] ── 创建 Agent 工具集 ToolRegistry ──");
             let mut registry = ToolRegistry::new();
             registry.register(Box::new(SearchDocumentTool::new(
                 doc_index.clone(),
@@ -855,6 +883,58 @@ async fn main() -> Result<()> {
                 panic!("搜索后端未初始化");
             }
             registry.register(Box::new(OutputFindingTool));
+            // V2+ 工具
+            registry.register(Box::new(CompareVersionsTool::new(
+                chunk_map.clone(),
+                chunk_order.clone(),
+            )));
+            registry.register(Box::new(DetectBoilerplateTool::new(
+                chunk_map.clone(),
+                chunk_order.clone(),
+            )));
+            // V3 采购程序合规审查
+            registry.register(Box::new(VerifyProcurementMethodTool));
+            registry.register(Box::new(VerifyBidDepositTool));
+            registry.register(Box::new(VerifyAnnouncementPeriodTool));
+            registry.register(Box::new(VerifyBidPreparationPeriodTool));
+            // V4 评审标准审查
+            registry.register(Box::new(ValidateScoringFormulaTool));
+            registry.register(Box::new(ValidateWeightDistributionTool));
+            registry.register(Box::new(DetectSubjectiveScoringTool));
+            registry.register(Box::new(CheckScoringCompletenessTool));
+            registry.register(Box::new(CheckImportedProductsTool));
+            registry.register(Box::new(VerifyConsortiumRulesTool));
+            // 零依赖计算工具
+            registry.register(Box::new(CalculateTimelineTool));
+            // 依赖 chunk 数据的工具
+            registry.register(Box::new(CheckCrossReferenceTool::new(
+                chunk_map.clone(),
+                chunk_order.clone(),
+            )));
+            registry.register(Box::new(ExtractObligationsTool::new(
+                chunk_map.clone(),
+                chunk_order.clone(),
+            )));
+            // 模板比对（需要 ChunkTextProvider）
+            let template_text_provider = Arc::new(ChunkTextProvider {
+                chunks: chunk_map.clone(),
+            });
+            registry.register(Box::new(CompareWithTemplateTool::new(
+                Arc::new(TemplateStore::with_builtin_templates()),
+                template_text_provider,
+            )));
+            // 数值计算校验
+            registry.register(Box::new(ValidateCalculationTool));
+            // 矛盾检测
+            registry.register(Box::new(SearchContradictionTool::new(
+                chunk_map.clone(),
+                chunk_order.clone(),
+                None,
+            )));
+            eprintln!(
+                "[main] ── 工具集注册完成: 共 {} 个工具 ──",
+                registry.len()
+            );
             registry
         }
     });
@@ -967,6 +1047,23 @@ async fn main() -> Result<()> {
         let snap_json = serde_json::to_string_pretty(snap)?;
         fs::write(&snap_path, snap_json)?;
         println!("  Graph 快照已写入: {}", snap_path);
+    }
+
+    // 8.5 知识沉淀：审核结果 → 挑精华 → 查重 → 写 Neo4j（默认开启，可用 AIBID_WRITE_NEO4J=0 关闭）
+    if std::env::var("AIBID_WRITE_NEO4J").unwrap_or_else(|_| "1".into()) != "0" {
+        match ai_bid::knowledge::graph::Neo4jClient::connect().await {
+            Ok(client) => match ai_bid::knowledge::run::run(output.findings.clone(), &client).await {
+                Ok(written) => {
+                    println!("  知识沉淀: 写入 Neo4j {} 条新风险/法条", written);
+                }
+                Err(e) => {
+                    eprintln!("  知识沉淀警告: 写 Neo4j 失败（不影响审核结果）: {}", e);
+                }
+            },
+            Err(e) => {
+                eprintln!("  知识沉淀警告: 连接 Neo4j 失败（不影响审核结果）: {}", e);
+            }
+        }
     }
 
     println!();
