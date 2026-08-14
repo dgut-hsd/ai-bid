@@ -12,9 +12,9 @@
 //! ## 条款级风险分级 (L1/L2/L3)
 //!
 //! 每条条款携带 Coordinator 预判的 tier，控制 max_turns：
-//! - L1: 6 turns（纯信息/格式条款）
-//! - L2: 10 turns（标准审查）
-//! - L3: 12 turns（深度审查）
+//! - L1: 5 turns（纯信息/格式条款）
+//! - L2: 8 turns（标准审查）
+//! - L3: 14 turns（深度审查）
 //!
 //! 审查过程中支持动态升降级（turn 2 检测）。
 
@@ -1668,6 +1668,7 @@ impl ReActLoop {
                                     不要再搜索了。现在调用 output_finding。"
                                     .to_string(),
                             });
+                            force_output_next = true;
                             continue;
                         } else {
                             // L3: 连续 3+ 次空（Agent 无视了 L2 指令）→ 最后通牒
@@ -1682,6 +1683,7 @@ impl ReActLoop {
                                     立即输出 output_finding，no_risk 设为 true 亦可。"
                                         .to_string(),
                             });
+                            force_output_next = true;
                             // 不 continue——让正常流程追加 tool result（保持对话一致性）
                         }
                     } else {
@@ -1705,6 +1707,7 @@ impl ReActLoop {
                                             不要再搜索了。现在调用 output_finding。"
                                             .to_string(),
                                     });
+                                    force_output_next = true;
                                     continue;
                                 }
                             } else {
@@ -1726,10 +1729,8 @@ impl ReActLoop {
                             if !novel_refs.is_empty() {
                                 // 有新法规引用 → 重置确认搜索计数器
                                 seen_law_refs.extend(new_law_refs);
-                                if web_search_count >= 2 {
-                                    // 第 2 次及以后的搜索带来了新法规 → 标记"已找到可用的法规"
-                                    found_actionable_law = true;
-                                }
+                                // 搜索带来了新法规 → 标记"已找到可用的法规"
+                                found_actionable_law = true;
                                 post_law_search_count = 0;
                             } else if found_actionable_law {
                                 // 已找到法规，但本次搜索没有新法规引用 → 确认搜索
@@ -1750,7 +1751,9 @@ impl ReActLoop {
                                         下一轮将强制你输出结论。立即整理已有信息，调用 output_finding。"
                                         .to_string(),
                                 });
-                                force_output_next = true;
+                                if tier != RiskTier::High {
+                                    force_output_next = true;
+                                }
                                 continue;
                             }
 
@@ -1790,6 +1793,7 @@ impl ReActLoop {
                                         limit_msg
                                     ),
                                 });
+                                force_output_next = true;
                                 continue;
                             }
                         }
