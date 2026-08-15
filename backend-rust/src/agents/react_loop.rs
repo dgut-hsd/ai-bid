@@ -2412,6 +2412,7 @@ where
     let raw_findings_total = Arc::new(AtomicUsize::new(0));
     let make_agent = Arc::new(make_agent);
     let mut join_set = JoinSet::new();
+    let mut task_meta = HashMap::new();
 
     for (idx, clause) in clauses.iter().enumerate() {
         let clause = clause.clone();
@@ -2427,7 +2428,7 @@ where
         let raw_findings_total = raw_findings_total.clone();
         let execution_control = execution_control.clone();
 
-        join_set.spawn(async move {
+        let abort_handle = join_set.spawn(async move {
             let _permit = sem.acquire_owned().await;
             let _global_permit = if let Some(ref control) = execution_control {
                 Some(control.acquire().await?)
@@ -2535,20 +2536,44 @@ where
 
             Ok::<_, anyhow::Error>((idx, findings))
         });
+        task_meta.insert(abort_handle.id(), idx);
     }
 
     // 收集结果，按原始顺序排列
     let mut findings: Vec<Option<Vec<RiskFinding>>> = (0..total).map(|_| None).collect();
-    while let Some(result) = join_set.join_next().await {
+    while let Some(result) = join_set.join_next_with_id().await {
         match result {
-            Ok(Ok((idx, clause_findings))) => {
+            Ok((task_id, Ok((idx, clause_findings)))) => {
+                task_meta.remove(&task_id);
                 findings[idx] = Some(clause_findings);
             }
-            Ok(Err(e)) => {
+            Ok((task_id, Err(e))) => {
+                if let Some(idx) = task_meta.remove(&task_id)
+                    && let Some(ref graph) = graph
+                    && let Err(graph_error) = graph.fail_started_attempts(
+                        &agent_id,
+                        &[clauses[idx].chunk_id.clone()],
+                        ReviewAttemptErrorCode::TaskCancelled,
+                        "条款审查任务被取消",
+                    )
+                {
+                    eprintln!("[PARALLEL] 收口取消尝试失败: {}", graph_error);
+                }
                 eprintln!("[PARALLEL] 获取全局并发名额失败: {}", e);
             }
             Err(e) => {
-                // task panic — 为该 clause 生成占位 finding
+                if let Some(idx) = task_meta.remove(&e.id())
+                    && let Some(ref graph) = graph
+                    && let Err(graph_error) = graph.fail_started_attempts(
+                        &agent_id,
+                        &[clauses[idx].chunk_id.clone()],
+                        ReviewAttemptErrorCode::TaskPanic,
+                        "条款审查任务异常终止",
+                    )
+                {
+                    eprintln!("[PARALLEL] 收口崩溃尝试失败: {}", graph_error);
+                }
+                // task panic — 后续为该 clause 生成占位 finding
                 eprintln!("[PARALLEL] 条款审查 task 异常: {}", e);
             }
         }

@@ -1195,6 +1195,7 @@ impl Coordinator {
             let review_events = self.review_events.clone();
             let metrics = self.metrics.clone();
             let agent_id_str = agent_id.to_string();
+            let task_agent_id = agent_id.clone();
             let agent_label = registry_def
                 .as_ref()
                 .map(|d| d.display_name.to_string())
@@ -1354,7 +1355,7 @@ impl Coordinator {
                 }
             });
 
-            task_meta.insert(abort_handle.id(), (agent_id_str, clause_ids));
+            task_meta.insert(abort_handle.id(), (task_agent_id, clause_ids));
         }
 
         // 等待所有 Agent 完成
@@ -1372,9 +1373,10 @@ impl Coordinator {
         while !join_set.is_empty() {
             match tokio::time::timeout_at(deadline, join_set.join_next_with_id()).await {
                 Ok(Some(Ok((task_id, report)))) => {
-                    let (agent_id, _) = task_meta
-                        .remove(&task_id)
-                        .unwrap_or_else(|| ("unknown-agent".to_string(), Vec::new()));
+                    let (agent_id, _) = task_meta.remove(&task_id).unwrap_or_else(|| {
+                        (AgentId::Dynamic("unknown-agent".to_string()), Vec::new())
+                    });
+                    let agent_id = agent_id.to_string();
                     if report.successful_clauses > 0 {
                         successful_agents += 1;
                     } else {
@@ -1393,11 +1395,20 @@ impl Coordinator {
                     failed_clauses.extend(report.failed_clauses);
                 }
                 Ok(Some(Err(e))) => {
-                    let (agent_id, clause_ids) = task_meta
-                        .remove(&e.id())
-                        .unwrap_or_else(|| ("unknown-agent".to_string(), Vec::new()));
+                    let (agent_id, clause_ids) = task_meta.remove(&e.id()).unwrap_or_else(|| {
+                        (AgentId::Dynamic("unknown-agent".to_string()), Vec::new())
+                    });
                     eprintln!("  [EXECUTE] Agent task panicked: {}", e);
                     let message = format!("Agent task 异常终止: {}", e);
+                    self.graph
+                        .fail_started_attempts(
+                            &agent_id,
+                            &clause_ids,
+                            ReviewAttemptErrorCode::TaskPanic,
+                            &message,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                    let agent_id = agent_id.to_string();
                     failed_agents.push(AgentExecutionFailure {
                         agent_id: agent_id.clone(),
                         message: message.clone(),
@@ -1465,6 +1476,15 @@ impl Coordinator {
                     execution_control.record_pipeline_timeout_if_expired();
                     for (_task_id, (agent_id, clause_ids)) in task_meta.drain() {
                         let message = "Agent Execute 阶段超时取消".to_string();
+                        self.graph
+                            .fail_started_attempts(
+                                &agent_id,
+                                &clause_ids,
+                                ReviewAttemptErrorCode::TaskCancelled,
+                                &message,
+                            )
+                            .map_err(anyhow::Error::msg)?;
+                        let agent_id = agent_id.to_string();
                         failed_agents.push(AgentExecutionFailure {
                             agent_id: agent_id.clone(),
                             message: message.clone(),
@@ -3230,6 +3250,8 @@ mod tests {
 
     struct ConditionalPanicLlm;
 
+    struct SlowLlm;
+
     struct CountingLegalVerifyLlm {
         calls: Arc<AtomicUsize>,
     }
@@ -3275,6 +3297,19 @@ mod tests {
                 panic!("模拟单条条款 task 崩溃");
             }
             NoRiskLlm.chat(messages, tools, tool_choice).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for SlowLlm {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _tool_choice: &ToolChoice,
+        ) -> Result<LlmResponse> {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            unreachable!("测试应在 LLM 返回前取消任务")
         }
     }
 
@@ -3457,6 +3492,15 @@ mod tests {
             .await;
 
         assert!(result.is_err(), "Agent 崩溃时不得返回审核成功");
+        let snapshot = coordinator.graph.snapshot();
+        let attempt = snapshot
+            .review_attempts
+            .values()
+            .next()
+            .expect("已启动的审查尝试必须保留");
+        assert_eq!(attempt.status, ReviewAttemptStatus::Failed);
+        assert_eq!(attempt.error_code, Some(ReviewAttemptErrorCode::TaskPanic));
+        assert!(!snapshot.reviewed_by.contains_key("ch_panic"));
     }
 
     #[tokio::test]
@@ -3489,6 +3533,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_timeout_closes_started_attempt_as_cancelled() {
+        let mut config = CoordinatorConfig::default();
+        config.enabled_agents = vec![AgentId::FactCheck];
+        let mut coordinator = make_runtime_coordinator(config, Arc::new(|| Box::new(SlowLlm)));
+        let mut limits = crate::agents::execution_control::ExecutionLimits::default();
+        limits.execute_timeout = std::time::Duration::from_millis(20);
+        limits.pipeline_timeout = std::time::Duration::from_secs(1);
+        coordinator.global_execution_limiter = Arc::new(GlobalExecutionLimiter::new(limits));
+
+        let result = coordinator
+            .review(&[make_test_clause("ch_cancelled", "封面格式要求")])
+            .await;
+
+        assert!(result.is_err(), "Execute 超时后不得返回审核成功");
+        let snapshot = coordinator.graph.snapshot();
+        let attempt = snapshot
+            .review_attempts
+            .values()
+            .next()
+            .expect("取消前已启动的审查尝试必须保留");
+        assert_eq!(attempt.status, ReviewAttemptStatus::Failed);
+        assert_eq!(
+            attempt.error_code,
+            Some(ReviewAttemptErrorCode::TaskCancelled)
+        );
+        assert!(!snapshot.reviewed_by.contains_key("ch_cancelled"));
+    }
+
+    #[tokio::test]
     async fn one_failed_clause_keeps_agent_result_but_marks_partial_failed() {
         let mut config = CoordinatorConfig::default();
         config.enabled_agents = vec![AgentId::FactCheck];
@@ -3514,6 +3587,21 @@ mod tests {
         assert_eq!(
             output.execution_summary.failed_clauses[0].clause_id,
             "ch_failed"
+        );
+        let failed_attempt = output
+            .graph_snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .review_attempts
+                    .values()
+                    .find(|attempt| attempt.chunk_id == "ch_failed")
+            })
+            .expect("崩溃条款必须保留失败尝试");
+        assert_eq!(failed_attempt.status, ReviewAttemptStatus::Failed);
+        assert_eq!(
+            failed_attempt.error_code,
+            Some(ReviewAttemptErrorCode::TaskPanic)
         );
     }
 
