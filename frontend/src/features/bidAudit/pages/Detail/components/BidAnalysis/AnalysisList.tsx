@@ -1,5 +1,5 @@
 import React, { useMemo, useRef, useEffect } from 'react';
-import { Segmented, Typography, Tag, Space, Progress, Alert, Button } from 'antd';
+import { Segmented, Typography, Tag, Space, Progress, Alert } from 'antd';
 import { useStyles } from '../../style';
 import type { AuditIssue } from '../../types';
 import type { BBoxData } from '../../components/PDFPreview/PdfPreview';
