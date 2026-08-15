@@ -1066,7 +1066,8 @@ impl ReActLoop {
                         initial_tier,
                         final_tier: tier,
                         tier_escalated,
-                        truncated: false,
+                        // 基础设施错误必须进入条款失败统计，不能伪装成“无风险”。
+                        truncated: true,
                         suggested_agent: None,
                         citations: Vec::new(),
                         finding_role: FindingRole::default(),
@@ -2556,6 +2557,20 @@ mod multi_finding_tests {
 
     struct ConditionalSlowLlm;
 
+    struct AlwaysFailLlm;
+
+    #[async_trait::async_trait]
+    impl LlmClient for AlwaysFailLlm {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _tool_choice: &ToolChoice,
+        ) -> Result<LlmResponse> {
+            Err(anyhow::anyhow!("模拟 LLM 基础设施故障"))
+        }
+    }
+
     #[async_trait::async_trait]
     impl LlmClient for ConditionalSlowLlm {
         async fn chat(
@@ -2586,6 +2601,52 @@ mod multi_finding_tests {
                 usage: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn llm_failure_is_reported_as_clause_failure() {
+        let clauses = vec![ReviewClause {
+            chunk_id: "ch_llm_error".to_string(),
+            section_path: vec!["测试".to_string()],
+            text: "格式要求".to_string(),
+            page_start: 0,
+            page_end: 0,
+            tier: RiskTier::Low,
+            tier_max_turns: 1,
+        }];
+
+        let report = review_clauses_parallel_report(
+            &clauses,
+            |llm, tools| {
+                ReActLoop::new(
+                    AgentConfig {
+                        name: "TestAgent".to_string(),
+                        system_prompt: "测试".to_string(),
+                        default_max_turns: 1,
+                        tool_names: vec!["output_finding".to_string()],
+                    },
+                    llm,
+                    tools,
+                )
+            },
+            Arc::new(|| Box::new(AlwaysFailLlm)),
+            Arc::new(crate::agents::tools::ToolRegistry::new),
+            1,
+            None,
+            None,
+            "TestAgent",
+            None,
+        )
+        .await;
+
+        assert_eq!(report.successful_clauses, 0);
+        assert_eq!(report.failed_clauses.len(), 1);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| { finding.category_code == "ENGINE_ERROR" && finding.truncated })
+        );
     }
 
     #[async_trait::async_trait]

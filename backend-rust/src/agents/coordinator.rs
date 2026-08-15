@@ -64,6 +64,18 @@ struct ExecuteAgentsOutput {
     execution_summary: ExecutionSummary,
 }
 
+/// 取消尚未完成的 Agent，同时取回取消前已经完成但尚未轮询的结果。
+async fn abort_and_drain_agent_tasks(
+    join_set: &mut JoinSet<AgentTaskOutput>,
+) -> Vec<Result<(tokio::task::Id, AgentTaskOutput), tokio::task::JoinError>> {
+    join_set.abort_all();
+    let mut results = Vec::new();
+    while let Some(result) = join_set.join_next_with_id().await {
+        results.push(result);
+    }
+    results
+}
+
 // ─── 批量搜索辅助函数 ────────────────────────────────────────────
 
 /// 从 legal_basis 字符串提取搜索 query。
@@ -312,6 +324,15 @@ impl Coordinator {
             message: "关键词路由中...".to_string(),
         });
         let routing = self.route_clauses(clauses);
+        let routed_clause_ids: HashSet<&str> = routing
+            .values()
+            .flatten()
+            .map(|clause| clause.chunk_id.as_str())
+            .collect();
+        let unrouted_clauses: Vec<&ReviewClause> = clauses
+            .iter()
+            .filter(|clause| !routed_clause_ids.contains(clause.chunk_id.as_str()))
+            .collect();
         let effective_tasks = routing.values().map(Vec::len).sum();
         let execution_control = self
             .global_execution_limiter
@@ -390,7 +411,21 @@ impl Coordinator {
         let execution = self
             .execute_agents(&routing, execution_control.clone())
             .await?;
-        let execution_summary = execution.execution_summary;
+        let mut execution_summary = execution.execution_summary;
+        if !unrouted_clauses.is_empty() {
+            execution_summary.status = ReviewExecutionStatus::PartialFailed;
+            execution_summary
+                .failed_clauses
+                .extend(
+                    unrouted_clauses
+                        .into_iter()
+                        .map(|clause| ClauseExecutionFailure {
+                            agent_id: "Router".to_string(),
+                            clause_id: clause.chunk_id.clone(),
+                            message: "条款未命中任何已启用 Agent 的路由关键词".to_string(),
+                        }),
+                );
+        }
         let all_findings = execution.findings;
 
         // ── 指标：Execute 阶段耗时 + per-agent finding 统计 ──
@@ -1377,8 +1412,52 @@ impl Coordinator {
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    join_set.abort_all();
-                    while join_set.join_next().await.is_some() {}
+                    // abort_all 不会取消已经完成但尚未轮询的任务；必须带 task_id
+                    // 排空 JoinSet 并先保留这些结果，再把真正未完成的任务记为超时。
+                    for result in abort_and_drain_agent_tasks(&mut join_set).await {
+                        match result {
+                            Ok((task_id, report)) => {
+                                let (agent_id, _) = task_meta
+                                    .remove(&task_id)
+                                    .unwrap_or_else(|| ("unknown-agent".to_string(), Vec::new()));
+                                if report.successful_clauses > 0 {
+                                    successful_agents += 1;
+                                } else {
+                                    failed_agents.push(AgentExecutionFailure {
+                                        agent_id: agent_id.clone(),
+                                        message: "Agent 所有条款均执行失败".to_string(),
+                                    });
+                                }
+                                all_findings.extend(
+                                    report
+                                        .findings
+                                        .into_iter()
+                                        .filter(|finding| !finding.truncated),
+                                );
+                                failed_clauses.extend(report.failed_clauses);
+                            }
+                            Err(e) if e.is_cancelled() => {
+                                // 保留 task_meta，稍后统一记录为超时取消。
+                            }
+                            Err(e) => {
+                                let (agent_id, clause_ids) = task_meta
+                                    .remove(&e.id())
+                                    .unwrap_or_else(|| ("unknown-agent".to_string(), Vec::new()));
+                                let message = format!("Agent task 异常终止: {}", e);
+                                failed_agents.push(AgentExecutionFailure {
+                                    agent_id: agent_id.clone(),
+                                    message: message.clone(),
+                                });
+                                failed_clauses.extend(clause_ids.into_iter().map(|clause_id| {
+                                    ClauseExecutionFailure {
+                                        agent_id: agent_id.clone(),
+                                        clause_id,
+                                        message: message.clone(),
+                                    }
+                                }));
+                            }
+                        }
+                    }
                     execution_control.record_stage_failure(
                         ExecutionStage::Execute,
                         "Agent Execute 阶段超过 20 分钟",
@@ -3436,6 +3515,83 @@ mod tests {
             output.execution_summary.failed_clauses[0].clause_id,
             "ch_failed"
         );
+    }
+
+    #[tokio::test]
+    async fn abort_drain_keeps_completed_unpolled_agent_result() {
+        let mut join_set = JoinSet::new();
+        let completed = join_set.spawn(async {
+            AgentTaskOutput {
+                findings: Vec::new(),
+                successful_clauses: 1,
+                failed_clauses: Vec::new(),
+            }
+        });
+        join_set.spawn(async {
+            std::future::pending::<()>().await;
+            unreachable!("挂起任务应被取消")
+        });
+        while !completed.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let results = abort_and_drain_agent_tasks(&mut join_set).await;
+
+        assert!(results.iter().any(|result| matches!(
+            result,
+            Ok((_, report)) if report.successful_clauses == 1
+        )));
+        assert!(results.iter().any(|result| matches!(
+            result,
+            Err(error) if error.is_cancelled()
+        )));
+    }
+
+    #[tokio::test]
+    async fn unmatched_clause_is_recorded_as_partial_failure() {
+        let mut config = CoordinatorConfig::default();
+        config.enabled_agents = vec![AgentId::SemanticRisk];
+        let coordinator = make_runtime_coordinator(config, Arc::new(|| Box::new(NoRiskLlm)));
+
+        let output = coordinator
+            .review(&[
+                make_test_clause("ch_matched", "指定品牌要求"),
+                make_test_clause("ch_unmatched", "本文件是采购文件组成部分"),
+            ])
+            .await
+            .expect("已路由条款成功时应保留审核结果");
+
+        assert_eq!(
+            output.execution_summary.status,
+            ReviewExecutionStatus::PartialFailed
+        );
+        assert!(
+            output
+                .execution_summary
+                .failed_clauses
+                .iter()
+                .any(|failure| {
+                    failure.clause_id == "ch_unmatched" && failure.agent_id == "Router"
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn all_unmatched_clauses_are_not_reported_completed() {
+        let mut config = CoordinatorConfig::default();
+        config.enabled_agents = vec![AgentId::SemanticRisk];
+        let coordinator = make_runtime_coordinator(config, Arc::new(|| Box::new(NoRiskLlm)));
+
+        let output = coordinator
+            .review(&[make_test_clause("ch_unmatched", "本文件是采购文件组成部分")])
+            .await
+            .expect("漏路由应通过结构化失败返回");
+
+        assert_eq!(
+            output.execution_summary.status,
+            ReviewExecutionStatus::PartialFailed
+        );
+        assert_eq!(output.execution_summary.failed_clauses.len(), 1);
     }
 
     // ── [1] ROUTE 测试 ───────────────────────────────────────
