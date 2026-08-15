@@ -13,7 +13,6 @@ let isLoggingOut = false;
 // ── token refresh 并发控制 ───────────────────────────────────────────
 // 多个请求同时 401 时，只有第一个真正去 refresh，其余 await 同一个 pending promise；
 // refresh 成功后所有排队请求用新 token 重放，避免误触发 logout 踢用户下线。
-let isRefreshing = false;
 let refreshPromise: Promise<string> | null = null;
 
 function getRefreshToken(): string | null {
@@ -26,7 +25,6 @@ function getCurrentStorage(): Storage {
 
 function doRefresh(): Promise<string> {
   if (refreshPromise) return refreshPromise;
-  isRefreshing = true;
   refreshPromise = (async () => {
     const refreshToken = getRefreshToken();
     if (!refreshToken) throw new Error('no refresh token');
@@ -49,7 +47,6 @@ function doRefresh(): Promise<string> {
   refreshPromise
     .catch(() => { /* 错误由调用方处理 */ })
     .finally(() => {
-      isRefreshing = false;
       refreshPromise = null;
     });
   return refreshPromise;
@@ -65,12 +62,19 @@ function forceLogout() {
 }
 
 // 请求拦截器：自动注入 Token
+// 若调用方已显式设置 Authorization（例如用 refreshToken 调 /api/auth/refresh），则不覆盖，
+// 避免把可能已过期的 access token 强加给 refresh 等接口。
 request.interceptors.request.use((config) => {
+  const headers = config.headers as unknown as
+    | Record<string, string | undefined>
+    | undefined;
+  const explicitAuth = headers && (headers.Authorization || headers.authorization);
   const token =
     localStorage.getItem('token') || sessionStorage.getItem('token');
 
-  if (token && config.headers) {
-    config.headers.Authorization = `Bearer ${token}`;
+  if (!explicitAuth && token && config.headers) {
+    (config.headers as unknown as Record<string, string>).Authorization =
+      `Bearer ${token}`;
   }
 
   return config;
@@ -92,6 +96,17 @@ request.interceptors.response.use(
 
     // ── 401：认证相关，按 error_code 细分 ──────────────────────────
     if (status === 401) {
+      // 登录 / 注册 / 刷新接口自身的 401（如密码错误）不代表"需要刷新登录态"，
+      // 直接 reject 交给 UI 层展示错误提示，避免误触发 refresh → forceLogout → 整页刷新。
+      const reqUrl = (originalConfig?.url || '').toLowerCase();
+      if (
+        reqUrl.includes('/api/auth/login') ||
+        reqUrl.includes('/api/auth/register') ||
+        reqUrl.includes('/api/auth/refresh')
+      ) {
+        return Promise.reject(error);
+      }
+
       // TENANT_SESSION_STALE：租户会话已过期，不重放，直接清登录引导重新切租户
       if (errorCode === 'TENANT_SESSION_STALE') {
         console.warn('租户会话已过期，请重新切换租户');
@@ -143,5 +158,18 @@ request.interceptors.response.use(
     return Promise.reject(error);
   }
 );
+
+/**
+ * 从后端错误响应包络（{ data: { error_code } }）中提取业务错误码。
+ * 响应拦截器里直接读 error.response?.data?.error_code；此函数供测试与
+ * 需要单独判断 error_code 的调用方复用。
+ */
+export function extractErrorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null) return undefined;
+  const data = (error as { data?: unknown }).data;
+  if (typeof data !== 'object' || data === null) return undefined;
+  const code = (data as { error_code?: unknown }).error_code;
+  return typeof code === 'string' ? code : undefined;
+}
 
 export default request;

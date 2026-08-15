@@ -1,20 +1,14 @@
 import type { FormInstance } from 'antd';
+import type { AuthSession, ApiResponse } from '@/features/tenant/types';
 
 export interface LoginParams {
+   /** 登录使用手机号，与登录表单(LoginFormValues)保持一致。 */
    phone: string;
    password: string;
 }
 
-export interface UserInfo {
-   id: number;
-   username: string;
-   realName: string;
-}
-
-export interface LoginResponse {
-   token: string;
-   userInfo: UserInfo;
-}
+export type LoginResponse = AuthSession;
+export type AuthResponse = ApiResponse<AuthSession>;
 
 export interface RegisterParams {
    username: string;
