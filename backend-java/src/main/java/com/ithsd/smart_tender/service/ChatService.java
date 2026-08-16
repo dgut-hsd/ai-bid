@@ -2,6 +2,7 @@ package com.ithsd.smart_tender.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ithsd.smart_tender.common.BaseContext;
+import com.ithsd.smart_tender.common.TenantContext;
 import com.ithsd.smart_tender.mapper.ChatMessageMapper;
 import com.ithsd.smart_tender.mapper.TenderMapper;
 import com.ithsd.smart_tender.model.dto.ChatRequestDTO;
@@ -55,17 +56,20 @@ public class ChatService {
         Long bidId = requestDTO.getBidId();
         Long tenantId = TenantScope.requiredTenantId();
 
-        // 1. 保存用户消息
+        // 1. 先做租户隔离校验：标书必须属于当前租户，避免跨租户写入污染
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, bidId)
+                .eq(Tender::getTenantId, tenantId));
+        if (tender == null) {
+            throw TenantScope.resourceNotFound();
+        }
+
+        // 2. 保存用户消息（校验通过后再写入）
         ChatMessage userMsg = ChatMessage.builder()
                 .projectId(projectId).bidId(bidId).userId(userId)
                 .role("user").content(requestDTO.getContent())
                 .createTime(LocalDateTime.now()).build();
         chatMessageMapper.insert(userMsg);
-
-        // 2. 获取标书（租户隔离：必须附加 tenant_id）
-        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
-                .eq(Tender::getId, bidId)
-                .eq(Tender::getTenantId, tenantId));
 
         // 3. 确保文件已上传到 Rust（幂等，Rust 重启后自动重传）
         ChatResponseVO response;
@@ -116,14 +120,7 @@ public class ChatService {
         log.info("chatStream called: projectId={}, bidId={}, contentLen={}", projectId, bidId,
                 requestDTO.getContent() != null ? requestDTO.getContent().length() : 0);
 
-        // 1. Save user message
-        ChatMessage userMsg = ChatMessage.builder()
-                .projectId(projectId).bidId(bidId).userId(userId)
-                .role("user").content(requestDTO.getContent())
-                .createTime(LocalDateTime.now()).build();
-        chatMessageMapper.insert(userMsg);
-
-        // 2. Get tender & ensure uploaded to Rust (lazy upload, like sync chat())
+        // 1. 先做租户隔离校验：标书必须属于当前租户，避免跨租户写入污染
         Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
                 .eq(Tender::getId, bidId)
                 .eq(Tender::getTenantId, tenantId));
@@ -137,6 +134,13 @@ public class ChatService {
             sendErrorAsync(emitter, "标书不存在", bidId);
             return emitter;
         }
+
+        // 2. 保存用户消息（校验通过后再写入）
+        ChatMessage userMsg = ChatMessage.builder()
+                .projectId(projectId).bidId(bidId).userId(userId)
+                .role("user").content(requestDTO.getContent())
+                .createTime(LocalDateTime.now()).build();
+        chatMessageMapper.insert(userMsg);
 
         // ★ 触发懒上传到 Rust（对齐同步 chat() 的 chatViaRust 逻辑）
         final String rustDocId;
@@ -154,8 +158,9 @@ public class ChatService {
         log.info("chatStream: connecting to Rust SSE, docId={}", rustDocId);
 
         // 4. Async: connect to Rust SSE, relay events, save AI response on done
+        //    使用 TenantContext.wrap 传播请求线程上下文，否则内部签名会因缺失租户而失败（5706）。
         String threadName = "chat-stream-" + bidId;
-        new Thread(() -> {
+        new Thread(TenantContext.wrap(() -> {
             try {
                 CompletableFuture<Void> connected = rustApiClient.connectChatStream(
                         rustDocId, rustReq, (eventType, jsonNode) -> {
@@ -220,7 +225,7 @@ public class ChatService {
                     emitter.completeWithError(ex);
                 }
             }
-        }, threadName).start();
+        }), threadName).start();
 
         log.info("chatStream: emitter returned, bidId={}", bidId);
         return emitter;

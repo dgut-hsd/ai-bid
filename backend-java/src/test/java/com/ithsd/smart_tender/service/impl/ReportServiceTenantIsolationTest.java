@@ -13,10 +13,12 @@ import com.ithsd.smart_tender.mapper.UserMapper;
 import com.ithsd.smart_tender.model.entity.AuditTask;
 import com.ithsd.smart_tender.model.entity.Tender;
 import com.ithsd.smart_tender.model.vo.ReportVO;
+import com.ithsd.smart_tender.tenant.fixture.TenantQueryAssertions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -82,7 +84,9 @@ class ReportServiceTenantIsolationTest {
                 .hasMessageContaining("审核任务不存在");
 
         // resolveAuditId 尝试了 bidId 匹配和 auditId 匹配，都返回 null
-        verify(auditTaskMapper, atLeast(1)).selectOne(any(LambdaQueryWrapper.class));
+        ArgumentCaptor<LambdaQueryWrapper<AuditTask>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(auditTaskMapper, atLeast(1)).selectOne(captor.capture());
+        captor.getAllValues().forEach(w -> TenantQueryAssertions.assertTenantScoped(w, TENANT_A));
         // 不应生成报告或查询 issues
         verify(auditIssueMapper, never()).selectList(any(LambdaQueryWrapper.class));
         verify(auditReportMapper, never()).insert(any());
@@ -127,7 +131,9 @@ class ReportServiceTenantIsolationTest {
                 .hasMessageContaining("审核任务不存在");
 
         // resolveAuditId 尝试了 bidId 匹配和 auditId 匹配，都返回 null
-        verify(auditTaskMapper, atLeast(1)).selectOne(any(LambdaQueryWrapper.class));
+        ArgumentCaptor<LambdaQueryWrapper<AuditTask>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(auditTaskMapper, atLeast(1)).selectOne(captor.capture());
+        captor.getAllValues().forEach(w -> TenantQueryAssertions.assertTenantScoped(w, TENANT_A));
         verify(auditReportMapper, never()).selectOne(any(LambdaQueryWrapper.class));
     }
 

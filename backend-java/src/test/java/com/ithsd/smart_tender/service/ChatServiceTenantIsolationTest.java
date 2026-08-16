@@ -13,10 +13,12 @@ import com.ithsd.smart_tender.model.entity.Tender;
 import com.ithsd.smart_tender.model.vo.ChatMessageVO;
 import com.ithsd.smart_tender.service.engine.rust.RustApiClient;
 import com.ithsd.smart_tender.service.engine.rust.RustDocumentService;
+import com.ithsd.smart_tender.tenant.fixture.TenantQueryAssertions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -26,12 +28,14 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.*;
 
 /**
  * 跨租户隔离测试 — ChatService。
  *
- * <p>验证租户 A 的用户无法通过已知 bidId 读取租户 B 的标书聊天内容。</p>
+ * <p>验证租户 A 的用户无法通过已知 bidId 读取租户 B 的标书聊天内容，
+ * 且校验通过前不会写入任何消息。</p>
  */
 @ExtendWith(MockitoExtension.class)
 class ChatServiceTenantIsolationTest {
@@ -70,11 +74,6 @@ class ChatServiceTenantIsolationTest {
         TenantContext.set(new TenantRequestContext(USER_A, TENANT_A, "OWNER", 1L, "chat-test-a"));
     }
 
-    /** 租户 B 用户上下文 */
-    private void givenUserInTenantB() {
-        TenantContext.set(new TenantRequestContext(USER_A, TENANT_B, "OWNER", 1L, "chat-test-b"));
-    }
-
     private ChatRequestDTO buildChatRequest() {
         ChatRequestDTO dto = new ChatRequestDTO();
         dto.setProjectId(PROJECT_ID);
@@ -93,17 +92,14 @@ class ChatServiceTenantIsolationTest {
         when(tenderMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(null);
 
         ChatRequestDTO dto = buildChatRequest();
-        // ensureUploaded 会因标书不存在而抛异常 → 进入 catch 返回友好提示
-        when(rustDocumentService.ensureUploaded(eq(BID_ID), eq(TENANT_A)))
-                .thenThrow(new RuntimeException("标书不存在"));
 
-        var response = chatService.chat(dto);
-        assertThat(response.getContent()).contains("文档正在处理中");
+        assertThatThrownBy(() -> chatService.chat(dto))
+                .isInstanceOf(TenantAuthException.class)
+                .matches(ex -> ((TenantAuthException) ex).getErrorCode().equals("RESOURCE_NOT_FOUND"));
 
-        // 验证 tender 查询附带了 tenant_id
-        verify(tenderMapper).selectOne(any(LambdaQueryWrapper.class));
-        // chat 历史不应被查询（因为 tender 不属于此租户就进入了异常分支）
-        verify(chatMessageMapper, never()).selectList(any(LambdaQueryWrapper.class));
+        // 跨租户时不得写入任何消息，也不得调用 Rust 上传
+        verify(chatMessageMapper, never()).insert(any(ChatMessage.class));
+        verify(rustDocumentService, never()).ensureUploaded(anyLong(), anyLong());
     }
 
     @Test
@@ -118,6 +114,11 @@ class ChatServiceTenantIsolationTest {
         var response = chatService.chat(dto);
         // 应该尝试调用 Rust（可能有 network 错误，但不会因租户问题被拒）
         assertThat(response).isNotNull();
+
+        // 查询必须携带 tenant_id 过滤，否则 mock 返回 tender 也无法证明隔离生效
+        ArgumentCaptor<LambdaQueryWrapper<Tender>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(tenderMapper).selectOne(captor.capture());
+        TenantQueryAssertions.assertTenantScoped(captor.getValue(), TENANT_A);
     }
 
     // ── getHistory() ───────────────────────────────────────────
@@ -132,7 +133,9 @@ class ChatServiceTenantIsolationTest {
         List<ChatMessageVO> history = chatService.getHistory(PROJECT_ID, BID_ID, 10);
 
         assertThat(history).isEmpty();
-        verify(tenderMapper).selectOne(any(LambdaQueryWrapper.class));
+        ArgumentCaptor<LambdaQueryWrapper<Tender>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(tenderMapper).selectOne(captor.capture());
+        TenantQueryAssertions.assertTenantScoped(captor.getValue(), TENANT_A);
         verify(chatMessageMapper, never()).selectList(any(LambdaQueryWrapper.class));
     }
 
@@ -147,7 +150,9 @@ class ChatServiceTenantIsolationTest {
         List<ChatMessageVO> history = chatService.getHistory(PROJECT_ID, BID_ID, 10);
 
         assertThat(history).isEmpty(); // no messages, but no rejection either
-        verify(tenderMapper).selectOne(any(LambdaQueryWrapper.class));
+        ArgumentCaptor<LambdaQueryWrapper<Tender>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(tenderMapper).selectOne(captor.capture());
+        TenantQueryAssertions.assertTenantScoped(captor.getValue(), TENANT_A);
         verify(chatMessageMapper).selectList(any(LambdaQueryWrapper.class));
     }
 

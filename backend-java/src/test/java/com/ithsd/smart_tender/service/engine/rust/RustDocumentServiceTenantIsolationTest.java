@@ -5,8 +5,10 @@ import com.ithsd.smart_tender.common.BizException;
 import com.ithsd.smart_tender.mapper.TenderMapper;
 import com.ithsd.smart_tender.model.entity.Tender;
 import com.ithsd.smart_tender.service.StoragePathService;
+import com.ithsd.smart_tender.tenant.fixture.TenantQueryAssertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -49,7 +51,9 @@ class RustDocumentServiceTenantIsolationTest {
                 .isInstanceOf(BizException.class)
                 .matches(ex -> ((BizException) ex).getCode() == 5704);
 
-        verify(tenderMapper).selectOne(any(LambdaQueryWrapper.class));
+        ArgumentCaptor<LambdaQueryWrapper<Tender>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(tenderMapper).selectOne(captor.capture());
+        TenantQueryAssertions.assertTenantScoped(captor.getValue(), TENANT_A);
         verify(rustApiClient, never()).getDocument(any());
     }
 
@@ -66,7 +70,9 @@ class RustDocumentServiceTenantIsolationTest {
         String result = service.ensureUploaded(BID_ID, TENANT_A);
 
         assertThat(result).isEqualTo(RUST_DOC_ID);
-        verify(tenderMapper).selectOne(any(LambdaQueryWrapper.class));
+        ArgumentCaptor<LambdaQueryWrapper<Tender>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(tenderMapper).selectOne(captor.capture());
+        TenantQueryAssertions.assertTenantScoped(captor.getValue(), TENANT_A);
         verify(tenderMapper, never()).updateById(any());
     }
 
@@ -79,7 +85,9 @@ class RustDocumentServiceTenantIsolationTest {
         String result = service.getCachedDocumentId(BID_ID, TENANT_A);
 
         assertThat(result).isNull();
-        verify(tenderMapper).selectOne(any(LambdaQueryWrapper.class));
+        ArgumentCaptor<LambdaQueryWrapper<Tender>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(tenderMapper).selectOne(captor.capture());
+        TenantQueryAssertions.assertTenantScoped(captor.getValue(), TENANT_A);
     }
 
     @Test

@@ -11,10 +11,12 @@ import com.ithsd.smart_tender.mapper.TraceSessionMapper;
 import com.ithsd.smart_tender.model.entity.AuditTask;
 import com.ithsd.smart_tender.model.entity.TraceSession;
 import com.ithsd.smart_tender.model.vo.TraceSessionDetailVO;
+import com.ithsd.smart_tender.tenant.fixture.TenantQueryAssertions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -73,7 +75,9 @@ class TraceServiceTenantIsolationTest {
         var result = service.listByTaskId(TASK_ID, null, null, 1, 20);
 
         assertThat(result.getTotal()).isEqualTo(0L);
-        verify(auditTaskMapper).selectOne(any(LambdaQueryWrapper.class));
+        ArgumentCaptor<LambdaQueryWrapper<AuditTask>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(auditTaskMapper).selectOne(captor.capture());
+        TenantQueryAssertions.assertTenantScoped(captor.getValue(), TENANT_A);
         // 不应查询 trace session
         verify(sessionMapper, never()).selectPage(any(), any(LambdaQueryWrapper.class));
     }
@@ -117,7 +121,9 @@ class TraceServiceTenantIsolationTest {
 
         assertThat(result).isNull();
         verify(sessionMapper).selectById(SESSION_ID);
-        verify(auditTaskMapper).selectOne(any(LambdaQueryWrapper.class));
+        ArgumentCaptor<LambdaQueryWrapper<AuditTask>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(auditTaskMapper).selectOne(captor.capture());
+        TenantQueryAssertions.assertTenantScoped(captor.getValue(), TENANT_A);
         // 不应查询事件
         verify(eventMapper, never()).selectList(any(LambdaQueryWrapper.class));
     }

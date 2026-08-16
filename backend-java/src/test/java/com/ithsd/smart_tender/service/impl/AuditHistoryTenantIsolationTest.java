@@ -16,10 +16,12 @@ import com.ithsd.smart_tender.model.entity.AuditTask;
 import com.ithsd.smart_tender.model.entity.Tender;
 import com.ithsd.smart_tender.model.entity.User;
 import com.ithsd.smart_tender.model.vo.AuditHistoryDetailVO;
+import com.ithsd.smart_tender.tenant.fixture.TenantQueryAssertions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -86,7 +88,9 @@ class AuditHistoryTenantIsolationTest {
         AuditHistoryDetailVO result = service.getDetailById(AUDIT_TASK_ID);
 
         assertThat(result).isNull();
-        verify(auditTaskMapper).selectOne(any(LambdaQueryWrapper.class));
+        ArgumentCaptor<LambdaQueryWrapper<AuditTask>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(auditTaskMapper).selectOne(captor.capture());
+        TenantQueryAssertions.assertTenantScoped(captor.getValue(), TENANT_A);
         // 不应该去查子资源（issues / reports）
         verify(auditIssueMapper, never()).selectList(any(LambdaQueryWrapper.class));
         verify(auditReportMapper, never()).selectOne(any(LambdaQueryWrapper.class));
@@ -122,7 +126,9 @@ class AuditHistoryTenantIsolationTest {
 
         service.delete(AUDIT_TASK_ID);
 
-        verify(auditTaskMapper).selectOne(any(LambdaQueryWrapper.class));
+        ArgumentCaptor<LambdaQueryWrapper<AuditTask>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(auditTaskMapper).selectOne(captor.capture());
+        TenantQueryAssertions.assertTenantScoped(captor.getValue(), TENANT_A);
         verify(auditIssueMapper, never()).delete(any(LambdaQueryWrapper.class));
         verify(auditReportMapper, never()).delete(any(LambdaQueryWrapper.class));
         verify(auditTaskMapper, never()).delete(any(LambdaQueryWrapper.class));
@@ -151,7 +157,9 @@ class AuditHistoryTenantIsolationTest {
         var result = service.page(dto);
 
         assertThat(result).isNotNull();
-        verify(auditTaskMapper).selectPage(any(Page.class), any(LambdaQueryWrapper.class));
+        ArgumentCaptor<LambdaQueryWrapper<AuditTask>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(auditTaskMapper).selectPage(any(Page.class), captor.capture());
+        TenantQueryAssertions.assertTenantScoped(captor.getValue(), TENANT_A);
     }
 
     // ── getStatistics ──────────────────────────────────────────
@@ -166,7 +174,9 @@ class AuditHistoryTenantIsolationTest {
         Map<String, Object> stats = service.getStatistics(dto);
 
         assertThat(stats).containsKey("statusList");
-        verify(auditTaskMapper).selectList(any(LambdaQueryWrapper.class));
+        ArgumentCaptor<LambdaQueryWrapper<AuditTask>> captor = ArgumentCaptor.forClass(LambdaQueryWrapper.class);
+        verify(auditTaskMapper).selectList(captor.capture());
+        TenantQueryAssertions.assertTenantScoped(captor.getValue(), TENANT_A);
     }
 
     // ── TenantContext 缺失 ─────────────────────────────────────

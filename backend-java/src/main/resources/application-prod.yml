@@ -4,9 +4,15 @@ server:
 
 security:
   jwt:
-    secret: ${ST_JWT_SECRET:aibid-jwt-secret-dev-only-change-in-production}
+    # 生产环境必须显式注入签名密钥；缺失时启动即失败，杜绝硬编码回退密钥。
+    secret: ${ST_JWT_SECRET}
     ttl-millis: ${ST_JWT_TTL_MILLIS:86400000}
     accept-legacy-user-id: false
+
+rust:
+  api:
+    # 生产环境同样禁止默认内部签名密钥（与 Rust 侧一致，仅从环境变量读取）。
+    internal-secret: ${RUST_API_INTERNAL_SECRET}
 
 file:
   storage:
