@@ -30,6 +30,7 @@ use crate::agents::tools::{
     read_section::ReadSectionTool,
     search_document::SearchDocumentTool,
     search_knowledge::{DashScopeSearchBackend, SearchKnowledgeTool},
+    search_knowledge_base::SearchKnowledgeBaseTool,
     // V2+ 工具
     compare_versions::CompareVersionsTool,
     detect_boilerplate::DetectBoilerplateTool,
@@ -927,6 +928,10 @@ async fn run_review_pipeline(
             && let Some(ref ds) = ds_search
         {
             registry.register(Box::new(SearchKnowledgeTool::with_dashscope(ds.clone())));
+        }
+        // 本地知识库检索（与入库共享 EmbeddingClient，保证向量空间一致）
+        if let Some(ref ec) = ec_for_tools {
+            registry.register(Box::new(SearchKnowledgeBaseTool::new(ec.clone())));
         }
         registry.register(Box::new(OutputFindingTool));
         // V2+ 工具

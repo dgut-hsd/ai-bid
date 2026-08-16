@@ -2093,7 +2093,7 @@ impl ReActLoop {
 
     /// 判断是否为搜索类工具（兼容新旧工具名）。
     fn is_search_tool(&self, name: &str) -> bool {
-        name == "web_search" || name == "search_knowledge"
+        name == "web_search" || name == "search_knowledge" || name == "search_knowledge_base"
     }
 
     /// 统计搜索结果条数，兼容多种后端格式。
