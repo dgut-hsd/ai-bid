@@ -1,8 +1,9 @@
-//! 知识库（法规/标准库）导入接口
+//! 知识库（法规/标准库）导入 / 删除接口
 //!
-//! POST /api/v1/knowledge/ingest —— 供 Java 上传后异步触发，也支持 curl 手动导入。
+//! - POST   /api/v1/knowledge/ingest              —— 入库（供 Java 上传后异步触发，也支持 curl 手动导入）
+//! - DELETE /api/v1/knowledge/document/:document_id —— 按 document_id 删除某份文件的所有向量（供 Java 删除标准库文件时联动调用）
 
-use axum::extract::{Multipart, State};
+use axum::extract::{Extension, Multipart, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Serialize;
@@ -12,11 +13,12 @@ use uuid::Uuid;
 
 // 注意：handlers.rs 中 bad_request / server_error 均为私有函数，不可跨模块 use，
 // 此处按 handlers.rs 的 ErrorResponse { error, detail } 结构自行复制同构实现。
-use crate::api::handlers::{AppState, ErrorResponse};
+use crate::api::handlers::{AppState, ErrorResponse, InternalRequestContext};
 use crate::paths::data_path_str;
 use crate::services::knowledge_ingest_service::{
     ingest_file, IngestResult, TempFileGuard,
 };
+use crate::services::qdrant_store::QdrantStore;
 
 /// 上传文件大小上限（100MB），超出返回 413 Payload Too Large
 const MAX_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
@@ -114,6 +116,7 @@ impl IngestForm {
 /// multipart 字段：file（必填）、category、applicable_scope、document_name（可选）
 pub async fn ingest_knowledge(
     State(_state): State<AppState>,
+    Extension(ctx): Extension<InternalRequestContext>,
     mut multipart: Multipart,
 ) -> Result<Json<IngestResponse>, (StatusCode, Json<ErrorResponse>)> {
     let tmp_dir = data_path_str("tmp");
@@ -190,6 +193,7 @@ pub async fn ingest_knowledge(
         &display_name,
         &form.category,
         &form.applicable_scope,
+        &ctx.tenant_id,
     )
     .await
     .map_err(|e| server_error("入库失败", e))?;
@@ -198,6 +202,126 @@ pub async fn ingest_knowledge(
     drop(upload_guard);
 
     Ok(Json(IngestResponse::from_result(&result)))
+}
+
+/// DELETE /api/v1/knowledge/document/:document_id
+/// 按 document_id 删除某份文件在 Qdrant 中的所有向量（Java 组删除标准库文件时联动调用）。
+/// 多租户隔离：仅当文档归属当前租户时才会删除。
+pub async fn delete_knowledge_document(
+    Extension(ctx): Extension<InternalRequestContext>,
+    Path(document_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let store = QdrantStore::from_env().map_err(|e| server_error("Qdrant 初始化失败", e))?;
+    store
+        .delete_by_document(&document_id, Some(&ctx.tenant_id))
+        .await
+        .map_err(|e| server_error("删除向量失败", e))?;
+    Ok(Json(serde_json::json!({
+        "deleted": true,
+        "document_id": document_id,
+    })))
+}
+
+// ─── 知识库搜索（检索组）──────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub struct KnowledgeSearchRequest {
+    pub query: String,
+    #[serde(default = "default_top_k")]
+    pub top_k: u64,
+    pub category: Option<String>,
+    pub applicable_scope: Option<String>,
+}
+
+fn default_top_k() -> u64 { 10 }
+
+#[derive(Debug, serde::Serialize)]
+pub struct KnowledgeEvidence {
+    pub document_id: String,
+    pub document_name: String,
+    pub chunk_id: String,
+    pub relevance_score: f32,
+    pub text: String,
+    pub category: String,
+    pub section_path: Vec<String>,
+    pub page_start: usize,
+    pub page_end: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct KnowledgeSearchResponse {
+    pub evidences: Vec<KnowledgeEvidence>,
+    pub total_candidates: usize,
+    pub query_ms: u64,
+}
+
+/// POST /api/v1/knowledge/search
+pub async fn search_knowledge(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<InternalRequestContext>,
+    Json(req): Json<KnowledgeSearchRequest>,
+) -> Result<Json<KnowledgeSearchResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if req.query.trim().is_empty() {
+        return Err(bad_request("query 不能为空"));
+    }
+    if !(1..=50).contains(&req.top_k) {
+        return Err(bad_request("top_k 必须在 1..=50 之间"));
+    }
+    let t0 = std::time::Instant::now();
+
+    // 复用 AppState 中的嵌入客户端（尊重 EMBED_ENGINE 选择，
+    // 与入库使用同一向量空间，避免 local/remote 混用导致检索无意义）
+    let embed_client = {
+        let ec = state.embed_client.lock().unwrap();
+        ec.clone()
+    };
+    let query = req.query.clone();
+    let query_embeddings = tokio::task::spawn_blocking(move || {
+        let ec = embed_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("嵌入客户端未初始化"))?;
+        ec.encode_queries(&[query.as_str()])
+    })
+    .await
+    .map_err(|e| server_error("查询向量化任务失败", e))?
+    .map_err(|e| server_error("查询向量化失败", e))?;
+    let query_vec = query_embeddings.into_iter().next().unwrap_or_default();
+
+    let store = crate::services::qdrant_store::QdrantStore::from_env()
+        .map_err(|e| server_error("Qdrant 连接失败", e))?;
+    // 多租户隔离：只检索当前租户入库的文档
+    let results = store
+        .search(
+            query_vec,
+            req.top_k,
+            req.category.clone(),
+            req.applicable_scope.clone(),
+            Some(ctx.tenant_id.clone()),
+        )
+        .await
+        .map_err(|e| server_error("知识库搜索失败", e))?;
+
+    let evidences: Vec<KnowledgeEvidence> = results
+        .into_iter()
+        .map(|(score, payload)| KnowledgeEvidence {
+            document_id: payload.document_id,
+            document_name: payload.document_name,
+            chunk_id: payload.chunk_id,
+            relevance_score: score,
+            text: payload.embed_text,
+            category: payload.category,
+            section_path: payload.section_path,
+            page_start: payload.page_start,
+            page_end: payload.page_end,
+        })
+        .collect();
+
+    let total = evidences.len();
+    Ok(Json(KnowledgeSearchResponse {
+        evidences,
+        total_candidates: total,
+        query_ms: t0.elapsed().as_millis() as u64,
+    }))
 }
 
 #[cfg(test)]
