@@ -205,11 +205,13 @@ fn category_from_alias(value: &str) -> Option<&'static str> {
 
 /// Critical 红线判定。
 ///
-/// Day 1：从 risk_taxonomy.rs 迁入 5 类。
-/// Day 3：扩到 8 类（catalog.yaml 中 `critical_default: true` 的全部类别），
-///        补 OEM_AUTHORIZATION / UNBOUNDED_IP / UNILATERAL_CHANGE。
-///        其余 7 类显式返回 false（catalog critical_default: false）。
+/// 类别级开关来自 `catalog.yaml` 的 `critical_default`（单一事实源，engine
+/// 实际读取，不再是死数据）；仅在类别默认 Critical 时，才继续用证据关键词
+/// 判断该条款是否真正触发红线。
 fn critical_evidence(code: &str, quote: &str) -> bool {
+    if !crate::rules::catalog::is_critical_default(code) {
+        return false;
+    }
     match code {
         "LOCAL_REGISTRATION" => {
             contains_any(quote, &["注册", "分公司", "分支机构", "营业执照", "纳税"])
@@ -234,48 +236,62 @@ fn critical_evidence(code: &str, quote: &str) -> bool {
             contains_any(quote, &["注册资本", "实缴资本", "营业收入", "资产总额", "净资产", "业务收入", "主营", "规模"])
                 && contains_any(quote, &["不得低于", "不少于", "以上", "资格", "不低于", "达到", "未达到"])
         }
-        // Day 3 新增：OEM_AUTHORIZATION（catalog critical_default: true）
         "OEM_AUTHORIZATION" => {
             contains_any(quote, &["原厂", "厂家", "制造商", "总代理商", "原厂商"])
                 && contains_any(quote, &["授权", "承诺函", "专项授权书", "项目授权书", "代理证明"])
                 && contains_any(quote, &["资格", "无效", "废标", "必须", "须", "作为资格条件", "必备材料", "终止审查"])
         }
-        // Day 3 新增：UNBOUNDED_IP（catalog critical_default: true）
         "UNBOUNDED_IP" => {
             contains_any(quote, &["知识产权", "侵权", "专利", "著作权", "软件著作权"])
                 && contains_any(quote, &["全部责任", "一切责任", "无限", "无上限", "永久归", "不设最高限额"])
         }
-        // Day 3 新增：UNILATERAL_CHANGE（catalog critical_default: true）
         "UNILATERAL_CHANGE" => {
             contains_any(quote, &["单方", "采购人有权变更", "任意调整需求", "新增需求由供应商"])
                 && contains_any(quote, &["不得调整", "不调整", "无条件", "费用不变", "工期不变", "原合同范围"])
         }
-        // 7 个非 Critical 类别（catalog critical_default: false）显式返回 false
-        "SHORT_DEADLINE" | "EXCESSIVE_DEPOSIT" | "SUBJECTIVE_SCORING" | "LOCAL_AWARD"
-        | "VAGUE_ACCEPTANCE" | "CONFLICTING_DATES" | "UNCLEAR_PENALTY" => false,
+        // 其余类别（catalog critical_default: false）已在上方被过滤，不会到达这里
         _ => false,
     }
 }
 
 // ── YAML 规则库接入（离线缓存 + 主链路集成）─────────────────────────────
 
-const RULEBOOK_PATH: &str = "src/rules/data/conditions.yaml";
+/// 相对 crate 根（CARGO_MANIFEST_DIR = backend-rust/）定位规则库，
+/// 不依赖运行目录（CWD），从任意目录运行都能加载。
+const RULEBOOK_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/rules/data/conditions.yaml"
+);
 
-/// 惰性加载规则库，加载失败时使用空规则库（静默降级）。
-fn get_rulebook() -> &'static RuleBook {
-    static RULEBOOK: OnceLock<RuleBook> = OnceLock::new();
-    RULEBOOK.get_or_init(|| match load_rulebook(RULEBOOK_PATH) {
+/// 惰性加载规则库。
+///
+/// - 成功：缓存到 `OnceLock<Option<RuleBook>>`，后续调用直接复用；
+/// - 失败：**不缓存失败状态**，打印告警并返回 `None`，下一次调用会重新尝试，
+///   因此修复规则文件/CWD 后无需重启进程即可恢复 YAML 规则。
+fn get_rulebook() -> Option<&'static RuleBook> {
+    static RULEBOOK: OnceLock<Option<RuleBook>> = OnceLock::new();
+    // 已成功缓存 → 直接返回
+    if let Some(cached) = RULEBOOK.get() {
+        return cached.as_ref();
+    }
+    match load_rulebook(RULEBOOK_PATH) {
         Ok((book, warnings)) => {
             if !warnings.is_empty() {
                 eprintln!("[rules] Rulebook warnings: {}", warnings.len());
             }
-            book
+            let _ = RULEBOOK.set(Some(book));
+            RULEBOOK.get().and_then(|b| b.as_ref())
         }
         Err(e) => {
-            eprintln!("[rules] Warning: YAML rulebook not loaded ({e}), continuing without YAML.");
-            RuleBook { rules: vec![] }
+            // 不 set：下次调用重试；同时输出可操作的错误信息（含路径与运行目录提示）
+            eprintln!("[rules] ERROR: YAML rulebook failed to load: {e}");
+            eprintln!("[rules]       path = {RULEBOOK_PATH}");
+            eprintln!(
+                "[rules]       YAML rules are DISABLED for this run. Fix the file, no restart needed."
+            );
+            None
         }
-    })
+    }
 }
 
 /// 将 YAML category String 映射回 `&'static str` canonical code。
@@ -287,10 +303,9 @@ fn category_to_static(cat: &str) -> Option<&'static str> {
 
 /// 对条款文本执行 YAML 规则求值，返回去重后的 canonical category 列表。
 fn yaml_candidate_categories(text: &str) -> Vec<&'static str> {
-    let book = get_rulebook();
-    if book.rules.is_empty() {
+    let Some(book) = get_rulebook() else {
         return vec![];
-    }
+    };
     let metrics = DocumentMetrics::extract_from_clause_text(text);
     let hits = evaluate_rulebook(book, text, &metrics);
     let mut result: Vec<&'static str> = Vec::new();
@@ -304,21 +319,21 @@ fn yaml_candidate_categories(text: &str) -> Vec<&'static str> {
     result
 }
 
-/// 检查文本是否匹配 YAML 中 severity=Critical 的规则。
-fn yaml_is_critical(quote: &str) -> bool {
-    let book = get_rulebook();
-    if book.rules.is_empty() {
+/// 检查文本是否匹配 YAML 中 severity=Critical 的规则，**且命中规则属于
+/// 当前 finding 的类别**（与 `critical_evidence` 的类别收敛语义一致，
+/// 避免跨类别误判——例如 SHORT_DEADLINE 文本里出现其他 Critical 规则的关键词）。
+fn yaml_is_critical(quote: &str, category: &str) -> bool {
+    let Some(book) = get_rulebook() else {
         return false;
-    }
+    };
     let metrics = DocumentMetrics::extract_from_clause_text(quote);
     let hits = evaluate_rulebook(book, quote, &metrics);
-    if hits.is_empty() {
-        return false;
-    }
-    hits.iter().any(|(rule_id, _)| {
-        book.rules
-            .iter()
-            .any(|r| r.id == *rule_id && r.severity == "Critical")
+    hits.iter().any(|(rule_id, hit_category)| {
+        hit_category == category
+            && book
+                .rules
+                .iter()
+                .any(|r| r.id == *rule_id && r.severity == "Critical")
     })
 }
 
@@ -427,7 +442,7 @@ pub fn normalize_finding(finding: &mut RiskFinding) {
     let is_critical = !finding.no_risk
         && !finding.source_quote.trim().is_empty()
         && (critical_evidence(&category, finding.source_quote.trim())
-            || yaml_is_critical(finding.source_quote.trim()));
+            || yaml_is_critical(finding.source_quote.trim(), &category));
     finding.is_critical = is_critical;
     if is_critical {
         finding.severity = RiskSeverity::High;

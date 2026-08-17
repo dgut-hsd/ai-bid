@@ -1181,7 +1181,7 @@ async fn main() -> Result<()> {
         {
             eprintln!("\n? 指标已写入: {}", run_path);
             eprintln!(
-                "   总耗时 {:.1}s | Token {} in + {} out | 成本 ?{:.2}",
+                "   总耗时 {:.1}s | Token {} in + {} out | 成本 ¥{:.2}",
                 run_metrics.latency.total_wall_clock_secs,
                 run_metrics.llm_efficiency.totals.tokens_input,
                 run_metrics.llm_efficiency.totals.tokens_output,

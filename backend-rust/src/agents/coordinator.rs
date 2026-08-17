@@ -1624,7 +1624,7 @@ impl Coordinator {
                                 }
                             }
                         } else {
-                            eprintln!("    [{}] ?? 批量结果 JSON 解析失败", domain);
+                            eprintln!("    [{}] !! 批量结果 JSON 解析失败", domain);
                         }
                         break; // 只解析第一个 BATCH_VERIFICATION 标记
                     }

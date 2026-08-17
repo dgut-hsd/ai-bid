@@ -125,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (rulebook, warnings) = load_rulebook(Path::new(rulebook_path))
         .map_err(|e| format!("Failed to load {rulebook_path}: {e}. Run from backend-rust/ dir."))?;
     if !warnings.is_empty() {
-        eprintln!("??  Rulebook warnings:");
+        eprintln!("!!  Rulebook warnings:");
         for w in &warnings {
             eprintln!("  {w}");
         }
@@ -230,7 +230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let note = if raw_hits.is_empty() {
             "无规则命中".into()
         } else if finding.is_critical {
-            format!("??  Critical: {}", finding.critical_reason)
+            format!("!!  Critical: {}", finding.critical_reason)
         } else {
             format!("命中 {} 条规则，非 Critical", raw_hits.len())
         };
