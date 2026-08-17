@@ -30,6 +30,7 @@ use crate::agents::tools::{
     read_section::ReadSectionTool,
     search_document::SearchDocumentTool,
     search_knowledge::{DashScopeSearchBackend, SearchKnowledgeTool},
+    search_knowledge_base::SearchKnowledgeBaseTool,
     // V2+ 工具
     compare_versions::CompareVersionsTool,
     detect_boilerplate::DetectBoilerplateTool,
@@ -113,6 +114,8 @@ pub struct AppState {
     pub review_event_buses: Arc<TokioMutex<HashMap<String, Arc<ReviewEventBus>>>>,
     /// 异步审查结果缓存：doc_id → CoordinatorOutput
     pub review_results: Arc<TokioMutex<HashMap<String, CoordinatorOutput>>>,
+    /// 异步审查的 token/成本统计：doc_id → ReviewUsage
+    pub review_usages: Arc<TokioMutex<HashMap<String, ReviewUsage>>>,
     /// 异步审查失败信息：doc_id → 错误消息
     pub review_errors: Arc<TokioMutex<HashMap<String, String>>>,
     /// 正在执行的审核任务：doc_id（用于并发控制，防止重复提交）
@@ -166,6 +169,7 @@ impl AppState {
             embed_engine,
             review_event_buses: Arc::new(TokioMutex::new(HashMap::new())),
             review_results: Arc::new(TokioMutex::new(HashMap::new())),
+            review_usages: Arc::new(TokioMutex::new(HashMap::new())),
             review_errors: Arc::new(TokioMutex::new(HashMap::new())),
             active_reviews: Arc::new(TokioMutex::new(HashSet::new())),
         })
@@ -253,6 +257,19 @@ pub struct ReviewResponse {
     pub graph_snapshot: Option<crate::agents::types::GraphSnapshot>,
 }
 
+/// 单份文档一次审核的 LLM 消耗与成本估算（benchmark / 前端统计用）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReviewUsage {
+    /// LLM 调用次数（该文档整次审核聚合）
+    pub llm_calls: usize,
+    /// 输入 token 总数（该文档整次审核聚合）
+    pub tokens_input: u64,
+    /// 输出 token 总数（该文档整次审核聚合）
+    pub tokens_output: u64,
+    /// 估算成本（CNY，按当前模型单价）
+    pub cost_cny: f64,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ReviewResultResponse {
     pub status: String,
@@ -260,6 +277,9 @@ pub struct ReviewResultResponse {
     pub result: Option<ReviewResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 该文档审核的 LLM token 消耗与成本估算（审核成功后提供）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ReviewUsage>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -909,6 +929,10 @@ async fn run_review_pipeline(
         {
             registry.register(Box::new(SearchKnowledgeTool::with_dashscope(ds.clone())));
         }
+        // 本地知识库检索（与入库共享 EmbeddingClient，保证向量空间一致）
+        if let Some(ref ec) = ec_for_tools {
+            registry.register(Box::new(SearchKnowledgeBaseTool::new(ec.clone())));
+        }
         registry.register(Box::new(OutputFindingTool));
         // V2+ 工具
         registry.register(Box::new(CompareVersionsTool::new(
@@ -1104,35 +1128,8 @@ async fn run_review_pipeline(
                 }
             }
 
-            // 存入 review_results 供 GET /result 查询
-            {
-                let mut results = state.review_results.lock().await;
-                results.insert(doc_id.clone(), output.clone());
-            }
-
-            // 写盘: {doc_id}_result.json — 重启后磁盘 fallback
-            {
-                let dir = data_path_str("output/findings");
-                let _ = std::fs::create_dir_all(&dir);
-                let result_path = format!("{}/{}_result.json", dir, doc_id);
-                let persisted = ReviewResultResponse {
-                    status: "completed".to_string(),
-                    result: Some(ReviewResponse {
-                        document_id: doc_id.clone(),
-                        findings: output.findings.clone(),
-                        routing_summary: output.routing_summary.clone(),
-                        graph_snapshot: output.graph_snapshot.clone(),
-                    }),
-                    error: None,
-                };
-                if let Ok(json) = serde_json::to_string_pretty(&persisted) {
-                    let _ = std::fs::write(&result_path, json);
-                    println!("[DISK] result → {}", result_path);
-                }
-            }
-
-            // ── 指标：写盘 ──
-            {
+            // ── 指标：finalize（拿到 token/成本 totals，构造 usage）──
+            let usage = {
                 let mut collector = metrics.lock().await;
                 collector.set_findings_detail(&output.findings);
                 collector.record_stage(
@@ -1177,6 +1174,44 @@ async fn run_review_pipeline(
                 if let Ok(json) = serde_json::to_string_pretty(&run_metrics) {
                     let _ = std::fs::write(&run_path, json);
                     println!("[METRICS] → {}", run_path);
+                }
+
+                let totals = &run_metrics.llm_efficiency.totals;
+                ReviewUsage {
+                    llm_calls: totals.llm_calls,
+                    tokens_input: totals.tokens_input,
+                    tokens_output: totals.tokens_output,
+                    cost_cny: totals.cost_cny,
+                }
+            };
+
+            // 存入 review_results + review_usages 供 GET /result 查询
+            {
+                let mut results = state.review_results.lock().await;
+                results.insert(doc_id.clone(), output.clone());
+                let mut usages = state.review_usages.lock().await;
+                usages.insert(doc_id.clone(), usage.clone());
+            }
+
+            // 写盘: {doc_id}_result.json — 重启后磁盘 fallback（含 usage）
+            {
+                let dir = data_path_str("output/findings");
+                let _ = std::fs::create_dir_all(&dir);
+                let result_path = format!("{}/{}_result.json", dir, doc_id);
+                let persisted = ReviewResultResponse {
+                    status: "completed".to_string(),
+                    result: Some(ReviewResponse {
+                        document_id: doc_id.clone(),
+                        findings: output.findings.clone(),
+                        routing_summary: output.routing_summary.clone(),
+                        graph_snapshot: output.graph_snapshot.clone(),
+                    }),
+                    usage: Some(usage.clone()),
+                    error: None,
+                };
+                if let Ok(json) = serde_json::to_string_pretty(&persisted) {
+                    let _ = std::fs::write(&result_path, json);
+                    println!("[DISK] result → {}", result_path);
                 }
             }
 
@@ -1337,6 +1372,7 @@ pub async fn get_review_result(
     {
         let results = state.review_results.lock().await;
         if let Some(output) = results.get(&doc_id) {
+            let usage = state.review_usages.lock().await.get(&doc_id).cloned();
             return Ok(Json(ReviewResultResponse {
                 status: "completed".to_string(),
                 result: Some(ReviewResponse {
@@ -1345,6 +1381,7 @@ pub async fn get_review_result(
                     routing_summary: output.routing_summary.clone(),
                     graph_snapshot: output.graph_snapshot.clone(),
                 }),
+                usage,
                 error: None,
             }));
         }
@@ -1357,6 +1394,7 @@ pub async fn get_review_result(
             return Ok(Json(ReviewResultResponse {
                 status: "failed".to_string(),
                 result: None,
+                usage: None,
                 error: Some(msg.clone()),
             }));
         }
@@ -1369,6 +1407,7 @@ pub async fn get_review_result(
             return Ok(Json(ReviewResultResponse {
                 status: "pending".to_string(),
                 result: None,
+                usage: None,
                 error: None,
             }));
         }

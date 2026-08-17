@@ -11,13 +11,12 @@ import {
   LinkOutlined,
   BarChartOutlined,
   CaretRightOutlined,
-  CodeOutlined,
   FileTextOutlined,
 } from '@ant-design/icons';
 import type { TraceEvent } from '@/types/audit';
 import { AGENT_LABELS } from '@/types/audit';
 
-const { Text, Paragraph } = Typography;
+const { Text } = Typography;
 
 interface Props {
   events: TraceEvent[];
@@ -60,7 +59,7 @@ const isImportant = (type: string) => type === 'output_finding';
 // ─── 事件详情面板（可展开） ──────────────────────────────────
 
 const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
-  const p = event.payload as Record<string, unknown> | undefined;
+  const p = event.payload as Record<string, any> | undefined;
   if (!p) return null;
 
   // agent_thought: 完整推理内容
@@ -91,7 +90,6 @@ const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
   // tool_call: 完整参数
   if (event.event_type === 'tool_call' && p.arguments) {
     const args = p.arguments as Record<string, unknown>;
-    const toolName = (p.tool_name as string) || '';
     return (
       <div style={{ marginTop: 6 }}>
         <Text type="secondary" style={{ fontSize: 10, display: 'block', marginBottom: 2 }}>
@@ -126,7 +124,6 @@ const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
 
   // tool_result: 返回内容
   if (event.event_type === 'tool_result') {
-    const toolName = event.summary?.split(' ')[0] || event.summary || '';
     return (
       <div style={{ marginTop: 6 }}>
         {/* read_section 文本预览 */}
@@ -399,7 +396,7 @@ const LiveReviewFeed: React.FC<Props> = ({ events }) => {
 
   // 判断事件是否有可展开的详情
   const hasDetail = (event: TraceEvent): boolean => {
-    const p = event.payload as Record<string, unknown> | undefined;
+    const p = event.payload as Record<string, any> | undefined;
     if (!p) return false;
     switch (event.event_type) {
       case 'agent_thought': return !!p.content;
@@ -440,7 +437,7 @@ const LiveReviewFeed: React.FC<Props> = ({ events }) => {
           const expanded = expandedKeys.has(idx);
 
           // tool_result: extract sources from payload
-          const p = event.payload as Record<string, unknown> | undefined;
+          const p = event.payload as Record<string, any> | undefined;
           const sources: SearchSource[] =
             isToolResult && p?.sources
               ? (p.sources as SearchSource[])

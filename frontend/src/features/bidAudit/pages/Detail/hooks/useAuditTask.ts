@@ -239,6 +239,7 @@ export const useAuditTask = (bidId?: number) => {
       if (!taskId || isComplete || !hydrated || !shouldConnectStream) return;
 
       let isMounted = true;
+      const controller = new AbortController(); // 卸载时 abort SSE，避免后台重连泄漏
 
       const lastEventId = (
          (typeof window !== 'undefined'
@@ -333,9 +334,9 @@ export const useAuditTask = (bidId?: number) => {
                setIssues(prev => prev.filter(i => i.riskId !== fr.risk_id));
             }
          },
-         // onComplete —— SSE 流闭合（可能由 Java emit complete、可能由网络断开）。
-         // 不再依赖每 3 秒轮询兜底：收到流结束立即主动查 status / result 并切完成态，
-         // 避免 Rust 已完成但前端一直卡在"等待结果确认…"
+        // onComplete —— SSE 流闭合（可能由 Java emit complete、可能由网络断开）。
+        // 收到流结束立即主动查 status / result 并切完成态，避免 Rust 已完成但前端一直卡在"等待结果确认…"。
+        // 下方仍保留每 3 秒 syncStatus 轮询作为第二重兜底（同步进度 + 检测完成/失败），二者并存不冲突。
          () => {
             if (!isMounted) return;
             (async () => {
@@ -378,11 +379,13 @@ export const useAuditTask = (bidId?: number) => {
             if (!isMounted) return;
             console.error('[AuditTask] SSE 异常:', err);
             setError('实时数据连接中断，请刷新页面');
-         }
+         },
+         controller.signal
       );
 
       return () => {
          isMounted = false;
+         controller.abort(); // 组件卸载 → 立即终止 SSE 连接与重连循环
       };
    }, [taskId, isComplete, hydrated, shouldConnectStream]);
 

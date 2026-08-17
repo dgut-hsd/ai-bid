@@ -12,9 +12,9 @@
 //! ## 条款级风险分级 (L1/L2/L3)
 //!
 //! 每条条款携带 Coordinator 预判的 tier，控制 max_turns：
-//! - L1: 6 turns（纯信息/格式条款）
-//! - L2: 10 turns（标准审查）
-//! - L3: 12 turns（深度审查）
+//! - L1: 5 turns（纯信息/格式条款）
+//! - L2: 8 turns（标准审查）
+//! - L3: 14 turns（深度审查）
 //!
 //! 审查过程中支持动态升降级（turn 2 检测）。
 
@@ -663,6 +663,8 @@ impl ReActLoop {
         let mut seen_law_refs: std::collections::HashSet<String> = std::collections::HashSet::new(); // 已见过的法规引用（用于判断搜索是否带来新信息）
         // ★ 优化：法规证据充分后，下一轮强制锁定 output_finding，避免 Auto 模式下 LLM 继续调用工具空转
         let mut force_output_next = false;
+        // ★ 强化强制收尾（AIBID_STALL_FORCE_OUTPUT）：连续 N 轮仅请求探索类工具且未产出 finding → 下一轮强制 output_finding
+        let mut consecutive_stall: u32 = 0;
 
         // ── 条款头日志 ──
         let _print_lock = self.print_lock.as_ref().map(|l| l.lock().unwrap());
@@ -922,6 +924,42 @@ impl ReActLoop {
                             produced_finding: r.has_output_finding(),
                             finding_parsed_ok: false, // 由后续 output_finding 解析更新
                         });
+                    }
+
+                    // ★ 强化强制收尾（AIBID_STALL_FORCE_OUTPUT=N）：
+                    // 连续 N 轮 LLM 只请求探索类工具（read_section/search_*）且未产出 finding → 视为空转，
+                    // 下一轮强制锁定 output_finding，避免在多 agent 协作 / 复杂条款场景下无限探索。
+                    let stall_threshold: u32 = std::env::var("AIBID_STALL_FORCE_OUTPUT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if stall_threshold > 0 {
+                        let produced = r.has_output_finding();
+                        let explore_only = !r.tool_calls.is_empty()
+                            && r.tool_calls.iter().all(|tc| {
+                                matches!(
+                                    tc.name.as_str(),
+                                    "read_section"
+                                        | "search_document"
+                                        | "search_knowledge"
+                                        | "web_search"
+                                )
+                            });
+                        if produced {
+                            consecutive_stall = 0;
+                        } else if explore_only {
+                            consecutive_stall += 1;
+                            if consecutive_stall >= stall_threshold {
+                                force_output_next = true;
+                                eprintln!(
+                                    "[STALL-FORCE] 条款 {} 连续 {} 轮仅探索未产出 → 强制 output_finding",
+                                    clause.chunk_id, consecutive_stall
+                                );
+                                consecutive_stall = 0;
+                            }
+                        } else {
+                            consecutive_stall = 0;
+                        }
                     }
 
                     // SSE: call_log — 每次 LLM 调用的统计信息
@@ -1630,6 +1668,7 @@ impl ReActLoop {
                                     不要再搜索了。现在调用 output_finding。"
                                     .to_string(),
                             });
+                            force_output_next = true;
                             continue;
                         } else {
                             // L3: 连续 3+ 次空（Agent 无视了 L2 指令）→ 最后通牒
@@ -1644,6 +1683,7 @@ impl ReActLoop {
                                     立即输出 output_finding，no_risk 设为 true 亦可。"
                                         .to_string(),
                             });
+                            force_output_next = true;
                             // 不 continue——让正常流程追加 tool result（保持对话一致性）
                         }
                     } else {
@@ -1667,6 +1707,7 @@ impl ReActLoop {
                                             不要再搜索了。现在调用 output_finding。"
                                             .to_string(),
                                     });
+                                    force_output_next = true;
                                     continue;
                                 }
                             } else {
@@ -1688,10 +1729,8 @@ impl ReActLoop {
                             if !novel_refs.is_empty() {
                                 // 有新法规引用 → 重置确认搜索计数器
                                 seen_law_refs.extend(new_law_refs);
-                                if web_search_count >= 2 {
-                                    // 第 2 次及以后的搜索带来了新法规 → 标记"已找到可用的法规"
-                                    found_actionable_law = true;
-                                }
+                                // 搜索带来了新法规 → 标记"已找到可用的法规"
+                                found_actionable_law = true;
                                 post_law_search_count = 0;
                             } else if found_actionable_law {
                                 // 已找到法规，但本次搜索没有新法规引用 → 确认搜索
@@ -1712,7 +1751,9 @@ impl ReActLoop {
                                         下一轮将强制你输出结论。立即整理已有信息，调用 output_finding。"
                                         .to_string(),
                                 });
-                                force_output_next = true;
+                                if tier != RiskTier::High {
+                                    force_output_next = true;
+                                }
                                 continue;
                             }
 
@@ -1752,6 +1793,7 @@ impl ReActLoop {
                                         limit_msg
                                     ),
                                 });
+                                force_output_next = true;
                                 continue;
                             }
                         }
@@ -2051,7 +2093,7 @@ impl ReActLoop {
 
     /// 判断是否为搜索类工具（兼容新旧工具名）。
     fn is_search_tool(&self, name: &str) -> bool {
-        name == "web_search" || name == "search_knowledge"
+        name == "web_search" || name == "search_knowledge" || name == "search_knowledge_base"
     }
 
     /// 统计搜索结果条数，兼容多种后端格式。
