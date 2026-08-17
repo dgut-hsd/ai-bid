@@ -27,6 +27,7 @@ use ai_bid::agents::tools::search_document::SearchDocumentTool;
 use ai_bid::agents::tools::search_knowledge::{
     DashScopeSearchBackend, SearchBuffer, SearchKnowledgeTool,
 };
+use ai_bid::agents::tools::search_knowledge_base::SearchKnowledgeBaseTool;
 // V2+ 工具
 use ai_bid::agents::tools::compare_versions::CompareVersionsTool;
 use ai_bid::agents::tools::detect_boilerplate::DetectBoilerplateTool;
@@ -880,6 +881,10 @@ async fn main() -> Result<()> {
             } else {
                 panic!("搜索后端未初始化");
             }
+            // 本地知识库检索（与入库共享 EmbeddingClient，保证向量空间一致）
+            registry.register(Box::new(SearchKnowledgeBaseTool::new(
+                agent_embed.clone(),
+            )));
             registry.register(Box::new(OutputFindingTool));
             // V2+ 工具
             registry.register(Box::new(CompareVersionsTool::new(

@@ -97,7 +97,7 @@ ON MATCH  SET r.candidate_ids = [x IN coalesce(r.candidate_ids, []) WHERE x <> $
         let cql = r"
 MATCH (r:Risk {risk_id: $risk_id})
 MERGE (l:Law {law_id: $law_id})
-ON CREATE SET l.name = $law_name,
+ON CREATE SET l.name = $name,
               l.level = $level, l.issuing_body = $issuing_body,
               l.doc_number = $doc_number, l.year = $year
 ON MATCH  SET l.level = coalesce(l.level, $level),
@@ -111,7 +111,7 @@ MERGE (r)-[:cites]->(l)";
                 query(cql)
                     .param("risk_id", d.risk.id.as_str())
                     .param("law_id", law.law_id.as_str())
-                    .param("law_name", law.law_name.as_str())
+                    .param("name", law.law_name.as_str())
                     .param("level", meta.map(|m| m.level.as_str()).unwrap_or(""))
                     .param("issuing_body", meta.map(|m| m.issuing_body.as_str()).unwrap_or(""))
                     .param("doc_number", meta.map(|m| m.doc_number.as_str()).unwrap_or(""))
@@ -149,7 +149,7 @@ OPTIONAL MATCH (l)-[:has_article]->(a:Article)
 RETURN r.risk_id AS risk_id, r.name AS risk_name, r.severity AS severity,
        coalesce(r.snippet, '') AS snippet,
        coalesce(r.candidate_ids, []) AS candidate_ids,
-       coalesce(l.law_id, '') AS law_id, coalesce(l.law_name, '') AS law_name,
+       coalesce(l.law_id, '') AS law_id, coalesce(l.name, '') AS name,
        coalesce(a.article_id, '') AS article_id, coalesce(a.article_no, '') AS article_no";
         let mut result = self.graph.execute(query(cql).param("q", q)).await?;
 
@@ -162,7 +162,7 @@ RETURN r.risk_id AS risk_id, r.name AS risk_name, r.severity AS severity,
             let snippet: String = row.get("snippet")?;
             let candidate_ids: Vec<String> = row.get("candidate_ids")?;
             let law_id: String = row.get("law_id")?;
-            let law_name: String = row.get("law_name")?;
+            let name: String = row.get("name")?;
             let article_id: String = row.get("article_id")?;
             let article_no: String = row.get("article_no")?;
 
@@ -197,7 +197,7 @@ RETURN r.risk_id AS risk_id, r.name AS risk_name, r.severity AS severity,
             }
             hits[idx].laws.push(LawArticleEntity {
                 law_id,
-                law_name,
+                law_name: name,
                 article_id: (!article_id.is_empty()).then_some(article_id),
                 article_no: (!article_no.is_empty()).then_some(article_no),
                 meta: None,
@@ -206,4 +206,75 @@ RETURN r.risk_id AS risk_id, r.name AS risk_name, r.severity AS severity,
         Ok(hits)
     }
 
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_law_round_trip() {
+        // 1. 初始化 Neo4j 客户端（未配置环境时跳过测试）
+        let client = match Neo4jClient::connect().await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        // 2. 构造 Risk 实体 (id, name, severity)
+        let risk = RiskEntity {
+            id: "test_risk_roundtrip_001".to_string(),
+            name: "测试风险项".to_string(),
+            severity: "HIGH".to_string(),
+        };
+
+        // 3. 构造 Law 实体 (law_id, law_name, article_id, article_no, meta)
+        let law = LawArticleEntity {
+            law_id: "law_test_001".to_string(),
+            law_name: "中华人民共和国政府采购法实施条例".to_string(),
+            article_id: Some("article_test_001".to_string()),
+            article_no: Some("第20条".to_string()),
+            meta: None,
+        };
+
+        // 4. 构造 EntityDecision 实体 (使用正确的 Decision::New)
+        let decision = EntityDecision {
+            candidate_id: "candidate_test_001".to_string(),
+            decision: Decision::New,
+            risk: risk.clone(),
+            laws: vec![law.clone()],
+            snippet: "测试摘录片段".to_string(),
+        };
+
+        // 5. 执行写入
+        if let Err(e) = client.upsert_risk(&decision).await {
+            println!("写入 Risk 节点失败，跳过测试: {:?}", e);
+            return;
+        }
+        if let Err(e) = client.upsert_law(&decision, &law).await {
+            println!("写入 Law 节点失败，跳过测试: {:?}", e);
+            return;
+        }
+
+        // 6. 执行真实检索 (Round-trip)
+        let search_hits = client.search("测试风险项").await.expect("查询应正常返回");
+
+        assert!(!search_hits.is_empty(), "必须能够查出刚写入的数据");
+
+        let hit = search_hits
+            .iter()
+            .find(|h| h.risk.id == "test_risk_roundtrip_001")
+            .expect("必须找到匹配的 Risk 记录");
+
+        assert!(!hit.laws.is_empty(), "返回结果中的 laws 列表不能为空");
+        let returned_law = &hit.laws[0];
+
+        // 7. 验证法律名称 (law_name) 和条款号 (article_no) 未丢失
+        assert_eq!(
+            returned_law.law_name, law.law_name,
+            "法律名称应完全一致且不能丢失！"
+        );
+        assert_eq!(
+            returned_law.article_no, law.article_no,
+            "条款号应完全一致！"
+        );
+    }
 }

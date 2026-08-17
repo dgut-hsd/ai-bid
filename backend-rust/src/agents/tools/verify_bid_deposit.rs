@@ -462,7 +462,7 @@ mod tests {
             deposit_form: None,
             return_deadline_days: None,
             deposit_type: "bid".to_string(),
-            procurement_category: Some(String::from("货物")),
+            procurement_category: None,
         };
         let result = VerifyBidDepositTool::verify(&args).unwrap();
         assert!(matches!(result.status, DepositStatus::Compliant));
@@ -477,7 +477,7 @@ mod tests {
             deposit_form: None,
             return_deadline_days: None,
             deposit_type: "bid".to_string(),
-            procurement_category: Some(String::from("货物")),
+            procurement_category: None,
         };
         let result = VerifyBidDepositTool::verify(&args).unwrap();
         assert!(matches!(result.status, DepositStatus::Violation));
@@ -496,7 +496,7 @@ mod tests {
             deposit_form: None,
             return_deadline_days: None,
             deposit_type: "bid".to_string(),
-            procurement_category: Some(String::from("货物")),
+            procurement_category: None,
         };
         let result = VerifyBidDepositTool::verify(&args).unwrap();
         assert!(matches!(result.status, DepositStatus::Violation));
@@ -514,7 +514,7 @@ mod tests {
             deposit_form: Some("保函".to_string()),
             return_deadline_days: None,
             deposit_type: "performance".to_string(),
-            procurement_category: Some(String::from("货物")),
+            procurement_category: None,
         };
         let result = VerifyBidDepositTool::verify(&args).unwrap();
         assert!(matches!(result.status, DepositStatus::Compliant));
@@ -529,7 +529,7 @@ mod tests {
             deposit_form: None,
             return_deadline_days: None,
             deposit_type: "performance".to_string(),
-            procurement_category: Some(String::from("货物")),
+            procurement_category: None,
         };
         let result = VerifyBidDepositTool::verify(&args).unwrap();
         assert!(matches!(result.status, DepositStatus::Violation));
@@ -543,7 +543,7 @@ mod tests {
             deposit_form: None,
             return_deadline_days: Some(10),
             deposit_type: "bid".to_string(),
-            procurement_category: Some(String::from("货物")),
+            procurement_category: None,
         };
         let result = VerifyBidDepositTool::verify(&args).unwrap();
         assert!(matches!(result.status, DepositStatus::Violation));
@@ -561,7 +561,7 @@ mod tests {
             deposit_form: Some("支票".to_string()),
             return_deadline_days: None,
             deposit_type: "bid".to_string(),
-            procurement_category: Some(String::from("货物")),
+            procurement_category: None,
         };
         let result = VerifyBidDepositTool::verify(&args).unwrap();
         assert!(matches!(result.status, DepositStatus::Violation));
@@ -575,7 +575,7 @@ mod tests {
             deposit_form: None,
             return_deadline_days: None,
             deposit_type: "guarantee".to_string(),
-            procurement_category: Some(String::from("货物")),
+            procurement_category: None,
         };
         let result = VerifyBidDepositTool::verify(&args);
         assert!(result.is_err());

@@ -375,7 +375,7 @@ const SectionTreeNodeView: React.FC<{
                       title={`跳转到第 ${clause.pageNumber} 页`}
                       onClick={(e) => {
                         e.stopPropagation();
-                        onLocateIssuePage(clause.pageNumber);
+                        onLocateIssuePage(clause.pageNumber!);
                       }}
                     >
                       p.{clause.pageNumber}
@@ -437,7 +437,7 @@ function stripEmoji(s: string): string {
 /** 单个 trace 事件行 — 可点击展开详情 */
 const TraceEventRow: React.FC<{ ev: TraceEvent }> = ({ ev }) => {
   const [expanded, setExpanded] = useState(false);
-  const p = ev.payload as Record<string, unknown> | undefined;
+  const p = ev.payload as Record<string, any> | undefined;
   const hasDetail = !!p && (
     ev.event_type === 'agent_thought' || ev.event_type === 'tool_call' ||
     ev.event_type === 'tool_result' || ev.event_type === 'output_finding' ||
