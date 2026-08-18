@@ -43,6 +43,10 @@ spring:
       mode: always
       schema-locations: classpath:audit_task_event.sql,classpath:trace_schema.sql
   servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
     multipart:
       max-file-size: 50MB
       max-request-size: 50MB
@@ -119,3 +123,4 @@ rust:
     connect-timeout-ms: 5000
     read-timeout-ms: 900000
     health-check-enabled: true
+    internal-secret: ${RUST_API_INTERNAL_SECRET:dev-internal-secret-key-2024}
