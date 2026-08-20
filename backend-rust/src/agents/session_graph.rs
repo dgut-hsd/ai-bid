@@ -139,6 +139,15 @@ impl SessionGraph {
         outcome: ReviewAttemptOutcome,
         finding_ids: Vec<String>,
     ) -> Result<(), String> {
+        match outcome {
+            ReviewAttemptOutcome::Findings if finding_ids.is_empty() => {
+                return Err("Findings 结果的 finding_ids 不得为空".to_string());
+            }
+            ReviewAttemptOutcome::NoRisk if !finding_ids.is_empty() => {
+                return Err("NoRisk 结果的 finding_ids 必须为空".to_string());
+            }
+            _ => {}
+        }
         let (agent_id, chunk_id) = {
             let mut attempts = self
                 .review_attempts
@@ -853,6 +862,94 @@ mod tests {
         let attempt = &snapshot.review_attempts[&attempt_id];
         assert_eq!(attempt.status, ReviewAttemptStatus::Completed);
         assert_eq!(attempt.outcome, Some(ReviewAttemptOutcome::NoRisk));
+        assert_eq!(snapshot.reviewed_by["ch_001"], vec![AgentId::FactCheck]);
+    }
+
+    #[test]
+    fn test_review_attempt_findings_requires_non_empty_finding_ids() {
+        let graph = SessionGraph::new();
+        graph.add_chunk(make_test_chunk("ch_001"));
+        let attempt_id = graph
+            .start_review_attempt(AgentId::FactCheck, "ch_001")
+            .expect("应创建审查尝试");
+
+        let error = graph
+            .complete_review_attempt(&attempt_id, ReviewAttemptOutcome::Findings, Vec::new())
+            .expect_err("Findings 结果必须关联至少一个 finding_id");
+
+        assert!(error.contains("finding_ids"));
+        let snapshot = graph.snapshot();
+        assert_eq!(
+            snapshot.review_attempts[&attempt_id].status,
+            ReviewAttemptStatus::Started
+        );
+        assert!(!snapshot.reviewed_by.contains_key("ch_001"));
+    }
+
+    #[test]
+    fn test_review_attempt_no_risk_rejects_finding_ids() {
+        let graph = SessionGraph::new();
+        graph.add_chunk(make_test_chunk("ch_001"));
+        let attempt_id = graph
+            .start_review_attempt(AgentId::FactCheck, "ch_001")
+            .expect("应创建审查尝试");
+
+        let error = graph
+            .complete_review_attempt(
+                &attempt_id,
+                ReviewAttemptOutcome::NoRisk,
+                vec!["R_001".to_string()],
+            )
+            .expect_err("NoRisk 结果不得关联 finding_id");
+
+        assert!(error.contains("finding_ids"));
+        let snapshot = graph.snapshot();
+        assert_eq!(
+            snapshot.review_attempts[&attempt_id].status,
+            ReviewAttemptStatus::Started
+        );
+        assert!(!snapshot.reviewed_by.contains_key("ch_001"));
+    }
+
+    #[test]
+    fn test_review_attempt_completed_findings_records_ids_once() {
+        let graph = SessionGraph::new();
+        graph.add_chunk(make_test_chunk("ch_001"));
+        let attempt_id = graph
+            .start_review_attempt(AgentId::FactCheck, "ch_001")
+            .expect("应创建审查尝试");
+
+        graph
+            .complete_review_attempt(
+                &attempt_id,
+                ReviewAttemptOutcome::Findings,
+                vec!["R_001".to_string()],
+            )
+            .expect("Findings 应正常完成");
+        assert!(
+            graph
+                .complete_review_attempt(
+                    &attempt_id,
+                    ReviewAttemptOutcome::Findings,
+                    vec!["R_002".to_string()],
+                )
+                .is_err()
+        );
+        assert!(
+            graph
+                .fail_review_attempt(
+                    &attempt_id,
+                    ReviewAttemptErrorCode::TaskCancelled,
+                    "重复失败",
+                )
+                .is_err()
+        );
+
+        let snapshot = graph.snapshot();
+        let attempt = &snapshot.review_attempts[&attempt_id];
+        assert_eq!(attempt.status, ReviewAttemptStatus::Completed);
+        assert_eq!(attempt.outcome, Some(ReviewAttemptOutcome::Findings));
+        assert_eq!(attempt.finding_ids, vec!["R_001"]);
         assert_eq!(snapshot.reviewed_by["ch_001"], vec![AgentId::FactCheck]);
     }
 

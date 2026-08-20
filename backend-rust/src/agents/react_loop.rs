@@ -2359,7 +2359,7 @@ pub struct ClauseReviewReport {
     pub failed_clauses: Vec<ClauseReviewFailure>,
 }
 
-fn classify_review_attempt(
+pub(crate) fn classify_review_attempt(
     findings: &[RiskFinding],
 ) -> Result<(ReviewAttemptOutcome, Vec<String>), ReviewAttemptErrorCode> {
     if findings.is_empty() {
@@ -2380,6 +2380,45 @@ fn classify_review_attempt(
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct ClauseReviewProgress {
+    state: Arc<std::sync::Mutex<ClauseReviewProgressState>>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ClauseReviewProgressSnapshot {
+    pub completed: HashMap<String, Vec<RiskFinding>>,
+    pub failed: HashMap<String, String>,
+}
+
+#[derive(Default)]
+struct ClauseReviewProgressState {
+    completed: HashMap<String, Vec<RiskFinding>>,
+    failed: HashMap<String, String>,
+}
+
+impl ClauseReviewProgress {
+    fn record_completed(&self, clause_id: &str, findings: Vec<RiskFinding>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.failed.remove(clause_id);
+        state.completed.insert(clause_id.to_string(), findings);
+    }
+
+    fn record_failed(&self, clause_id: &str, message: impl Into<String>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.completed.remove(clause_id);
+        state.failed.insert(clause_id.to_string(), message.into());
+    }
+
+    pub fn snapshot(&self) -> ClauseReviewProgressSnapshot {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        ClauseReviewProgressSnapshot {
+            completed: state.completed.clone(),
+            failed: state.failed.clone(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn review_clauses_parallel_report<F>(
     clauses: &[ReviewClause],
@@ -2391,6 +2430,40 @@ pub async fn review_clauses_parallel_report<F>(
     review_events: Option<Arc<ReviewEventBus>>,
     agent_id: AgentId,
     execution_control: Option<Arc<crate::agents::execution_control::ReviewExecutionControl>>,
+) -> ClauseReviewReport
+where
+    F: Fn(Box<dyn LlmClient>, crate::agents::tools::ToolRegistry) -> ReActLoop
+        + Send
+        + Sync
+        + 'static,
+{
+    review_clauses_parallel_report_with_progress(
+        clauses,
+        make_agent,
+        llm_factory,
+        tools_factory,
+        max_parallel,
+        graph,
+        review_events,
+        agent_id,
+        execution_control,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn review_clauses_parallel_report_with_progress<F>(
+    clauses: &[ReviewClause],
+    make_agent: F,
+    llm_factory: Arc<dyn Fn() -> Box<dyn LlmClient> + Send + Sync>,
+    tools_factory: Arc<dyn Fn() -> crate::agents::tools::ToolRegistry + Send + Sync>,
+    max_parallel: usize,
+    graph: Option<Arc<SessionGraph>>,
+    review_events: Option<Arc<ReviewEventBus>>,
+    agent_id: AgentId,
+    execution_control: Option<Arc<crate::agents::execution_control::ReviewExecutionControl>>,
+    progress: Option<ClauseReviewProgress>,
 ) -> ClauseReviewReport
 where
     F: Fn(Box<dyn LlmClient>, crate::agents::tools::ToolRegistry) -> ReActLoop
@@ -2427,6 +2500,7 @@ where
         let done = done.clone();
         let raw_findings_total = raw_findings_total.clone();
         let execution_control = execution_control.clone();
+        let progress = progress.clone();
 
         let abort_handle = join_set.spawn(async move {
             let _permit = sem.acquire_owned().await;
@@ -2485,6 +2559,7 @@ where
                 (agent.review_single(&clause, &risk_id).await, None)
             };
 
+            let mut failure_message = None;
             if let (Some(graph), Some(attempt_id)) = (graph.as_ref(), attempt_id.as_deref()) {
                 if let Some(message) = timeout_message {
                     graph
@@ -2494,6 +2569,7 @@ where
                             message,
                         )
                         .map_err(anyhow::Error::msg)?;
+                    failure_message = Some(message.to_string());
                 } else {
                     match classify_review_attempt(&findings) {
                         Ok((outcome, finding_ids)) => {
@@ -2509,8 +2585,21 @@ where
                             graph
                                 .fail_review_attempt(attempt_id, error_code, message)
                                 .map_err(anyhow::Error::msg)?;
+                            failure_message = Some(message.to_string());
                         }
                     }
+                }
+            } else if let Some(message) = timeout_message {
+                failure_message = Some(message.to_string());
+            } else if classify_review_attempt(&findings).is_err() {
+                failure_message = Some("条款审查未完整结束".to_string());
+            }
+
+            if let Some(ref progress) = progress {
+                if let Some(message) = failure_message {
+                    progress.record_failed(&clause.chunk_id, message);
+                } else {
+                    progress.record_completed(&clause.chunk_id, findings.clone());
                 }
             }
 
@@ -2548,30 +2637,38 @@ where
                 findings[idx] = Some(clause_findings);
             }
             Ok((task_id, Err(e))) => {
-                if let Some(idx) = task_meta.remove(&task_id)
-                    && let Some(ref graph) = graph
-                    && let Err(graph_error) = graph.fail_started_attempts(
-                        &agent_id,
-                        &[clauses[idx].chunk_id.clone()],
-                        ReviewAttemptErrorCode::TaskCancelled,
-                        "条款审查任务被取消",
-                    )
-                {
-                    eprintln!("[PARALLEL] 收口取消尝试失败: {}", graph_error);
+                if let Some(idx) = task_meta.remove(&task_id) {
+                    if let Some(ref progress) = progress {
+                        progress.record_failed(&clauses[idx].chunk_id, e.to_string());
+                    }
+                    if let Some(ref graph) = graph
+                        && let Err(graph_error) = graph.fail_started_attempts(
+                            &agent_id,
+                            &[clauses[idx].chunk_id.clone()],
+                            ReviewAttemptErrorCode::TaskCancelled,
+                            "条款审查任务被取消",
+                        )
+                    {
+                        eprintln!("[PARALLEL] 收口取消尝试失败: {}", graph_error);
+                    }
                 }
                 eprintln!("[PARALLEL] 获取全局并发名额失败: {}", e);
             }
             Err(e) => {
-                if let Some(idx) = task_meta.remove(&e.id())
-                    && let Some(ref graph) = graph
-                    && let Err(graph_error) = graph.fail_started_attempts(
-                        &agent_id,
-                        &[clauses[idx].chunk_id.clone()],
-                        ReviewAttemptErrorCode::TaskPanic,
-                        "条款审查任务异常终止",
-                    )
-                {
-                    eprintln!("[PARALLEL] 收口崩溃尝试失败: {}", graph_error);
+                if let Some(idx) = task_meta.remove(&e.id()) {
+                    if let Some(ref progress) = progress {
+                        progress.record_failed(&clauses[idx].chunk_id, "条款审查任务异常终止");
+                    }
+                    if let Some(ref graph) = graph
+                        && let Err(graph_error) = graph.fail_started_attempts(
+                            &agent_id,
+                            &[clauses[idx].chunk_id.clone()],
+                            ReviewAttemptErrorCode::TaskPanic,
+                            "条款审查任务异常终止",
+                        )
+                    {
+                        eprintln!("[PARALLEL] 收口崩溃尝试失败: {}", graph_error);
+                    }
                 }
                 // task panic — 后续为该 clause 生成占位 finding
                 eprintln!("[PARALLEL] 条款审查 task 异常: {}", e);
@@ -2745,7 +2842,7 @@ mod multi_finding_tests {
             1,
             None,
             None,
-            "TestAgent",
+            AgentId::Dynamic("TestAgent".to_string()),
             None,
         )
         .await;

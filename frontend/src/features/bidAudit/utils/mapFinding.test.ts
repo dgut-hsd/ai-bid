@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   mapBackendFinding,
   mapBackendFindings,
+  mapBackendGraphSnapshot,
   isBackendFormat,
   ensureAuditIssue,
 } from './mapFinding';
@@ -240,6 +241,89 @@ describe('mapBackendFindings', () => {
 
   it('returns an empty array when given an empty array', () => {
     expect(mapBackendFindings([])).toEqual([]);
+  });
+});
+
+describe('mapBackendGraphSnapshot', () => {
+  it('maps Rust snake_case graph and review attempts to frontend camelCase', () => {
+    const result = mapBackendGraphSnapshot({
+      chunks: {
+        ch_001: {
+          chunk_id: 'ch_001',
+          section_path: ['第三章'],
+          page_start: 2,
+          page_end: 3,
+          text_preview: '测试条款',
+          tier: 'L2',
+        },
+      },
+      risks: {},
+      has_risk: {},
+      reviewed_by: {
+        ch_001: ['FactCheck'],
+        ch_002: [{ Dynamic: 'dynamic_technical' }],
+      },
+      linked_to: { ch_001: [{ chunk_id: 'ch_002', reason: '交叉引用' }] },
+      cites: {},
+      cited_by: {},
+      agents: {},
+      laws: {},
+      cases: {},
+      contradicts: {},
+      same_law: {},
+      review_attempts: {
+        attempt_001: {
+          attempt_id: 'attempt_001',
+          agent_id: 'FactCheckAgent',
+          chunk_id: 'ch_001',
+          status: 'completed',
+          outcome: 'no_risk',
+          finding_ids: [],
+          started_at: '2026-08-16T00:00:00Z',
+          finished_at: '2026-08-16T00:00:01Z',
+        },
+        attempt_002: {
+          attempt_id: 'attempt_002',
+          agent_id: { Dynamic: 'dynamic_technical' },
+          chunk_id: 'ch_002',
+          status: 'failed',
+          finding_ids: [],
+          error_code: 'task_cancelled',
+          error_message: '执行取消',
+          started_at: '2026-08-16T00:00:00Z',
+          finished_at: '2026-08-16T00:00:01Z',
+        },
+      },
+    });
+
+    expect(result.chunks.ch_001).toMatchObject({
+      chunkId: 'ch_001',
+      sectionPath: ['第三章'],
+      pageStart: 2,
+      pageEnd: 3,
+      textPreview: '测试条款',
+    });
+    expect(result.reviewedBy).toEqual({
+      ch_001: ['FactCheck'],
+      ch_002: ['dynamic_technical'],
+    });
+    expect(result.linkedTo.ch_001[0]).toEqual({
+      chunkId: 'ch_002',
+      reason: '交叉引用',
+    });
+    expect(result.reviewAttempts.attempt_001).toEqual({
+      attemptId: 'attempt_001',
+      agentId: 'FactCheckAgent',
+      chunkId: 'ch_001',
+      status: 'completed',
+      outcome: 'no_risk',
+      findingIds: [],
+      errorCode: undefined,
+      errorMessage: undefined,
+      startedAt: '2026-08-16T00:00:00Z',
+      finishedAt: '2026-08-16T00:00:01Z',
+    });
+    expect(result.reviewAttempts.attempt_002.agentId).toBe('dynamic_technical');
   });
 });
 

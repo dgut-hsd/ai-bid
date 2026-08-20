@@ -7,6 +7,14 @@ import type {
    CreateTaskParams,
    BidDetail,
 } from '../types';
+import {
+   mapBackendGraphSnapshot,
+   type BackendGraphSnapshot,
+} from '@/features/bidAudit/utils/mapFinding';
+
+type BackendAuditResult = Omit<AuditResult, 'graphSnapshot'> & {
+   graphSnapshot?: BackendGraphSnapshot;
+};
 
 export const createTask = async (
    params: CreateTaskParams
@@ -31,14 +39,19 @@ export const getAuditResult = async (
    taskId: string,
    params?: { page?: number; size?: number; sinceIssueNo?: string }
 ): Promise<AuditResult> => {
-   const res = await request.get<unknown, BaseResponse<AuditResult>>(
+   const res = await request.get<unknown, BaseResponse<BackendAuditResult>>(
       `/api/audit-tasks/${taskId}/result`,
       {
          params,
       }
    );
 
-   return res.data;
+   return {
+      ...res.data,
+      graphSnapshot: res.data.graphSnapshot
+         ? mapBackendGraphSnapshot(res.data.graphSnapshot)
+         : undefined,
+   };
 };
 
 export const getBidDetail = async (id: number): Promise<BidDetail> => {
