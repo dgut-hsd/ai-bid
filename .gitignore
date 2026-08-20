@@ -45,7 +45,8 @@ __pycache__/
 *.py[cod]
 .runtime-data/
 env/
-/data/
+data/
+dump.rdb
 
 # ── Python 缓存 ──
 __pycache__/
