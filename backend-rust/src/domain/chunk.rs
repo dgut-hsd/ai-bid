@@ -115,4 +115,8 @@ pub struct BlockBBox {
     pub bbox: BBox,
     /// 原始 PDF 页面宽度 (pt)，用于前端 scale = renderedWidth / pageWidth
     pub page_width: f64,
+    /// block 文本的字符数，用于按真实文本长度估算其在 chunk.text 中的偏移，
+    /// 替代按 block 序号做 index 比例估算（后者在 block 长度差异大时偏移严重）。
+    #[serde(default)]
+    pub char_count: usize,
 }

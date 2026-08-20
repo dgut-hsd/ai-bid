@@ -1063,38 +1063,35 @@ async fn run_review_pipeline(
                     // 避免整页高亮导致"框太大"问题。
                     // 占位 bbox 来自 blocks_from_text()（lopdf 失败降级路径），
                     // 特征是 x0==0.0 && x1==400.0 且高度 ≤20pt。
+                    //
+                    // 同时按 block 真实文本长度累加，估算每个 block 在
+                    // chunk.text 中的字符偏移（用 block 中心位置代表该 block），
+                    // 替代按 index 比例估算——后者在 block 长度差异大时偏移严重。
                     let source_quote = finding.source_quote.clone();
-                    let valid_blocks: Vec<String> = chunk
-                        .source_block_ids
-                        .iter()
-                        .filter(|bid| {
-                            chunk.bbox_refs.iter().any(|r| {
-                                let is_same = &r.block_id == *bid;
-                                let is_placeholder =
-                                    r.bbox.x0 == 0.0 && r.bbox.x1 == 400.0
-                                        && (r.bbox.bottom - r.bbox.top) <= 20.1;
-                                is_same && !is_placeholder
-                            })
-                        })
-                        .cloned()
-                        .collect();
-
-                    // 如果经过滤后为空（全是占位 bbox），则不退化为文本匹配，
-                    // 保持空数组让前端走文本高亮路径。
-                    // 如果仍有过多有效 block（如大 section），取最多前 5 个。
                     let max_blocks = 5usize;
-                    finding.block_ids = if valid_blocks.len() > max_blocks {
-                        // 优选与 source_quote 文本相关的 block
-                        let truncated: Vec<String> = valid_blocks
-                            .into_iter()
-                            .take(max_blocks)
-                            .collect();
-                        truncated
-                    } else {
-                        valid_blocks
-                    };
+                    let mut valid_blocks: Vec<(String, usize)> = Vec::new();
+                    let mut offset_acc = 0usize;
+                    for r in &chunk.bbox_refs {
+                        let is_placeholder =
+                            r.bbox.x0 == 0.0 && r.bbox.x1 == 400.0
+                                && (r.bbox.bottom - r.bbox.top) <= 20.1;
+                        if !is_placeholder {
+                            // 用 block 中心偏移代表其位置，避免长 block 的首字符偏移
+                            // 无法覆盖落在 block 中后段的证据。
+                            valid_blocks
+                                .push((r.block_id.clone(), offset_acc + r.char_count / 2));
+                        }
+                        offset_acc += r.char_count;
+                    }
 
-                    let _ = source_quote; // 预留后续按文本相关性排序
+                    // 统一走可靠性匹配：source_quote 匹配不可靠时返回空，
+                    // 让前端走文本定位（不再区分「块多/块少」两条路径）。
+                    finding.block_ids = select_blocks_by_source_quote(
+                        &valid_blocks,
+                        &source_quote,
+                        &chunk.text,
+                        max_blocks,
+                    );
                 }
             }
             let findings_with_blocks = output
@@ -2506,5 +2503,350 @@ pub async fn delete_metric_run(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error":format!("{}",e)})),
         ),
+    }
+}
+
+// ─── Block 匹配辅助函数 ──────────────────────────────────────────────────
+
+/// 判定「可靠匹配」所需的最小 bigram 重叠率。
+const MIN_OVERLAP: f64 = 0.15;
+
+/// 判定「可靠匹配」所需的最小 bigram 命中数。
+///
+/// 至少命中 2 个 bigram，且命中率不低于 [`MIN_OVERLAP`]（向上取整）。
+/// 这样短 quote（bigram 少）会被要求更高的命中率——例如 4 字符 quote 仅 3 个
+/// bigram，命中 1 个的命中率 0.33 虽越过 0.15 门槛，但单点命中不足以视为可靠。
+fn min_hits_required(n_bigrams: usize) -> usize {
+    ((n_bigrams as f64 * MIN_OVERLAP).ceil() as usize).max(2)
+}
+
+/// 判断一个相邻二字组是否参与匹配：两个字符都必须是「有内容」的字符
+/// （字母 / 汉字 / 数字），跳过空白与标点（含中文全角标点 ，。；：等）。
+///
+/// 注意不能只用 `is_ascii_punctuation()`——它不过滤中文全角标点；
+/// `is_alphanumeric()` 对汉字与数字都返回 true，对全角/半角标点返回 false，
+/// 正好满足「保留文字与数字、跳过标点」的需求。
+fn bigram_is_meaningful(a: char, b: char) -> bool {
+    a.is_alphanumeric() && b.is_alphanumeric()
+}
+
+/// 在 `chunk_text` 中寻找与 `source_quote` 的最佳匹配窗口位置。
+///
+/// 使用滑动窗口 + bigram 重叠率计算匹配分数。
+/// 对中文文本，bigram（相邻二字组）能捕获字符顺序，比字符集重叠
+/// 更具区分度，避免"投标人"与"招标投标"的误匹配。
+///
+/// 重叠率 = source_quote 的 bigram 在窗口中的命中数 / source_quote 的 bigram 总数。
+/// 若最佳命中数低于 [`min_hits_required`]，返回 `None`，表示匹配不可靠。
+fn find_quote_position(source_quote: &str, chunk_text: &str) -> Option<(usize, usize)> {
+    const MIN_QUOTE_CHARS: usize = 4;
+
+    let sq: Vec<char> = source_quote.chars().collect();
+    let ct: Vec<char> = chunk_text.chars().collect();
+
+    if sq.len() < MIN_QUOTE_CHARS || ct.is_empty() {
+        return None;
+    }
+
+    // 从 source_quote 构建 bigram 集合（相邻二字组，跳过含空白/标点的）
+    let sq_bigrams: Vec<(char, char)> = sq
+        .windows(2)
+        .filter(|w| bigram_is_meaningful(w[0], w[1]))
+        .map(|w| (w[0], w[1]))
+        .collect();
+
+    if sq_bigrams.is_empty() {
+        return None;
+    }
+
+    let min_hits = min_hits_required(sq_bigrams.len());
+
+    // 从 chunk_text 构建所有位置的 bigram 集合（用于快速查找）
+    let ct_bigram_set: std::collections::HashSet<(char, char)> = ct
+        .windows(2)
+        .filter(|w| bigram_is_meaningful(w[0], w[1]))
+        .map(|w| (w[0], w[1]))
+        .collect();
+
+    // 计算全局 bigram 命中数（用于判断 source_quote 是否与 chunk 整体相关）
+    let global_hits: usize = sq_bigrams
+        .iter()
+        .filter(|bg| ct_bigram_set.contains(bg))
+        .count();
+
+    if global_hits < min_hits {
+        return None;
+    }
+
+    // 滑动窗口精确定位：在 chunk_text 上滑动，
+    // 找到 bigram 命中密度最高的窗口
+    let window_len = sq.len().min(ct.len());
+    let step = (window_len / 4).max(1);
+
+    let mut best_start = 0usize;
+    let mut best_end = window_len;
+    let mut best_score = 0usize;
+
+    for start in (0..=ct.len().saturating_sub(window_len)).step_by(step) {
+        let end = start + window_len;
+        // 窗口内的 bigram 命中数
+        let window_bigrams: std::collections::HashSet<(char, char)> = ct[start..end]
+            .windows(2)
+            .filter(|w| bigram_is_meaningful(w[0], w[1]))
+            .map(|w| (w[0], w[1]))
+            .collect();
+
+        let hits: usize = sq_bigrams
+            .iter()
+            .filter(|bg| window_bigrams.contains(bg))
+            .count();
+        if hits > best_score {
+            best_score = hits;
+            best_start = start;
+            best_end = end;
+        }
+    }
+
+    if best_score < min_hits {
+        return None;
+    }
+
+    Some((best_start, best_end))
+}
+
+/// 基于 `source_quote` 在 chunk text 中的匹配位置，从 `valid_blocks` 中
+/// 选取最近的 `max_blocks` 个 block。
+///
+/// `valid_blocks` 为 `(block_id, 估计字符偏移)` 列表，偏移是每个 block 在
+/// chunk.text 中的估计位置（调用处按真实文本长度累加得到）。函数据此计算
+/// 每个 block 与匹配窗口的距离并排序，取最近的 `max_blocks` 个。
+///
+/// 若 `source_quote` 在 chunk.text 中匹配不可靠（命中数低于阈值），
+/// 返回空 Vec，让前端降级为文本定位而不是错误的高亮 block。
+fn select_blocks_by_source_quote(
+    valid_blocks: &[(String, usize)],
+    source_quote: &str,
+    chunk_text: &str,
+    max_blocks: usize,
+) -> Vec<String> {
+    let n = valid_blocks.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // 尝试定位 source_quote 在 chunk_text 中的匹配窗口
+    let (match_start, _match_end) = match find_quote_position(source_quote, chunk_text) {
+        Some(pos) => pos,
+        None => {
+            // 匹配不可靠 — 返回空，让前端走文本定位
+            return Vec::new();
+        }
+    };
+
+    // 按每个 block 的估计偏移与匹配位置的距离排序
+    let mut scored: Vec<(usize, &String)> = valid_blocks
+        .iter()
+        .map(|(bid, offset)| (offset.abs_diff(match_start), bid))
+        .collect();
+
+    // 按距离升序排列，距离最近的在前
+    scored.sort_by_key(|(d, _)| *d);
+
+    scored
+        .into_iter()
+        .take(max_blocks)
+        .map(|(_, bid)| bid.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod block_matching_tests {
+    use super::*;
+
+    /// 构造一个模拟 chunk.text：N 个 block，每个 block 的文本唯一，以 "\n" 拼接。
+    fn make_chunk_text(block_texts: &[&str]) -> String {
+        block_texts.join("\n")
+    }
+
+    /// 计算每个 block 在 chunk.text 中的字符中心偏移。
+    ///
+    /// 与调用处一致：偏移按 block 文本长度累加（此处额外计入 "\n" 分隔符，
+    /// 使偏移与 make_chunk_text 生成的 chunk.text 字符位置精确对应），
+    /// 每个 block 用其「中心」偏移代表其位置。
+    fn block_centers(block_texts: &[&str]) -> Vec<usize> {
+        let mut acc = 0usize;
+        let mut centers = Vec::with_capacity(block_texts.len());
+        for t in block_texts {
+            let len = t.chars().count();
+            centers.push(acc + len / 2);
+            acc += len + 1; // +1 对应 "\n" 分隔符
+        }
+        centers
+    }
+
+    /// 将 block id 与字符中心偏移配对成 `(block_id, offset)` 列表。
+    fn make_valid_blocks(prefix: &str, block_texts: &[&str]) -> Vec<(String, usize)> {
+        block_centers(block_texts)
+            .into_iter()
+            .enumerate()
+            .map(|(i, off)| (format!("{}_{}", prefix, i), off))
+            .collect()
+    }
+
+    #[test]
+    fn find_quote_position_strong_match() {
+        let chunk = "第一条 投标人资格要求。投标人须为中华人民共和国境内注册的企业法人。";
+        let quote = "投标人须为中华人民共和国境内注册";
+        let pos = find_quote_position(quote, chunk);
+        assert!(pos.is_some(), "强匹配应返回位置");
+    }
+
+    #[test]
+    fn find_quote_position_no_match() {
+        let chunk = "第一条 项目概况与招标范围。本项目位于北京市朝阳区。";
+        let quote = "投标人须具有独立法人资格";
+        let pos = find_quote_position(quote, chunk);
+        assert!(pos.is_none(), "无重叠应返回 None");
+    }
+
+    #[test]
+    fn find_quote_position_short_quote_returns_none() {
+        let chunk = "第一章 总则";
+        let quote = "第";
+        let pos = find_quote_position(quote, chunk);
+        assert!(pos.is_none(), "过短的 quote（<4 字符）应返回 None");
+    }
+
+    #[test]
+    fn find_quote_position_single_bigram_hit_not_reliable() {
+        // 4 字符 quote 仅 3 个 bigram；只命中 1 个时命中率 0.33 虽越过旧阈值 0.15，
+        // 但单点命中不足以视为可靠，现在应返回 None。
+        let chunk = "本项目采用公开投标方式。";
+        let quote = "投标人须";
+        let pos = find_quote_position(quote, chunk);
+        assert!(pos.is_none(), "仅 1 个 bigram 命中不应判定为可靠");
+    }
+
+    #[test]
+    fn select_blocks_returns_empty_when_match_unreliable() {
+        // chunk.text 与 source_quote 无交集
+        let valid_blocks: Vec<(String, usize)> = (0..10)
+            .map(|i| (format!("b_1_{}", i), i))
+            .collect();
+        let chunk_text =
+            "第一章 总则。本办法适用于所有政府采购项目的招标投标活动。".repeat(5);
+        let source_quote = "投标人须为本省注册企业且具有独立法人资格";
+
+        let result =
+            select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 5);
+        assert!(
+            result.is_empty(),
+            "不可靠匹配应返回空，让前端走文本定位"
+        );
+    }
+
+    #[test]
+    fn select_blocks_prefers_latter_half_when_evidence_there() {
+        // 模拟 10 个 block 的大 chunk，证据位于后半段
+        let block_texts: Vec<&str> = vec![
+            "第一条 总则。本办法依据《中华人民共和国招标投标法》制定。",
+            "第二条 适用范围。本办法适用于所有政府采购项目。",
+            "第三条 基本原则。招标投标活动应遵循公开、公平、公正原则。",
+            "第四条 采购人职责。采购人应对采购需求的合法性负责。",
+            "第五条 代理机构。采购代理机构应具备相应的资格条件。",
+            "第六条 招标文件。招标文件不得包含歧视性条款。",
+            "第七条 投标人资格。投标人须为中华人民共和国境内注册的企业法人。",
+            "第八条 联合体投标。两个以上法人可组成联合体参与投标。",
+            "第九条 投标保证金。投标保证金不得超过项目估算价的2%。",
+            "第十条 开标程序。开标应在招标文件确定的提交投标文件截止时间公开进行。",
+        ];
+        let chunk_text = make_chunk_text(&block_texts);
+        let valid_blocks = make_valid_blocks("b_1", &block_texts);
+
+        // 证据在第九条（block_texts[8]，index 8）：投标保证金不得超过项目估算价的2%
+        let source_quote = "投标保证金不得超过项目估算价的2%";
+
+        let result =
+            select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 3);
+
+        assert!(!result.is_empty(), "应找到匹配的 block");
+        // 第九条的 block 是 b_1_8（index 8），应在结果中排在前面
+        assert!(
+            result.contains(&"b_1_8".to_string()),
+            "结果应包含证据所在 block b_1_8（第九条），实际: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn select_blocks_falls_back_to_empty_for_very_different_texts() {
+        let valid_blocks: Vec<(String, usize)> = (0..6)
+            .map(|i| (format!("b_2_{}", i), i))
+            .collect();
+        let chunk_text = "项目名称：XX市污水处理厂建设工程。建设地点：XX市南郊。工期：365天。";
+        let source_quote = "投标人须具备有效的安全生产许可证且在有效期内";
+
+        let result =
+            select_blocks_by_source_quote(&valid_blocks, source_quote, chunk_text, 5);
+        assert!(
+            result.is_empty(),
+            "完全不相关的 source_quote 应返回空 block_ids"
+        );
+    }
+
+    #[test]
+    fn select_blocks_respects_max_blocks_limit() {
+        let block_texts: Vec<String> = (0..20)
+            .map(|i| format!("第{}条 条款内容文本占位。", i + 1))
+            .collect();
+        let block_refs: Vec<&str> = block_texts.iter().map(|s| s.as_str()).collect();
+        let chunk_text = make_chunk_text(&block_refs);
+        let valid_blocks = make_valid_blocks("b_3", &block_refs);
+
+        let source_quote = "第15条 条款内容文本占位";
+
+        let result =
+            select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 5);
+        assert!(
+            result.len() <= 5,
+            "返回的 block 数不应超过 max_blocks=5，实际: {}",
+            result.len()
+        );
+        assert!(
+            result.contains(&"b_3_14".to_string()),
+            "应包含证据所在 block b_3_14（第15条，index 14），实际: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn select_blocks_handles_non_uniform_block_lengths() {
+        // 非均匀场景：前 9 个 block 极短，最后一个 block 极长（800+ 字符），
+        // 证据落在长 block 的中段。若按 index 比例估算偏移，长 block 会被
+        // 误估到 chunk 末尾，导致选中错误的短 block；按真实文本长度累加的
+        // 中心偏移则能正确选中长 block（index 9）。
+        let mut block_texts: Vec<String> = (0..9)
+            .map(|i| format!("第{}条 短条款。", i + 1))
+            .collect();
+        let long_block = format!(
+            "第十条 详细说明。{}投标保证金不得超过项目估算价的2%。{}",
+            "内容".repeat(200),
+            "内容".repeat(200),
+        );
+        block_texts.push(long_block);
+
+        let block_refs: Vec<&str> = block_texts.iter().map(|s| s.as_str()).collect();
+        let chunk_text = make_chunk_text(&block_refs);
+        let valid_blocks = make_valid_blocks("b_nu", &block_refs);
+
+        let source_quote = "投标保证金不得超过项目估算价的2%";
+        let result =
+            select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 3);
+
+        assert!(
+            result.contains(&"b_nu_9".to_string()),
+            "应按真实偏移选中长 block b_nu_9（第十条，index 9），实际: {:?}",
+            result
+        );
     }
 }
