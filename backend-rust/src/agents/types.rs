@@ -1017,7 +1017,7 @@ impl Default for CoordinatorConfig {
             legal_verify_max_turns: 3,
             blind_spot_max_turns: 10,
             blind_spot_fallback_enabled: true,
-            max_parallel_clauses: 5,
+            max_parallel_clauses: 3,
         }
     }
 }
@@ -1050,6 +1050,76 @@ pub struct DynamicAgentManifest {
 
 // ─── Coordinator 输出 ────────────────────────────────────────────
 
+/// Coordinator 主执行阶段的最终状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewExecutionStatus {
+    Completed,
+    PartialFailed,
+}
+
+impl ReviewExecutionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::PartialFailed => "partial_failed",
+        }
+    }
+}
+
+/// 整个 Agent 未能产出任何成功条款时的失败信息。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AgentExecutionFailure {
+    pub agent_id: String,
+    pub message: String,
+}
+
+/// 单条条款执行失败的信息。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ClauseExecutionFailure {
+    pub agent_id: String,
+    pub clause_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StageExecutionFailure {
+    pub stage: String,
+    pub message: String,
+}
+
+/// Coordinator 执行完整性摘要。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ExecutionSummary {
+    pub status: ReviewExecutionStatus,
+    pub successful_agents: usize,
+    pub failed_agents: Vec<AgentExecutionFailure>,
+    pub failed_clauses: Vec<ClauseExecutionFailure>,
+    #[serde(default)]
+    pub failed_stages: Vec<StageExecutionFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<crate::agents::execution_control::BudgetUsage>,
+}
+
+impl ExecutionSummary {
+    pub fn completed(successful_agents: usize) -> Self {
+        Self {
+            status: ReviewExecutionStatus::Completed,
+            successful_agents,
+            failed_agents: Vec::new(),
+            failed_clauses: Vec::new(),
+            failed_stages: Vec::new(),
+            budget: None,
+        }
+    }
+}
+
+impl Default for ExecutionSummary {
+    fn default() -> Self {
+        Self::completed(0)
+    }
+}
+
 /// Coordinator 审查管线的最终输出。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CoordinatorOutput {
@@ -1059,6 +1129,9 @@ pub struct CoordinatorOutput {
     pub routing_summary: RoutingSummary,
     /// SessionGraph 快照（审计追溯用）
     pub graph_snapshot: Option<GraphSnapshot>,
+    /// Agent 与条款执行是否完整，供 HTTP/SSE 区分完成与部分失败。
+    #[serde(default)]
+    pub execution_summary: ExecutionSummary,
 }
 
 /// Coordinator 的路由与审查统计摘要。
@@ -1819,5 +1892,6 @@ mod tests {
         assert_eq!(config.legal_verify_max_turns, 3);
         assert_eq!(config.blind_spot_max_turns, 10);
         assert!(config.blind_spot_fallback_enabled);
+        assert_eq!(config.max_parallel_clauses, 3);
     }
 }

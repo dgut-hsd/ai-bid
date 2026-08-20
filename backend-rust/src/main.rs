@@ -778,7 +778,7 @@ async fn main() -> Result<()> {
     let max_parallel: usize = env::var("AIBID_MAX_PARALLEL_CLAUSES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(5);
+        .unwrap_or(3);
     println!(
         "  最大并行条款: {} (设置 AIBID_MAX_PARALLEL_CLAUSES 调整)",
         max_parallel
@@ -810,12 +810,14 @@ async fn main() -> Result<()> {
     let registry = AgentRegistry::builtin();
 
     // 6. 工厂函数（避免 clone_box 传染）
-    let llm_factory = {
-        move || {
-            create_llm_client()
-                .expect("创建 LLM 客户端失败。请检查 AIBID_LLM_PROTOCOL 及相关 API 密钥环境变量")
-        }
-    };
+    let llm_factory: Arc<dyn Fn() -> Box<dyn ai_bid::agents::react_loop::LlmClient> + Send + Sync> =
+        Arc::new({
+            move || {
+                create_llm_client().expect(
+                    "创建 LLM 客户端失败。请检查 AIBID_LLM_PROTOCOL 及相关 API 密钥环境变量",
+                )
+            }
+        });
 
     // 6. 搜索后端选择
     let search_backend =
@@ -855,7 +857,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let tools_factory = {
+    let tools_factory: Arc<dyn Fn() -> ToolRegistry + Send + Sync> = Arc::new({
         let doc_index = doc_index.clone();
         let agent_embed = agent_embed.clone();
         let chunk_map = chunk_map.clone();
@@ -940,7 +942,7 @@ async fn main() -> Result<()> {
             );
             registry
         }
-    };
+    });
 
     // 7. 检查是否使用 Coordinator 模式（环境变量 AIBID_COORDINATOR=1）
     let use_coordinator = env::var("AIBID_COORDINATOR").unwrap_or_default() == "1";
@@ -958,8 +960,8 @@ async fn main() -> Result<()> {
         let coordinator = Coordinator::new(
             config,
             registry,
-            Arc::new(llm_factory),
-            Arc::new(tools_factory),
+            llm_factory.clone(),
+            tools_factory.clone(),
             bus,
             graph,
             trace,
@@ -1002,12 +1004,13 @@ async fn main() -> Result<()> {
         let findings = ai_bid::agents::react_loop::review_clauses_parallel(
             &review_clauses,
             create_fact_check_agent,
-            &llm_factory,
-            &tools_factory,
+            llm_factory.clone(),
+            tools_factory.clone(),
             max_parallel,
             None,
             None,
             "FactCheckAgent",
+            None,
         )
         .await;
 
@@ -1025,6 +1028,7 @@ async fn main() -> Result<()> {
                 blind_spot_findings: 0,
             },
             graph_snapshot: None,
+            execution_summary: ai_bid::agents::types::ExecutionSummary::completed(1),
         }
     };
 

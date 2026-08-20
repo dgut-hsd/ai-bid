@@ -45,6 +45,7 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub mod answer_user;
 pub mod bid_evaluation_test;
@@ -124,6 +125,27 @@ impl ToolRegistry {
         }
     }
 
+    /// 为所有工具增加统一的预算与单次调用超时控制。
+    pub fn into_controlled(
+        self,
+        control: Arc<crate::agents::execution_control::ReviewExecutionControl>,
+    ) -> Self {
+        let tools = self
+            .tools
+            .into_iter()
+            .map(|(name, tool)| {
+                let wrapped: Box<dyn AgentTool> = Box::new(ControlledTool {
+                    name: name.clone(),
+                    definition: tool.definition(),
+                    inner: tool,
+                    control: control.clone(),
+                });
+                (name, wrapped)
+            })
+            .collect();
+        Self { tools }
+    }
+
     /// 获取所有工具的 definitions（发送给 LLM）。
     pub fn definitions(&self) -> Vec<serde_json::Value> {
         let defs = self.tools.values().map(|t| t.definition()).collect();
@@ -197,8 +219,79 @@ impl ToolRegistry {
     }
 }
 
+struct ControlledTool {
+    name: String,
+    definition: serde_json::Value,
+    inner: Box<dyn AgentTool>,
+    control: Arc<crate::agents::execution_control::ReviewExecutionControl>,
+}
+
+#[async_trait::async_trait]
+impl AgentTool for ControlledTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn definition(&self) -> serde_json::Value {
+        self.definition.clone()
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value> {
+        let reservation = self.control.reserve_tool_call(&self.name)?;
+        let result = tokio::time::timeout(
+            self.control.limits().call_timeout,
+            self.inner.execute(args),
+        )
+            .await
+            .map_err(|_| anyhow::anyhow!("工具 {} 调用超时", self.name))??;
+        reservation.commit();
+        Ok(result)
+    }
+}
+
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::execution_control::{ExecutionLimits, GlobalExecutionLimiter};
+
+    struct AlwaysFailTool;
+
+    #[async_trait::async_trait]
+    impl AgentTool for AlwaysFailTool {
+        fn name(&self) -> &str {
+            "always_fail"
+        }
+
+        fn definition(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
+            Err(anyhow::anyhow!("模拟工具调用失败"))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_tool_call_releases_reserved_budget() {
+        let limiter = Arc::new(GlobalExecutionLimiter::new(ExecutionLimits::default()));
+        let control = limiter.start_review(1, 1);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(AlwaysFailTool));
+        let registry = registry.into_controlled(control.clone());
+
+        let result = registry
+            .get("always_fail")
+            .expect("测试工具应已注册")
+            .execute(serde_json::json!({}))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(control.budget_usage().tool_calls, 0);
     }
 }
