@@ -418,6 +418,16 @@ pub fn build(state: AppState) -> Router {
             "/knowledge/ingest",
             post(knowledge_handlers::ingest_knowledge),
         )
+        // 知识库向量删除（Java 删除标准库文件时联动调用）
+        .route(
+            "/knowledge/document/:document_id",
+            delete(knowledge_handlers::delete_knowledge_document),
+        )
+        // 知识库检索（检索组）
+        .route(
+            "/knowledge/search",
+            post(knowledge_handlers::search_knowledge),
+        )
         // SSE 实时推送 + 异步审查结果
         .route(
             "/review/:doc_id/stream",

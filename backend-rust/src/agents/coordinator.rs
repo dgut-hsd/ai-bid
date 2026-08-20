@@ -987,7 +987,7 @@ impl Coordinator {
                     eprintln!("  [BATCH_SEARCH] ❌ 并发控制失败: {}", e);
                 }
                 Err(e) => {
-                    eprintln!("  [BATCH_SEARCH] ❌ join error: {}", e);
+                    eprintln!("  [BATCH_SEARCH] ? join error: {}", e);
                 }
             }
         }
@@ -1792,8 +1792,8 @@ impl Coordinator {
     ///   ├─ Step A: LegalDomain 自动分类（纯规则，零 LLM）
     ///   │
     ///   ├─ Step B: 规则预筛（已知法规直通，跳过 LLM）
-    ///   │    ├─ 法条名称/条款号合法 → ✅ 直接通过（~70%）
-    ///   │    └─ 无法判断 → ➡ 进入 LLM 批量验证
+    ///   │    ├─ 法条名称/条款号合法 → ? 直接通过（~70%）
+    ///   │    └─ 无法判断 → ? 进入 LLM 批量验证
     ///   │
     ///   ├─ Step C: LLM 批量验证（按 legal_domain 分组）
     ///   │    每组一条 prompt → 一次 ReAct → 输出该组所有验证结论
@@ -1860,7 +1860,7 @@ impl Coordinator {
                 for original in findings.iter_mut() {
                     if original.risk_id == vf.risk_id {
                         original.reason.push_str(&format!(
-                            "\n[LegalVerify] ✅ 规则直通验证通过 (domain={})。",
+                            "\n[LegalVerify] ? 规则直通验证通过 (domain={})。",
                             domain
                         ));
                         total_verified += 1;
@@ -1947,7 +1947,7 @@ impl Coordinator {
                                     if original.risk_id == entry.risk_id {
                                         if entry.is_valid && entry.confidence >= 0.5 {
                                             original.reason.push_str(&format!(
-                                                "\n[LegalVerify] ✅ 批量验证通过 (domain={}, confidence={:.2})。",
+                                                "\n[LegalVerify] ? 批量验证通过 (domain={}, confidence={:.2})。",
                                                 domain, entry.confidence
                                             ));
                                             // 回写修正后的法条引用
@@ -1959,7 +1959,7 @@ impl Coordinator {
                                             original.severity = RiskSeverity::Info;
                                             original.clear_criticality();
                                             original.reason.push_str(&format!(
-                                                "\n[LegalVerify] ❌ 批量验证未通过 (domain={}, confidence={:.2}): {}。已降级。",
+                                                "\n[LegalVerify] ? 批量验证未通过 (domain={}, confidence={:.2}): {}。已降级。",
                                                 domain, entry.confidence, entry.reason
                                             ));
                                         }
@@ -1969,7 +1969,7 @@ impl Coordinator {
                                 }
                             }
                         } else {
-                            eprintln!("    [{}] ⚠️ 批量结果 JSON 解析失败", domain);
+                            eprintln!("    [{}] !! 批量结果 JSON 解析失败", domain);
                         }
                         break; // 只解析第一个 BATCH_VERIFICATION 标记
                     }
@@ -1994,7 +1994,7 @@ impl Coordinator {
                                 original.clear_criticality();
                                 original
                                     .reason
-                                    .push_str("\n[LegalVerify] ❌ 置信度不足，已降级 (fallback)。");
+                                    .push_str("\n[LegalVerify] ? 置信度不足，已降级 (fallback)。");
                             }
                             total_verified += 1;
                             break;
@@ -2062,10 +2062,10 @@ impl Coordinator {
                                 original.clear_criticality();
                                 original
                                     .reason
-                                    .push_str("\n[LegalVerify] ❌ 法条引用验证未通过，已降级。");
+                                    .push_str("\n[LegalVerify] ? 法条引用验证未通过，已降级。");
                             } else {
                                 original.reason.push_str(&format!(
-                                    "\n[LegalVerify] ✅ 法条引用验证通过 (confidence={:.2})。",
+                                    "\n[LegalVerify] ? 法条引用验证通过 (confidence={:.2})。",
                                     vf.confidence
                                 ));
                                 if !vf.legal_basis.is_empty() {
@@ -2196,7 +2196,7 @@ impl Coordinator {
             f.reason.chars().take(500).collect::<String>()
         ));
         task.push_str("请对上述法条引用进行对抗性验证，使用 output_finding 输出验证结论。\n\n");
-        task.push_str("🛑 无论验证通过或修正，每条 legal_basis 必须包含可验证的 URL 链接（Markdown 格式: [法条名](URL)），禁止输出纯文本法条名。");
+        task.push_str("? 无论验证通过或修正，每条 legal_basis 必须包含可验证的 URL 链接（Markdown 格式: [法条名](URL)），禁止输出纯文本法条名。");
         task
     }
 
@@ -2240,7 +2240,7 @@ impl Coordinator {
         }
 
         task.push_str("---\n\n");
-        task.push_str("🛑 现在调用 **output_verification_batch** 输出所有验证结论。\n");
+        task.push_str("? 现在调用 **output_verification_batch** 输出所有验证结论。\n");
         task.push_str("每条 corrected_legal_basis 必须包含可验证的 URL 链接（Markdown 格式: [法条名](URL)）。");
         task
     }
@@ -2255,10 +2255,10 @@ impl Coordinator {
                     finding.clear_criticality();
                     finding
                         .reason
-                        .push_str("\n[LegalVerify] ❌ 法条引用置信度不足，已降级 (fallback)。");
+                        .push_str("\n[LegalVerify] ? 法条引用置信度不足，已降级 (fallback)。");
                 } else {
                     finding.reason.push_str(&format!(
-                        "\n[LegalVerify] ✅ 法条引用置信度充足 (fallback, confidence={:.2})。",
+                        "\n[LegalVerify] ? 法条引用置信度充足 (fallback, confidence={:.2})。",
                         finding.confidence
                     ));
                 }
@@ -2452,7 +2452,7 @@ impl Coordinator {
             ));
             for (cid, pairs) in &snapshot.contradicts {
                 for (other_cid, reason) in pairs {
-                    ctx.push_str(&format!("- {} ↔ {} : {}\n", cid, other_cid, reason));
+                    ctx.push_str(&format!("- {} ? {} : {}\n", cid, other_cid, reason));
                 }
             }
             ctx.push('\n');
@@ -2945,7 +2945,7 @@ impl Coordinator {
             .count();
 
         eprintln!(
-            "  [TRIAGE] 🔴High={} 🟡Medium={} 🟢Low={} ℹ️Info={}",
+            "  [TRIAGE] ?High={} ?Medium={} ?Low={} ??Info={}",
             high, medium, low, info
         );
 

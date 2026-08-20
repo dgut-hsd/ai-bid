@@ -27,6 +27,7 @@ use ai_bid::agents::tools::search_document::SearchDocumentTool;
 use ai_bid::agents::tools::search_knowledge::{
     DashScopeSearchBackend, SearchBuffer, SearchKnowledgeTool,
 };
+use ai_bid::agents::tools::search_knowledge_base::SearchKnowledgeBaseTool;
 // V2+ 工具
 use ai_bid::agents::tools::compare_versions::CompareVersionsTool;
 use ai_bid::agents::tools::detect_boilerplate::DetectBoilerplateTool;
@@ -644,7 +645,7 @@ async fn main() -> Result<()> {
             );
             // 显示 snippet 前 120 字符
             let snippet: String = hit.snippet.chars().take(120).collect();
-            println!("       ↳ {}", snippet);
+            println!("       ? {}", snippet);
         }
         println!();
     }
@@ -882,6 +883,10 @@ async fn main() -> Result<()> {
             } else {
                 panic!("搜索后端未初始化");
             }
+            // 本地知识库检索（与入库共享 EmbeddingClient，保证向量空间一致）
+            registry.register(Box::new(SearchKnowledgeBaseTool::new(
+                agent_embed.clone(),
+            )));
             registry.register(Box::new(OutputFindingTool));
             // V2+ 工具
             registry.register(Box::new(CompareVersionsTool::new(
@@ -1086,7 +1091,7 @@ async fn main() -> Result<()> {
         "  截断(需人工): {} 条",
         findings.iter().filter(|f| f.truncated).count()
     );
-    println!("  🔴 High: {} 条", output.routing_summary.high_risk_count);
+    println!("  ? High: {} 条", output.routing_summary.high_risk_count);
     println!("  结果文件: {}", findings_path);
 
     // 打印 Agent 分布
@@ -1183,7 +1188,7 @@ async fn main() -> Result<()> {
         if let Ok(json) = serde_json::to_string_pretty(&run_metrics)
             && fs::write(&run_path, &json).is_ok()
         {
-            eprintln!("\n📊 指标已写入: {}", run_path);
+            eprintln!("\n? 指标已写入: {}", run_path);
             eprintln!(
                 "   总耗时 {:.1}s | Token {} in + {} out | 成本 ¥{:.2}",
                 run_metrics.latency.total_wall_clock_secs,

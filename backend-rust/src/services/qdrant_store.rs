@@ -36,6 +36,9 @@ pub struct KnowledgePayload {
     pub page_start: usize,
     pub page_end: usize,
     pub ingested_at: String,       // RFC3339，入库时间
+    /// 归属租户（多租户隔离：检索/删除均按此字段过滤）
+    #[serde(default)]
+    pub tenant_id: String,
 }
 
 impl KnowledgePayload {
@@ -121,22 +124,29 @@ impl QdrantStore {
     }
 
     /// 语义检索（供检索成员使用）：query 必须已 L2 归一化（复用 EmbeddingClient::encode_queries）
+    ///
+    /// `tenant_id`：多租户隔离过滤器。传入后仅检索该租户入库的文档；
+    /// 传 None 表示不限制（供单租户部署或内部工具使用）。
     pub async fn search(
         &self,
         query_vector: Vec<f32>,
         top_k: u64,
         category: Option<String>,
         applicable_scope: Option<String>,
+        tenant_id: Option<String>,
     ) -> Result<Vec<(f32, KnowledgePayload)>> {
         let mut builder = SearchPointsBuilder::new(KB_COLLECTION, query_vector, top_k)
             .with_payload(true);
-        // 可选过滤：category / applicable_scope
+        // 可选过滤：category / applicable_scope / tenant_id
         let mut must: Vec<Condition> = Vec::new();
         if let Some(c) = category {
             must.push(Condition::matches("category", MatchValue::Keyword(c)));
         }
         if let Some(s) = applicable_scope {
             must.push(Condition::matches("applicable_scope", MatchValue::Keyword(s)));
+        }
+        if let Some(t) = tenant_id {
+            must.push(Condition::matches("tenant_id", MatchValue::Keyword(t)));
         }
         if !must.is_empty() {
             builder = builder.filter(Filter::must(must));
@@ -156,11 +166,18 @@ impl QdrantStore {
     }
 
     /// 按 document_id 删除某份文件的所有向量（Java 组删除标准库文件时调用）
-    pub async fn delete_by_document(&self, document_id: &str) -> Result<()> {
-        let filter = Filter::must([Condition::matches(
+    ///
+    /// `tenant_id`：归属校验。传入后仅当文档属于该租户时才删除，
+    /// 防止跨租户删除；传 None 表示不校验（仅限内部运维）。
+    pub async fn delete_by_document(&self, document_id: &str, tenant_id: Option<&str>) -> Result<()> {
+        let mut must: Vec<Condition> = vec![Condition::matches(
             "document_id",
             MatchValue::Keyword(document_id.to_string()),
-        )]);
+        )];
+        if let Some(t) = tenant_id {
+            must.push(Condition::matches("tenant_id", MatchValue::Keyword(t.to_string())));
+        }
+        let filter = Filter::must(must);
         self.client
             .delete_points(
                 DeletePointsBuilder::new(KB_COLLECTION)
@@ -195,6 +212,7 @@ mod tests {
             page_start: 3,
             page_end: 4,
             ingested_at: "2026-01-01T00:00:00Z".into(),
+            tenant_id: "tenant-a".into(),
         }
     }
 
