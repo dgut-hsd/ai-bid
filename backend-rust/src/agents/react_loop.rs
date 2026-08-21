@@ -841,12 +841,11 @@ impl ReActLoop {
             }
 
             // ── Step 0a: Query SessionGraph — 拉取已知上下文 ──
-            if let Some(graph) = &self.graph {
-                if let Some(graph_msg) =
+            if let Some(graph) = &self.graph
+                && let Some(graph_msg) =
                     pull_graph_context_update(graph, &clause.chunk_id, &mut known_chunk_version)
-                {
-                    conversation.push(ChatMessage::System { content: graph_msg });
-                }
+            {
+                conversation.push(ChatMessage::System { content: graph_msg });
             }
 
             // ── Step 0b: AgentBus poll — 使用 Agent 持有的 Receiver 增量拉取 ──
