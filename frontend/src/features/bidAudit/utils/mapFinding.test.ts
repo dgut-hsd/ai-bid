@@ -247,6 +247,8 @@ describe('mapBackendFindings', () => {
 describe('mapBackendGraphSnapshot', () => {
   it('maps Rust snake_case graph and review attempts to frontend camelCase', () => {
     const result = mapBackendGraphSnapshot({
+      graph_version: 7,
+      chunk_versions: { ch_001: 3 },
       chunks: {
         ch_001: {
           chunk_id: 'ch_001',
@@ -257,7 +259,13 @@ describe('mapBackendGraphSnapshot', () => {
           tier: 'L2',
         },
       },
-      risks: {},
+      risks: {
+        RISK_001: {
+          finding: completeBackendFinding,
+          law_refs: ['《测试法》第1条'],
+          state: 'provisional',
+        },
+      },
       has_risk: {},
       reviewed_by: {
         ch_001: ['FactCheck'],
@@ -303,6 +311,9 @@ describe('mapBackendGraphSnapshot', () => {
       pageEnd: 3,
       textPreview: '测试条款',
     });
+    expect(result.graphVersion).toBe(7);
+    expect(result.chunkVersions).toEqual({ ch_001: 3 });
+    expect(result.risks.RISK_001.state).toBe('provisional');
     expect(result.reviewedBy).toEqual({
       ch_001: ['FactCheck'],
       ch_002: ['dynamic_technical'],
@@ -324,6 +335,33 @@ describe('mapBackendGraphSnapshot', () => {
       finishedAt: '2026-08-16T00:00:01Z',
     });
     expect(result.reviewAttempts.attempt_002.agentId).toBe('dynamic_technical');
+  });
+
+  it('defaults missing version and finding state fields for old snapshots', () => {
+    const result = mapBackendGraphSnapshot({
+      chunks: {},
+      risks: {
+        RISK_001: {
+          finding: completeBackendFinding,
+          law_refs: [],
+        },
+      },
+      has_risk: {},
+      reviewed_by: {},
+      linked_to: {},
+      cites: {},
+      cited_by: {},
+      agents: {},
+      laws: {},
+      cases: {},
+      contradicts: {},
+      same_law: {},
+      review_attempts: {},
+    });
+
+    expect(result.graphVersion).toBe(0);
+    expect(result.chunkVersions).toEqual({});
+    expect(result.risks.RISK_001.state).toBe('provisional');
   });
 });
 

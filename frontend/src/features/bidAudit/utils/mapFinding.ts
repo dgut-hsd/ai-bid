@@ -80,6 +80,7 @@ interface BackendChunkNode {
 interface BackendRiskNode {
   finding: BackendFinding;
   law_refs: string[];
+  state?: 'provisional';
 }
 
 type BackendAgentId = string | { Dynamic: string };
@@ -121,6 +122,8 @@ interface BackendReviewAttempt {
 }
 
 export interface BackendGraphSnapshot {
+  graph_version?: number;
+  chunk_versions?: Record<string, number>;
   chunks: Record<string, BackendChunkNode>;
   risks: Record<string, BackendRiskNode>;
   has_risk: Record<string, string[]>;
@@ -261,6 +264,8 @@ const mapBackendAgentId = (agentId: BackendAgentId): string =>
 export const mapBackendGraphSnapshot = (
   raw: BackendGraphSnapshot,
 ): GraphSnapshot => ({
+  graphVersion: raw.graph_version ?? 0,
+  chunkVersions: raw.chunk_versions ?? {},
   chunks: mapRecord(raw.chunks, (chunk) => ({
     chunkId: chunk.chunk_id,
     sectionPath: chunk.section_path,
@@ -272,6 +277,7 @@ export const mapBackendGraphSnapshot = (
   risks: mapRecord(raw.risks, (risk) => ({
     finding: mapBackendFinding(risk.finding),
     lawRefs: risk.law_refs,
+    state: risk.state ?? 'provisional',
   })),
   hasRisk: raw.has_risk ?? {},
   reviewedBy: mapRecord(raw.reviewed_by, (agentIds) =>

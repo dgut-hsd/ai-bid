@@ -189,9 +189,12 @@ export interface ChunkNode {
   tier: RiskTier;
 }
 
+export type FindingState = 'provisional';
+
 export interface RiskNode {
   finding: AuditIssue;
   lawRefs: string[];
+  state: FindingState;
 }
 
 export interface AgentNode {
@@ -239,6 +242,8 @@ export interface ReviewAttempt {
 }
 
 export interface GraphSnapshot {
+  graphVersion: number;
+  chunkVersions: Record<string, number>;
   chunks: Record<string, ChunkNode>;
   risks: Record<string, RiskNode>;
   hasRisk: Record<string, string[]>;
