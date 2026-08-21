@@ -1216,6 +1216,12 @@ pub enum FindingState {
     /// Agent 已发现、尚未经 Coordinator 最终裁决。
     #[default]
     Provisional,
+    /// Coordinator 已确认进入最终审计结果。
+    Confirmed,
+    /// Coordinator 已将该发现合并到另一条最终发现。
+    Merged,
+    /// Coordinator 已拒绝该发现。
+    Rejected,
 }
 
 /// SessionGraph 中的风险节点（封装 RiskFinding + 法条引用）。
@@ -1227,6 +1233,24 @@ pub struct RiskNode {
     /// 工作图状态；PR2 中 Agent 发现统一为 provisional。
     #[serde(default)]
     pub state: FindingState,
+    /// merged 状态对应的最终 finding ID。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_into: Option<String>,
+    /// Coordinator 的最终裁决原因。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_reason: Option<String>,
+}
+
+/// Finding 从 provisional 进入终态的不可变审计记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct FindingTransition {
+    pub risk_id: String,
+    pub from: FindingState,
+    pub to: FindingState,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_into: Option<String>,
+    pub decided_at: String,
 }
 
 /// linked_to 边的目标 Chunk + 关联原因。
@@ -1350,6 +1374,9 @@ pub struct GraphSnapshot {
     /// 每次 Agent 条款审查的生命周期记录；旧快照缺失时为空。
     #[serde(default)]
     pub review_attempts: HashMap<String, ReviewAttempt>,
+    /// Finding 最终裁决转换历史；旧快照缺失时为空。
+    #[serde(default)]
+    pub finding_transitions: Vec<FindingTransition>,
     /// 每次原子图事务递增一次；旧快照缺失时为 0。
     #[serde(default)]
     pub graph_version: u64,
@@ -1375,6 +1402,7 @@ impl GraphSnapshot {
             contradicts: HashMap::new(),
             same_law: HashMap::new(),
             review_attempts: HashMap::new(),
+            finding_transitions: Vec::new(),
             graph_version: 0,
             chunk_versions: HashMap::new(),
         }
@@ -1857,6 +1885,7 @@ mod tests {
         assert!(snap.contradicts.is_empty());
         assert!(snap.same_law.is_empty());
         assert!(snap.review_attempts.is_empty());
+        assert!(snap.finding_transitions.is_empty());
     }
 
     #[test]
@@ -1881,6 +1910,62 @@ mod tests {
         assert!(snapshot.review_attempts.is_empty());
         assert_eq!(snapshot.graph_version, 0);
         assert!(snapshot.chunk_versions.is_empty());
+    }
+
+    #[test]
+    fn test_graph_snapshot_deserializes_without_finding_finalization_fields() {
+        let json = serde_json::json!({
+            "chunks": {},
+            "risks": {},
+            "has_risk": {},
+            "reviewed_by": {},
+            "linked_to": {},
+            "cites": {},
+            "cited_by": {},
+            "agents": {},
+            "laws": {},
+            "cases": {},
+            "contradicts": {},
+            "same_law": {}
+        });
+
+        let snapshot: GraphSnapshot =
+            serde_json::from_value(json).expect("旧快照缺少裁决历史时应保持可反序列化");
+        assert!(snapshot.finding_transitions.is_empty());
+
+        let risk_json = serde_json::json!({
+            "finding": {
+                "risk_id": "R_001",
+                "clause_ids": ["ch_001"],
+                "no_risk": false,
+                "severity": "high",
+                "risk_type": "测试风险",
+                "source_quote": "测试原文",
+                "legal_basis": [],
+                "reason": "测试理由",
+                "suggestion": "测试建议",
+                "confidence": 0.9
+            },
+            "law_refs": []
+        });
+        let risk: RiskNode =
+            serde_json::from_value(risk_json).expect("旧风险节点缺少裁决字段时应兼容");
+        assert_eq!(risk.state, FindingState::Provisional);
+        assert!(risk.merged_into.is_none());
+        assert!(risk.decision_reason.is_none());
+
+        assert_eq!(
+            serde_json::to_value(FindingState::Confirmed).expect("终态应可序列化"),
+            serde_json::json!("confirmed")
+        );
+        assert_eq!(
+            serde_json::to_value(FindingState::Merged).expect("终态应可序列化"),
+            serde_json::json!("merged")
+        );
+        assert_eq!(
+            serde_json::to_value(FindingState::Rejected).expect("终态应可序列化"),
+            serde_json::json!("rejected")
+        );
     }
 
     // ── RiskSeverity 排序 ─────────────────────────────────────

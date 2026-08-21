@@ -4376,6 +4376,8 @@ mod tests {
                 finding: make_test_finding("R_001", "existing_chunk", "ExistingAgent"),
                 law_refs: Vec::new(),
                 state: FindingState::Provisional,
+                merged_into: None,
+                decision_reason: None,
             },
             "existing_chunk",
         );

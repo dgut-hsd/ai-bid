@@ -3345,6 +3345,8 @@ mod multi_finding_tests {
                 ),
                 law_refs: Vec::new(),
                 state: FindingState::Provisional,
+                merged_into: None,
+                decision_reason: None,
             },
             "existing_chunk",
         );
