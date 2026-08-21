@@ -2739,7 +2739,12 @@ impl Coordinator {
         if blind_spot_def.is_none() {
             eprintln!("  [BLINDSPOT] BlindSpotAgent 未注册，回退到 fallback");
             return if self.config.blind_spot_fallback_enabled {
-                self.blind_spot_fallback(Some(&snapshot), None).await
+                let candidate_chunk_ids = candidate_clauses
+                    .iter()
+                    .map(|clause| clause.chunk_id.clone())
+                    .collect::<Vec<_>>();
+                self.blind_spot_fallback(Some(&snapshot), Some(&candidate_chunk_ids))
+                    .await
             } else {
                 Vec::new()
             };
@@ -3914,6 +3919,64 @@ mod tests {
             .expect("BlindSpot 应保留审查尝试");
         assert_eq!(attempt.status, ReviewAttemptStatus::Completed);
         assert_eq!(attempt.outcome, Some(ReviewAttemptOutcome::NoRisk));
+    }
+
+    #[tokio::test]
+    async fn blind_spot_missing_agent_fallback_keeps_single_no_risk_candidate() {
+        let mut config = CoordinatorConfig::default();
+        config.blind_spot_fallback_enabled = true;
+        let mut registry = AgentRegistry::builtin();
+        registry.remove_for_test(&AgentId::BlindSpot);
+        let coordinator = make_test_coordinator(config, registry);
+        let clause = make_test_clause("ch_single_candidate", "投标人必须提交完整的履约方案");
+        coordinator.preload_chunks(std::slice::from_ref(&clause));
+        let attempt_id = coordinator
+            .graph
+            .start_review_attempt(AgentId::FactCheck, &clause.chunk_id)
+            .expect("应创建已有 Agent 的审查尝试");
+        coordinator
+            .graph
+            .commit_review_result(&attempt_id, ReviewAttemptOutcome::NoRisk, &[])
+            .expect("已有 Agent NoRisk 应正常完成");
+        let execution_control = coordinator.global_execution_limiter.start_review(1, 1);
+
+        let findings = coordinator.blind_spot_scan(execution_control).await;
+
+        assert_eq!(findings.len(), 1, "单个合法候选不得被提前跳过");
+        assert_eq!(findings[0].clause_ids, vec!["ch_single_candidate"]);
+        assert!(!findings[0].no_risk);
+    }
+
+    #[tokio::test]
+    async fn blind_spot_missing_agent_fallback_does_not_expand_beyond_candidates() {
+        let mut config = CoordinatorConfig::default();
+        config.blind_spot_fallback_enabled = true;
+        let mut registry = AgentRegistry::builtin();
+        registry.remove_for_test(&AgentId::BlindSpot);
+        let coordinator = make_test_coordinator(config, registry);
+        let candidate = make_test_clause("ch_candidate", "投标人必须提交完整的履约方案");
+        let mut low = make_test_clause("ch_low", "封面格式要求");
+        low.tier = RiskTier::Low;
+        let mut frontmatter = make_test_clause("ch_frontmatter", "采购邀请公告");
+        frontmatter.section_path = vec!["采购公告".to_string()];
+        coordinator.preload_chunks(&[candidate.clone(), low, frontmatter]);
+        let attempt_id = coordinator
+            .graph
+            .start_review_attempt(AgentId::FactCheck, &candidate.chunk_id)
+            .expect("应创建已有 Agent 的审查尝试");
+        coordinator
+            .graph
+            .commit_review_result(&attempt_id, ReviewAttemptOutcome::NoRisk, &[])
+            .expect("已有 Agent NoRisk 应正常完成");
+        let execution_control = coordinator.global_execution_limiter.start_review(1, 1);
+
+        let findings = coordinator.blind_spot_scan(execution_control).await;
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].clause_ids, vec!["ch_candidate"]);
+        let snapshot = coordinator.graph.snapshot();
+        assert!(!snapshot.has_risk.contains_key("ch_low"));
+        assert!(!snapshot.has_risk.contains_key("ch_frontmatter"));
     }
 
     #[tokio::test]

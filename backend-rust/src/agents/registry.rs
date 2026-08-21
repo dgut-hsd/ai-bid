@@ -325,6 +325,11 @@ impl AgentRegistry {
         self.definitions.keys().cloned().collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn remove_for_test(&mut self, id: &AgentId) {
+        self.definitions.remove(id);
+    }
+
     /// 注册一个动态 Agent。
     pub fn register_dynamic(&mut self, def: &DynamicAgentDefinition) {
         let agent_id = AgentId::Dynamic(def.id.clone());
