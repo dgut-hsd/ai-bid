@@ -256,6 +256,7 @@ impl SessionGraph {
                 affected.push(chunk_id.clone());
             }
         }
+        let is_hypothesis = node.finding.finding_role == FindingRole::Hypothesis;
         for law_ref in &node.law_refs {
             if push_unique(
                 state.cites.entry(risk_id.clone()).or_default(),
@@ -263,30 +264,35 @@ impl SessionGraph {
             ) {
                 changed = true;
             }
-            if push_unique(
-                state.cited_by.entry(law_ref.clone()).or_default(),
-                risk_id.clone(),
-            ) {
-                changed = true;
-            }
-            if !state.laws.contains_key(law_ref) {
-                state.laws.insert(
-                    law_ref.clone(),
-                    LawNode {
-                        law_id: law_ref.clone(),
-                        article_no: law_ref.clone(),
-                        title: String::new(),
-                    },
-                );
-                changed = true;
+            // Scout 假设仅供后续 Agent 参考，不提前创建正式法条节点和反向边。
+            if !is_hypothesis {
+                if push_unique(
+                    state.cited_by.entry(law_ref.clone()).or_default(),
+                    risk_id.clone(),
+                ) {
+                    changed = true;
+                }
+                if !state.laws.contains_key(law_ref) {
+                    state.laws.insert(
+                        law_ref.clone(),
+                        LawNode {
+                            law_id: law_ref.clone(),
+                            article_no: law_ref.clone(),
+                            title: String::new(),
+                        },
+                    );
+                    changed = true;
+                }
             }
         }
-        for chunk_id in &node.finding.clause_ids {
-            let same_law_affected =
-                Self::derive_same_law_edges_in_state(state, &node.law_refs, chunk_id);
-            if !same_law_affected.is_empty() {
-                changed = true;
-                affected.extend(same_law_affected);
+        if !is_hypothesis {
+            for chunk_id in &node.finding.clause_ids {
+                let same_law_affected =
+                    Self::derive_same_law_edges_in_state(state, &node.law_refs, chunk_id);
+                if !same_law_affected.is_empty() {
+                    changed = true;
+                    affected.extend(same_law_affected);
+                }
             }
         }
         if changed {

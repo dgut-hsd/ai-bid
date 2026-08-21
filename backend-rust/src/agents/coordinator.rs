@@ -795,7 +795,7 @@ impl Coordinator {
     /// Phase 0: Scout 初筛。Mini-batch 并行（3 clauses/批），零搜索。
     ///
     /// Scout 对每条 clause 产出 Hypothesis（finding_role=Hypothesis），
-    /// 通过 `add_hypothesis()` 轻量写入 SessionGraph，供 Phase 2 Agent 使用。
+    /// 通过原子提交接口轻量写入 SessionGraph，供 Phase 2 Agent 使用。
     #[allow(dead_code)]
     /// Scout 阶段 — 已被 review() 禁用（成本优化，见第 276 行 mark_scout_complete）。
     /// 保留此函数供未来按需重新启用，当前为死代码。
@@ -846,24 +846,16 @@ impl Coordinator {
                     // NOTE: Scout 不需要 .with_graph() — SessionGraph 此时只有 Chunk 节点
                     let mut findings = agent.review_single(&clause, &risk_id).await;
                     match classify_review_attempt(&findings) {
-                        Ok((outcome, finding_ids)) => {
+                        Ok((outcome, _)) => {
                             for finding in &mut findings {
                                 if !finding.no_risk {
                                     finding.finding_role = FindingRole::Hypothesis;
                                     finding.knowledge_source = "training_knowledge".into();
                                     finding.hypothesized_by = vec!["ScoutAgent".into()];
-                                    graph.add_hypothesis(
-                                        RiskNode {
-                                            finding: finding.clone(),
-                                            law_refs: finding.legal_basis.clone(),
-                                            state: FindingState::Provisional,
-                                        },
-                                        &clause.chunk_id,
-                                    );
                                 }
                             }
                             if let Err(error) =
-                                graph.complete_review_attempt(&attempt_id, outcome, finding_ids)
+                                graph.commit_review_result(&attempt_id, outcome, &findings)
                             {
                                 eprintln!("  [SCOUT] 完成审查尝试失败: {}", error);
                             }
@@ -1369,24 +1361,6 @@ impl Coordinator {
                         }
                     }
 
-                    // 将发现写入 SessionGraph（共享工作区）
-                    for finding in &findings {
-                        if !finding.no_risk {
-                            let law_refs = finding.legal_basis.clone();
-                            let risk_node = RiskNode {
-                                finding: finding.clone(),
-                                law_refs,
-                                state: FindingState::Provisional,
-                            };
-                            // 对每个关联的 clause 写入 has_risk 边
-                            for cid in &finding.clause_ids {
-                                graph_for_write.add_risk_with_edges(risk_node.clone(), cid);
-                            }
-                            // Note: AgentBus 广播已移至 ReActLoop 内部实时执行，
-                            // 不再在此处批量广播（避免时序问题——其他 Agent 已结束审查）
-                        }
-                    }
-
                     AgentTaskOutput {
                         findings,
                         successful_clauses: report.successful_clauses,
@@ -1575,14 +1549,6 @@ impl Coordinator {
 
                         for finding in recovered_findings.iter().filter(|finding| !finding.no_risk)
                         {
-                            let risk_node = RiskNode {
-                                finding: finding.clone(),
-                                law_refs: finding.legal_basis.clone(),
-                                state: FindingState::Provisional,
-                            };
-                            for clause_id in &finding.clause_ids {
-                                self.graph.add_risk_with_edges(risk_node.clone(), clause_id);
-                            }
                             if let Some(ref events) = self.review_events {
                                 events.emit(&ReviewEvent::FindingAdded {
                                     risk_id: finding.risk_id.clone(),
@@ -2913,19 +2879,12 @@ impl Coordinator {
             }
         }
 
-        // 将发现写入 SessionGraph
-        let graph_for_write = self.graph.clone();
+        // 静态兜底没有 ReviewAttempt，通过幂等接口写入 provisional 发现。
+        if let Err(error) = self.graph.upsert_provisional_findings(&real_findings) {
+            eprintln!("  [BLINDSPOT] 写入 SessionGraph 失败: {}", error);
+        }
         let bus_for_write = self.bus.clone();
         for finding in &real_findings {
-            let law_refs = finding.legal_basis.clone();
-            let risk_node = RiskNode {
-                finding: finding.clone(),
-                law_refs,
-                state: FindingState::Provisional,
-            };
-            for cid in &finding.clause_ids {
-                graph_for_write.add_risk_with_edges(risk_node.clone(), cid);
-            }
             if finding.severity == RiskSeverity::High {
                 bus_for_write.broadcast(
                     AgentId::BlindSpot,
@@ -3839,6 +3798,12 @@ mod tests {
         assert_eq!(fast_attempt.outcome, Some(ReviewAttemptOutcome::Findings));
         assert!(snapshot.reviewed_by.contains_key("ch_fast"));
         assert!(snapshot.risks.contains_key(&recovered_finding.risk_id));
+        assert_eq!(snapshot.risks.len(), 1, "超时恢复不得重复写入已提交风险");
+        assert_eq!(
+            snapshot.has_risk["ch_fast"],
+            vec![recovered_finding.risk_id.clone()],
+            "同一风险与条款的关系边必须保持唯一"
+        );
 
         let slow_attempt = snapshot
             .review_attempts

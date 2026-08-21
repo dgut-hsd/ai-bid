@@ -617,9 +617,9 @@ impl ReActLoop {
             let clause_findings = self.review_single(clause, &risk_id).await;
             if let (Some(graph), Some(attempt_id)) = (&self.graph, attempt_id.as_deref()) {
                 let transition_result = match classify_review_attempt(&clause_findings) {
-                    Ok((outcome, finding_ids)) => {
-                        graph.complete_review_attempt(attempt_id, outcome, finding_ids)
-                    }
+                    Ok((outcome, _)) => graph
+                        .commit_review_result(attempt_id, outcome, &clause_findings)
+                        .map(|_| ()),
                     Err(error_code) => {
                         graph.fail_review_attempt(attempt_id, error_code, "条款审查未完整结束")
                     }
@@ -2592,9 +2592,10 @@ where
                     failure_message = Some(message.to_string());
                 } else {
                     match classify_review_attempt(&findings) {
-                        Ok((outcome, finding_ids)) => {
+                        Ok((outcome, _)) => {
                             graph
-                                .complete_review_attempt(attempt_id, outcome, finding_ids)
+                                .commit_review_result(attempt_id, outcome, &findings)
+                                .map(|_| ())
                                 .map_err(anyhow::Error::msg)?;
                         }
                         Err(error_code) => {
@@ -2783,6 +2784,12 @@ mod multi_finding_tests {
         release_notify: Arc<Notify>,
     }
 
+    struct GatedFindingLlm {
+        slow_started: Arc<Notify>,
+        released: Arc<AtomicBool>,
+        release_notify: Arc<Notify>,
+    }
+
     struct ConditionalSlowLlm;
 
     struct AlwaysFailLlm;
@@ -2958,6 +2965,144 @@ mod multi_finding_tests {
                 usage: None,
             })
         }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for GatedFindingLlm {
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _tool_choice: &ToolChoice,
+        ) -> Result<LlmResponse> {
+            let should_block = messages.iter().any(|message| match message {
+                ChatMessage::User { content } => content.contains("模拟阻塞"),
+                _ => false,
+            });
+            if should_block {
+                self.slow_started.notify_one();
+                while !self.released.load(Ordering::SeqCst) {
+                    self.release_notify.notified().await;
+                }
+            }
+            Ok(LlmResponse {
+                content: None,
+                thought: None,
+                tool_calls: vec![ToolCall {
+                    id: "test-output".to_string(),
+                    name: "output_finding".to_string(),
+                    arguments: serde_json::json!({
+                        "findings": [finding_json("REALTIME_RISK", "测试风险条款")],
+                        "has_more": false,
+                        "coverage": ["procedure"],
+                    }),
+                }],
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_clause_commits_finding_before_parallel_batch_finishes() {
+        let graph = Arc::new(SessionGraph::new());
+        for chunk_id in ["ch_fast", "ch_slow"] {
+            graph.add_chunk(ChunkNode {
+                chunk_id: chunk_id.to_string(),
+                section_path: vec!["测试".to_string()],
+                page_start: 0,
+                page_end: 0,
+                text_preview: "测试条款".to_string(),
+                tier: RiskTier::Low,
+            });
+        }
+        let slow_started = Arc::new(Notify::new());
+        let released = Arc::new(AtomicBool::new(false));
+        let release_notify = Arc::new(Notify::new());
+        let clauses = vec![
+            ReviewClause {
+                chunk_id: "ch_fast".to_string(),
+                section_path: vec!["测试".to_string()],
+                text: "测试风险条款".to_string(),
+                page_start: 0,
+                page_end: 0,
+                tier: RiskTier::Low,
+                tier_max_turns: 1,
+            },
+            ReviewClause {
+                chunk_id: "ch_slow".to_string(),
+                section_path: vec!["测试".to_string()],
+                text: "模拟阻塞".to_string(),
+                page_start: 0,
+                page_end: 0,
+                tier: RiskTier::Low,
+                tier_max_turns: 1,
+            },
+        ];
+        let factory = {
+            let slow_started = slow_started.clone();
+            let released = released.clone();
+            let release_notify = release_notify.clone();
+            move || {
+                Box::new(GatedFindingLlm {
+                    slow_started: slow_started.clone(),
+                    released: released.clone(),
+                    release_notify: release_notify.clone(),
+                }) as Box<dyn LlmClient>
+            }
+        };
+        let graph_for_review = graph.clone();
+        let task = tokio::spawn(async move {
+            review_clauses_parallel_report(
+                &clauses,
+                |llm, tools| {
+                    ReActLoop::new(
+                        AgentConfig {
+                            name: "FactCheckAgent".to_string(),
+                            system_prompt: "测试".to_string(),
+                            default_max_turns: 1,
+                            tool_names: vec!["output_finding".to_string()],
+                        },
+                        llm,
+                        tools,
+                    )
+                },
+                Arc::new(factory),
+                Arc::new(crate::agents::tools::ToolRegistry::new),
+                2,
+                Some(graph_for_review),
+                None,
+                AgentId::FactCheck,
+                None,
+            )
+            .await
+        });
+
+        slow_started.notified().await;
+        let snapshot_before_release =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let snapshot = graph.snapshot();
+                    let fast_completed = snapshot.review_attempts.values().any(|attempt| {
+                        attempt.chunk_id == "ch_fast"
+                            && attempt.status == ReviewAttemptStatus::Completed
+                    });
+                    if fast_completed {
+                        break snapshot;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("快条款应先完成");
+
+        released.store(true, Ordering::SeqCst);
+        release_notify.notify_waiters();
+        let report = task.await.expect("并行审查任务应正常结束");
+
+        assert_eq!(snapshot_before_release.risks.len(), 1);
+        assert_eq!(snapshot_before_release.has_risk["ch_fast"].len(), 1);
+        assert!(!snapshot_before_release.has_risk.contains_key("ch_slow"));
+        assert_eq!(report.successful_clauses, 2);
     }
 
     #[tokio::test]
