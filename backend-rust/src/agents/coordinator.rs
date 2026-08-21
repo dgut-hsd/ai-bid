@@ -238,6 +238,8 @@ pub struct Coordinator {
     /// ★ 跨 Agent 共享搜索缓存（避免不同 Agent 重复搜索相同的法规）
     pub shared_search_cache: Arc<Mutex<HashMap<(String, String), serde_json::Value>>>,
     global_execution_limiter: Arc<GlobalExecutionLimiter>,
+    /// 同一 Coordinator 的 BlindSpot 后台扫描必须完整串行，避免 attempt 集合互相污染。
+    blind_spot_run_lock: Mutex<()>,
 }
 
 impl Coordinator {
@@ -275,6 +277,7 @@ impl Coordinator {
             metrics: None,
             shared_search_cache,
             global_execution_limiter: Arc::new(GlobalExecutionLimiter::from_env()),
+            blind_spot_run_lock: Mutex::new(()),
         };
 
         // 启动时加载已有动态 Agent
@@ -780,6 +783,7 @@ impl Coordinator {
     /// ★ BlindSpot 的发现**不会**追加到本次审核结果中——
     ///   它的价值在于为**下一次**审核积累经验（自动生成新的检测维度）。
     pub async fn run_blind_spot(&self) {
+        let _run_guard = self.blind_spot_run_lock.lock().await;
         eprintln!(
             "\n┌──────────────────────────────────────────────────────────────┐\n\
                │  BlindSpot: 后台盲点扫描 + 经验沉淀（异步，不阻塞主结果）    │\n\
@@ -3038,7 +3042,7 @@ impl Coordinator {
                     .unwrap_or(0);
                 let reason = if reviewed_count == 0 {
                     format!(
-                        "条款 {} 未被任何 Agent 审查，建议人工复核。章节: {}",
+                        "条款 {} 未被任何 Agent 成功完成审查，建议人工复核。章节: {}",
                         cid,
                         chunk.section_path.join(" > ")
                     )
@@ -3481,6 +3485,13 @@ mod tests {
         successful_clause_has_finding: bool,
     }
 
+    struct GatedBlindSpotLlm {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        released: Arc<std::sync::atomic::AtomicBool>,
+        release_notify: Arc<tokio::sync::Notify>,
+    }
+
     struct CountingLegalVerifyLlm {
         calls: Arc<AtomicUsize>,
     }
@@ -3626,6 +3637,36 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl LlmClient for GatedBlindSpotLlm {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _tool_choice: &ToolChoice,
+        ) -> Result<LlmResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            while !self.released.load(Ordering::SeqCst) {
+                self.release_notify.notified().await;
+            }
+            Ok(LlmResponse {
+                content: None,
+                thought: None,
+                tool_calls: vec![ToolCall {
+                    id: "test-output".to_string(),
+                    name: "output_finding".to_string(),
+                    arguments: serde_json::json!({
+                        "findings": [],
+                        "has_more": false,
+                        "coverage": [],
+                    }),
+                }],
+                usage: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
     impl LlmClient for CountingLegalVerifyLlm {
         async fn chat(
             &self,
@@ -3699,6 +3740,7 @@ mod tests {
             global_execution_limiter: Arc::new(GlobalExecutionLimiter::new(
                 crate::agents::execution_control::ExecutionLimits::default(),
             )),
+            blind_spot_run_lock: Mutex::new(()),
         }
     }
 
@@ -4006,6 +4048,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_blind_spot_serializes_reentrant_calls_per_coordinator() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_notify = Arc::new(tokio::sync::Notify::new());
+        let coordinator = Arc::new(make_runtime_coordinator(
+            CoordinatorConfig::default(),
+            Arc::new({
+                let calls = calls.clone();
+                let started = started.clone();
+                let released = released.clone();
+                let release_notify = release_notify.clone();
+                move || {
+                    Box::new(GatedBlindSpotLlm {
+                        calls: calls.clone(),
+                        started: started.clone(),
+                        released: released.clone(),
+                        release_notify: release_notify.clone(),
+                    })
+                }
+            }),
+        ));
+        let clause = make_test_clause("ch_reentrant", "投标人必须提交完整的履约方案");
+        coordinator.preload_chunks(std::slice::from_ref(&clause));
+        coordinator.preload_agents();
+
+        let first = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.run_blind_spot().await }
+        });
+        started.notified().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let second_invoked = Arc::new(tokio::sync::Notify::new());
+        let second = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let second_invoked = second_invoked.clone();
+            async move {
+                second_invoked.notify_one();
+                coordinator.run_blind_spot().await;
+            }
+        });
+        second_invoked.notified().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "第一次扫描释放前，第二次不得启动 BlindSpot LLM"
+        );
+        let started_attempts = coordinator
+            .graph
+            .snapshot()
+            .review_attempts
+            .values()
+            .filter(|attempt| {
+                attempt.agent_id == AgentId::BlindSpot
+                    && attempt.status == ReviewAttemptStatus::Started
+            })
+            .count();
+        assert_eq!(started_attempts, 1, "并发重入不得创建第二个审查尝试");
+
+        released.store(true, Ordering::SeqCst);
+        release_notify.notify_waiters();
+        first.await.expect("第一次扫描应完成");
+        second.await.expect("第二次扫描应在互斥锁释放后完成");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn blind_spot_missing_agent_fallback_does_not_expand_beyond_candidates() {
         let mut config = CoordinatorConfig::default();
         config.blind_spot_fallback_enabled = true;
@@ -4207,6 +4319,7 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].clause_ids, vec!["ch_failed"]);
         assert!(!findings[0].no_risk);
+        assert!(findings[0].reason.contains("未被任何 Agent 成功完成审查"));
         let snapshot = coordinator.graph.snapshot();
         assert!(snapshot.has_risk.contains_key("ch_failed"));
         assert!(!snapshot.has_risk.contains_key("ch_no_risk"));
