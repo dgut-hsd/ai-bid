@@ -1254,6 +1254,13 @@ pub struct ClauseContext {
     pub contradictions: Vec<LinkedChunk>,
 }
 
+/// 带条款版本的 SessionGraph 上下文，用于下一轮 ReAct 增量读取。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionedClauseContext {
+    pub version: u64,
+    pub context: ClauseContext,
+}
+
 impl ClauseContext {
     /// 是否存在已知风险。
     pub fn has_prior_risks(&self) -> bool {
@@ -1286,7 +1293,7 @@ impl ClauseContext {
                 let role_label = if r.finding_role == FindingRole::Hypothesis {
                     "[Scout 假设, 待验证]"
                 } else {
-                    "[已验证]"
+                    "[provisional, 待复核]"
                 };
                 let mut line = format!(
                     "- {} [{}] {} (confidence={:.2}): {}",

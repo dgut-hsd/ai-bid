@@ -827,6 +827,23 @@ impl SessionGraph {
             })
     }
 
+    /// 条款版本未变化时返回 None；变化时返回同一读锁下构建的完整上下文。
+    pub fn query_clause_context_since(
+        &self,
+        chunk_id: &str,
+        known_version: Option<u64>,
+    ) -> Option<VersionedClauseContext> {
+        let state = self.state.read().ok()?;
+        let version = state.chunk_versions.get(chunk_id).copied().unwrap_or(0);
+        if known_version == Some(version) {
+            return None;
+        }
+        Some(VersionedClauseContext {
+            version,
+            context: Self::build_clause_context(&state, chunk_id),
+        })
+    }
+
     /// 查询引用同一法条的所有 chunk_id（通过 cited_by 反向索引 O(1) 查询）。
     pub fn query_same_law_chunks(&self, law_ref: &str) -> Vec<String> {
         let mut result = Vec::new();
@@ -1319,6 +1336,34 @@ mod tests {
         assert_eq!(after_retry.contradicts["ch_002"].len(), 1);
         assert_eq!(after_retry.has_risk["ch_001"], vec!["R_001"]);
         assert_eq!(after_retry.graph_version, before_retry.graph_version);
+    }
+
+    #[test]
+    fn clause_context_since_returns_only_after_version_change() {
+        let graph = SessionGraph::new();
+        graph.add_chunk(make_test_chunk("ch_001"));
+        let first = graph
+            .query_clause_context_since("ch_001", None)
+            .expect("首次读取必须返回上下文");
+
+        assert!(
+            graph
+                .query_clause_context_since("ch_001", Some(first.version))
+                .is_none()
+        );
+
+        let attempt_id = graph
+            .start_review_attempt(AgentId::FactCheck, "ch_001")
+            .expect("应创建尝试");
+        graph
+            .commit_review_result(&attempt_id, ReviewAttemptOutcome::NoRisk, &[])
+            .expect("应完成尝试");
+        let changed = graph
+            .query_clause_context_since("ch_001", Some(first.version))
+            .expect("条款变化后必须返回新上下文");
+
+        assert!(changed.version > first.version);
+        assert_eq!(changed.context.reviewed_by, vec![AgentId::FactCheck]);
     }
 
     // ── 矛盾边 (contradicts) ──────────────────────────────────

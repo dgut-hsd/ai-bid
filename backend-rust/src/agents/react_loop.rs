@@ -210,6 +210,65 @@ impl ChunkReviewOutput {
     }
 }
 
+fn pull_graph_context_update(
+    graph: &SessionGraph,
+    chunk_id: &str,
+    known_version: &mut Option<u64>,
+) -> Option<String> {
+    let update = graph.query_clause_context_since(chunk_id, *known_version)?;
+    *known_version = Some(update.version);
+    let ctx = update.context;
+    if !ctx.has_prior_risks()
+        && ctx.reviewed_by.is_empty()
+        && ctx.linked_chunks.is_empty()
+        && ctx.same_law_chunks.is_empty()
+        && ctx.contradictions.is_empty()
+    {
+        return None;
+    }
+
+    let mut graph_msg = format!(
+        "[Session 记忆更新 v{}] 以下条款已被审查或存在共享线索:\n",
+        update.version
+    );
+    if !ctx.reviewed_by.is_empty() {
+        graph_msg.push_str(&format!(
+            "已审查 Agent: {}\n",
+            ctx.reviewed_by
+                .iter()
+                .map(|agent| agent.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if ctx.has_prior_risks() {
+        graph_msg.push_str("共享风险线索:\n");
+        graph_msg.push_str(&ctx.risk_summary());
+    }
+    if !ctx.linked_chunks.is_empty() {
+        graph_msg.push_str("\n关联条款:\n");
+        for linked in &ctx.linked_chunks {
+            graph_msg.push_str(&format!("- {} ({})\n", linked.chunk_id, linked.reason));
+        }
+    }
+    if !ctx.same_law_chunks.is_empty() {
+        graph_msg.push_str("\n引用相同法条的其他条款:\n");
+        for related_chunk_id in &ctx.same_law_chunks {
+            graph_msg.push_str(&format!("- {}\n", related_chunk_id));
+        }
+    }
+    if !ctx.contradictions.is_empty() {
+        graph_msg.push_str("\n⚠️ 已知条款矛盾:\n");
+        for contradiction in &ctx.contradictions {
+            graph_msg.push_str(&format!(
+                "- 与 {} 矛盾: {}\n",
+                contradiction.chunk_id, contradiction.reason
+            ));
+        }
+    }
+    Some(graph_msg)
+}
+
 // ─── 共享 Helper ───────────────────────────────────────────────
 
 /// 执行 LLM 返回的工具调用并将结果追加到对话历史。
@@ -765,6 +824,7 @@ impl ReActLoop {
         }
 
         let mut turn = 0u32;
+        let mut known_chunk_version = None;
         while turn < max_turns as u32 {
             turn += 1;
 
@@ -782,49 +842,9 @@ impl ReActLoop {
 
             // ── Step 0a: Query SessionGraph — 拉取已知上下文 ──
             if let Some(graph) = &self.graph {
-                let ctx = graph.query_clause_context(&clause.chunk_id);
-                if ctx.has_prior_risks() || !ctx.reviewed_by.is_empty() {
-                    let mut graph_msg =
-                        String::from("[Session 记忆] 以下条款已被审查或存在已知发现:\n");
-
-                    if !ctx.reviewed_by.is_empty() {
-                        graph_msg.push_str(&format!(
-                            "已审查 Agent: {}\n",
-                            ctx.reviewed_by
-                                .iter()
-                                .map(|a| a.to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ));
-                    }
-
-                    if ctx.has_prior_risks() {
-                        graph_msg.push_str("已知风险:\n");
-                        graph_msg.push_str(&ctx.risk_summary());
-                    }
-
-                    if !ctx.linked_chunks.is_empty() {
-                        graph_msg.push_str("\n关联条款:\n");
-                        for lc in &ctx.linked_chunks {
-                            graph_msg.push_str(&format!("- {} ({})\n", lc.chunk_id, lc.reason));
-                        }
-                    }
-
-                    if !ctx.same_law_chunks.is_empty() {
-                        graph_msg.push_str("\n引用相同法条的其他条款:\n");
-                        for cid in &ctx.same_law_chunks {
-                            graph_msg.push_str(&format!("- {}\n", cid));
-                        }
-                    }
-
-                    if !ctx.contradictions.is_empty() {
-                        graph_msg.push_str("\n⚠️ 已知条款矛盾:\n");
-                        for lc in &ctx.contradictions {
-                            graph_msg
-                                .push_str(&format!("- 与 {} 矛盾: {}\n", lc.chunk_id, lc.reason));
-                        }
-                    }
-
+                if let Some(graph_msg) =
+                    pull_graph_context_update(graph, &clause.chunk_id, &mut known_chunk_version)
+                {
                     conversation.push(ChatMessage::System { content: graph_msg });
                 }
             }
@@ -2766,6 +2786,60 @@ mod multi_finding_tests {
     struct ConditionalSlowLlm;
 
     struct AlwaysFailLlm;
+
+    #[test]
+    fn react_loop_injects_graph_context_only_when_chunk_version_changes() {
+        let graph = SessionGraph::new();
+        graph.add_chunk(ChunkNode {
+            chunk_id: "ch_shared".to_string(),
+            section_path: vec!["测试章节".to_string()],
+            page_start: 0,
+            page_end: 0,
+            text_preview: "共享条款".to_string(),
+            tier: RiskTier::Medium,
+        });
+        let mut known_version = None;
+
+        assert!(
+            pull_graph_context_update(&graph, "ch_shared", &mut known_version).is_none(),
+            "只有空条款预载时不应注入无意义消息"
+        );
+        let initial_version = known_version.expect("首次读取后必须记住条款版本");
+
+        let attempt_id = graph
+            .start_review_attempt(AgentId::Procedure, "ch_shared")
+            .expect("应创建并行 Agent 尝试");
+        let mut finding = RiskFinding::truncated_finding(
+            "R_shared".to_string(),
+            "ch_shared".to_string(),
+            "ProcedureAgent",
+            RiskTier::Medium,
+            RiskTier::Medium,
+            "测试共享风险",
+        );
+        finding.no_risk = false;
+        finding.truncated = false;
+        finding.risk_type = "共享风险".to_string();
+        finding.category_code = "SHARED_RISK".to_string();
+        graph
+            .commit_review_result(
+                &attempt_id,
+                ReviewAttemptOutcome::Findings,
+                std::slice::from_ref(&finding),
+            )
+            .expect("并行 Agent 发现应提交");
+
+        let message = pull_graph_context_update(&graph, "ch_shared", &mut known_version)
+            .expect("版本变化后必须注入共享白板消息");
+        assert!(known_version.expect("应记录新版本") > initial_version);
+        assert!(message.starts_with("[Session 记忆更新 v"));
+        assert!(message.contains("[provisional, 待复核]"));
+        assert!(message.contains("共享风险"));
+        assert!(
+            pull_graph_context_update(&graph, "ch_shared", &mut known_version).is_none(),
+            "版本未变化时不得重复注入"
+        );
+    }
 
     #[async_trait::async_trait]
     impl LlmClient for AlwaysFailLlm {
