@@ -60,11 +60,7 @@ fn tier_max_turns_from_env() -> Option<(usize, usize, usize)> {
             _ => {}
         }
     }
-    if any {
-        Some(caps)
-    } else {
-        None
-    }
+    if any { Some(caps) } else { None }
 }
 
 impl RiskTier {
@@ -1214,15 +1210,27 @@ pub struct ChunkNode {
 }
 
 /// SessionGraph 中的风险节点（封装 RiskFinding + 法条引用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingState {
+    /// Agent 已发现、尚未经 Coordinator 最终裁决。
+    #[default]
+    Provisional,
+}
+
+/// SessionGraph 中的风险节点（封装 RiskFinding + 法条引用）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskNode {
     pub finding: RiskFinding,
     /// 从 finding.legal_basis 提取的法条引用
     pub law_refs: Vec<String>,
+    /// 工作图状态；PR2 中 Agent 发现统一为 provisional。
+    #[serde(default)]
+    pub state: FindingState,
 }
 
 /// linked_to 边的目标 Chunk + 关联原因。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkedChunk {
     pub chunk_id: String,
     /// 关联原因（如 "共同指向品牌 X" / "资格+评分形成隐性升级"）
@@ -1335,6 +1343,12 @@ pub struct GraphSnapshot {
     /// 每次 Agent 条款审查的生命周期记录；旧快照缺失时为空。
     #[serde(default)]
     pub review_attempts: HashMap<String, ReviewAttempt>,
+    /// 每次原子图事务递增一次；旧快照缺失时为 0。
+    #[serde(default)]
+    pub graph_version: u64,
+    /// 每个条款的独立版本；旧快照缺失时为空。
+    #[serde(default)]
+    pub chunk_versions: HashMap<String, u64>,
 }
 
 impl GraphSnapshot {
@@ -1354,6 +1368,8 @@ impl GraphSnapshot {
             contradicts: HashMap::new(),
             same_law: HashMap::new(),
             review_attempts: HashMap::new(),
+            graph_version: 0,
+            chunk_versions: HashMap::new(),
         }
     }
 }
@@ -1856,6 +1872,8 @@ mod tests {
         let snapshot: GraphSnapshot =
             serde_json::from_value(json).expect("历史快照应保持可反序列化");
         assert!(snapshot.review_attempts.is_empty());
+        assert_eq!(snapshot.graph_version, 0);
+        assert!(snapshot.chunk_versions.is_empty());
     }
 
     // ── RiskSeverity 排序 ─────────────────────────────────────

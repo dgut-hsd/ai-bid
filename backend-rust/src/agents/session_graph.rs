@@ -11,50 +11,66 @@
 //!
 //! ## 并发语义
 //!
-//! SessionGraph 的读写是 **eventually consistent**：
-//! - 每个字段独立 `RwLock`，不保证跨字段的 ACID 事务
-//! - Agent 不应假设"读到 Risk 节点就一定有关联的 has_risk 边"
-//! - 写入用 `add_risk_with_edges()` 在一次写锁内完成 Risk + has_risk + cites，
-//!   减少（但不消除）中间态窗口
-//! - BlindSpot 在所有 Agent 完成后串行读取，此时图已静止，无并发问题
+//! SessionGraph 的图状态由单个 `RwLock<GraphState>` 保护：
+//! - 节点、边、审查尝试和版本在同一临界区提交
+//! - 查询和快照只读取一份一致状态
+//! - 预搜索缓存和 Scout 完成标志属于运行态，不参与图事务
 //!
 //! ## 生命周期
 //!
 //! Session 结束销毁，不持久化。长期记忆（Neo4j + Qdrant）在 Phase 3+ 实现。
 
 use crate::agents::types::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+#[derive(Clone, Default)]
+struct GraphState {
+    chunks: HashMap<String, ChunkNode>,
+    risks: HashMap<String, RiskNode>,
+    has_risk: HashMap<String, Vec<String>>,
+    reviewed_by: HashMap<String, Vec<AgentId>>,
+    linked_to: HashMap<String, Vec<LinkedChunk>>,
+    cites: HashMap<String, Vec<String>>,
+    cited_by: HashMap<String, Vec<String>>,
+    contradicts: HashMap<String, Vec<(String, String)>>,
+    same_law: HashMap<String, Vec<String>>,
+    agents: HashMap<AgentId, AgentNode>,
+    laws: HashMap<String, LawNode>,
+    cases: HashMap<String, CaseNode>,
+    review_attempts: HashMap<String, ReviewAttempt>,
+    graph_version: u64,
+    chunk_versions: HashMap<String, u64>,
+}
+
+fn bump_versions(state: &mut GraphState, chunk_ids: impl IntoIterator<Item = String>) -> u64 {
+    state.graph_version = state.graph_version.saturating_add(1);
+    let mut unique = HashSet::new();
+    for chunk_id in chunk_ids {
+        if unique.insert(chunk_id.clone()) {
+            let version = state.chunk_versions.entry(chunk_id).or_default();
+            *version = version.saturating_add(1);
+        }
+    }
+    state.graph_version
+}
+
+fn push_unique<T: PartialEq>(items: &mut Vec<T>, value: T) -> bool {
+    if items.contains(&value) {
+        false
+    } else {
+        items.push(value);
+        true
+    }
+}
 
 /// 中期记忆：Session Knowledge Graph。
 ///
 /// 线程安全的内存图，Agent 在审查过程中读写。
 pub struct SessionGraph {
-    /// 条款节点 (chunk_id → metadata)
-    chunks: RwLock<HashMap<String, ChunkNode>>,
-    /// 风险节点 (risk_id → RiskNode)
-    risks: RwLock<HashMap<String, RiskNode>>,
-    /// has_risk 边: chunk_id → Vec<risk_id>
-    has_risk: RwLock<HashMap<String, Vec<String>>>,
-    /// reviewed_by 边: chunk_id → Vec<AgentId>
-    reviewed_by: RwLock<HashMap<String, Vec<AgentId>>>,
-    /// linked_to 边: chunk_id → Vec<LinkedChunk>
-    linked_to: RwLock<HashMap<String, Vec<LinkedChunk>>>,
-    /// cites 边: risk_id → Vec<law_ref>（"哪些风险引用了此法条？"）
-    cites: RwLock<HashMap<String, Vec<String>>>,
-    /// cited_by 反向索引: law_ref → Vec<risk_id>（"此法条被哪些风险引用？"）
-    cited_by: RwLock<HashMap<String, Vec<String>>>,
-    /// contradicts 边: chunk_id → Vec<(other_chunk_id, reason)>
-    contradicts: RwLock<HashMap<String, Vec<(String, String)>>>,
-    /// same_law 物化边: chunk_id → Vec<other_chunk_id>
-    same_law: RwLock<HashMap<String, Vec<String>>>,
-    /// Agent 节点: agent_id → AgentNode
-    agents: RwLock<HashMap<AgentId, AgentNode>>,
-    /// Law 节点: law_id → LawNode
-    laws: RwLock<HashMap<String, LawNode>>,
-    /// Case 节点: case_id → CaseNode
-    cases: RwLock<HashMap<String, CaseNode>>,
+    /// 需要一致读写的图数据。
+    state: RwLock<GraphState>,
     /// 全局 risk_id 计数器，保证多 Agent 并发写入 SessionGraph 时 ID 唯一。
     ///
     /// 每次 `next_risk_id()` 调用原子递增，返回 `R_001`, `R_002`, ...。
@@ -66,30 +82,16 @@ pub struct SessionGraph {
     ///
     /// Coordinator 批量搜索阶段写入，Execute Phase 读取并注入 Agent prompt。
     search_results: RwLock<HashMap<String, Vec<SearchCacheEntry>>>,
-    /// 审查尝试记录，以 attempt_id 为键。
-    review_attempts: RwLock<HashMap<String, ReviewAttempt>>,
 }
 
 impl SessionGraph {
     /// 创建空的 SessionGraph。
     pub fn new() -> Self {
         Self {
-            chunks: RwLock::new(HashMap::new()),
-            risks: RwLock::new(HashMap::new()),
-            has_risk: RwLock::new(HashMap::new()),
-            reviewed_by: RwLock::new(HashMap::new()),
-            linked_to: RwLock::new(HashMap::new()),
-            cites: RwLock::new(HashMap::new()),
-            cited_by: RwLock::new(HashMap::new()),
-            contradicts: RwLock::new(HashMap::new()),
-            same_law: RwLock::new(HashMap::new()),
-            agents: RwLock::new(HashMap::new()),
-            laws: RwLock::new(HashMap::new()),
-            cases: RwLock::new(HashMap::new()),
+            state: RwLock::new(GraphState::default()),
             risk_id_counter: AtomicU64::new(0),
             scout_complete: AtomicBool::new(false),
             search_results: RwLock::new(HashMap::new()),
-            review_attempts: RwLock::new(HashMap::new()),
         }
     }
 
@@ -124,11 +126,12 @@ impl SessionGraph {
             started_at: chrono::Utc::now().to_rfc3339(),
             finished_at: None,
         };
-        let mut attempts = self
-            .review_attempts
+        let mut state = self
+            .state
             .write()
-            .map_err(|_| "SessionGraph 审查尝试写锁已中毒".to_string())?;
-        attempts.insert(attempt_id.clone(), attempt);
+            .map_err(|_| "SessionGraph 状态写锁已中毒".to_string())?;
+        state.review_attempts.insert(attempt_id.clone(), attempt);
+        bump_versions(&mut state, [chunk_id.to_string()]);
         Ok(attempt_id)
     }
 
@@ -148,12 +151,13 @@ impl SessionGraph {
             }
             _ => {}
         }
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "SessionGraph 状态写锁已中毒".to_string())?;
         let (agent_id, chunk_id) = {
-            let mut attempts = self
+            let attempt = state
                 .review_attempts
-                .write()
-                .map_err(|_| "SessionGraph 审查尝试写锁已中毒".to_string())?;
-            let attempt = attempts
                 .get_mut(attempt_id)
                 .ok_or_else(|| format!("审查尝试不存在: {}", attempt_id))?;
             if attempt.status != ReviewAttemptStatus::Started {
@@ -165,7 +169,11 @@ impl SessionGraph {
             attempt.finished_at = Some(chrono::Utc::now().to_rfc3339());
             (attempt.agent_id.clone(), attempt.chunk_id.clone())
         };
-        self.add_reviewed_by(&chunk_id, agent_id);
+        push_unique(
+            state.reviewed_by.entry(chunk_id.clone()).or_default(),
+            agent_id,
+        );
+        bump_versions(&mut state, [chunk_id]);
         Ok(())
     }
 
@@ -176,20 +184,25 @@ impl SessionGraph {
         error_code: ReviewAttemptErrorCode,
         error_message: &str,
     ) -> Result<(), String> {
-        let mut attempts = self
-            .review_attempts
+        let mut state = self
+            .state
             .write()
-            .map_err(|_| "SessionGraph 审查尝试写锁已中毒".to_string())?;
-        let attempt = attempts
-            .get_mut(attempt_id)
-            .ok_or_else(|| format!("审查尝试不存在: {}", attempt_id))?;
-        if attempt.status != ReviewAttemptStatus::Started {
-            return Err(format!("审查尝试 {} 已结束，禁止重复流转", attempt_id));
-        }
-        attempt.status = ReviewAttemptStatus::Failed;
-        attempt.error_code = Some(error_code);
-        attempt.error_message = Some(error_message.to_string());
-        attempt.finished_at = Some(chrono::Utc::now().to_rfc3339());
+            .map_err(|_| "SessionGraph 状态写锁已中毒".to_string())?;
+        let chunk_id = {
+            let attempt = state
+                .review_attempts
+                .get_mut(attempt_id)
+                .ok_or_else(|| format!("审查尝试不存在: {}", attempt_id))?;
+            if attempt.status != ReviewAttemptStatus::Started {
+                return Err(format!("审查尝试 {} 已结束，禁止重复流转", attempt_id));
+            }
+            attempt.status = ReviewAttemptStatus::Failed;
+            attempt.error_code = Some(error_code);
+            attempt.error_message = Some(error_message.to_string());
+            attempt.finished_at = Some(chrono::Utc::now().to_rfc3339());
+            attempt.chunk_id.clone()
+        };
+        bump_versions(&mut state, [chunk_id]);
         Ok(())
     }
 
@@ -201,13 +214,14 @@ impl SessionGraph {
         error_code: ReviewAttemptErrorCode,
         error_message: &str,
     ) -> Result<usize, String> {
-        let mut attempts = self
-            .review_attempts
+        let mut state = self
+            .state
             .write()
-            .map_err(|_| "SessionGraph 审查尝试写锁已中毒".to_string())?;
+            .map_err(|_| "SessionGraph 状态写锁已中毒".to_string())?;
         let finished_at = chrono::Utc::now().to_rfc3339();
         let mut closed = 0;
-        for attempt in attempts.values_mut() {
+        let mut affected_chunks = Vec::new();
+        for attempt in state.review_attempts.values_mut() {
             if attempt.status == ReviewAttemptStatus::Started
                 && &attempt.agent_id == agent_id
                 && chunk_ids.contains(&attempt.chunk_id)
@@ -216,8 +230,12 @@ impl SessionGraph {
                 attempt.error_code = Some(error_code);
                 attempt.error_message = Some(error_message.to_string());
                 attempt.finished_at = Some(finished_at.clone());
+                affected_chunks.push(attempt.chunk_id.clone());
                 closed += 1;
             }
+        }
+        if closed > 0 {
+            bump_versions(&mut state, affected_chunks);
         }
         Ok(closed)
     }
@@ -226,16 +244,23 @@ impl SessionGraph {
 
     /// 添加条款节点。
     pub fn add_chunk(&self, chunk: ChunkNode) {
-        if let Ok(mut chunks) = self.chunks.write() {
-            chunks.insert(chunk.chunk_id.clone(), chunk);
+        if let Ok(mut state) = self.state.write() {
+            let chunk_id = chunk.chunk_id.clone();
+            state.chunks.insert(chunk_id.clone(), chunk);
+            bump_versions(&mut state, [chunk_id]);
         }
     }
 
     /// 批量添加条款节点（Coordinator PRELOAD 阶段）。
     pub fn add_chunks(&self, chunks: Vec<ChunkNode>) {
-        if let Ok(mut map) = self.chunks.write() {
+        if let Ok(mut state) = self.state.write() {
+            let mut chunk_ids = Vec::with_capacity(chunks.len());
             for c in chunks {
-                map.insert(c.chunk_id.clone(), c);
+                chunk_ids.push(c.chunk_id.clone());
+                state.chunks.insert(c.chunk_id.clone(), c);
+            }
+            if !chunk_ids.is_empty() {
+                bump_versions(&mut state, chunk_ids);
             }
         }
     }
@@ -244,259 +269,240 @@ impl SessionGraph {
     pub fn add_risk(&self, mut risk: RiskNode) {
         // 从 RiskFinding.legal_basis 提取法条引用
         risk.law_refs = risk.finding.legal_basis.clone();
-        if let Ok(mut risks) = self.risks.write() {
-            risks.insert(risk.finding.risk_id.clone(), risk);
+        if let Ok(mut state) = self.state.write() {
+            let chunk_ids = risk.finding.clause_ids.clone();
+            state.risks.insert(risk.finding.risk_id.clone(), risk);
+            bump_versions(&mut state, chunk_ids);
         }
     }
 
     /// 添加 has_risk 边（chunk → risk）。
     pub fn add_has_risk(&self, chunk_id: &str, risk_id: &str) {
-        if let Ok(mut edges) = self.has_risk.write() {
-            edges
-                .entry(chunk_id.to_string())
-                .or_default()
-                .push(risk_id.to_string());
+        if let Ok(mut state) = self.state.write()
+            && push_unique(
+                state.has_risk.entry(chunk_id.to_string()).or_default(),
+                risk_id.to_string(),
+            )
+        {
+            bump_versions(&mut state, [chunk_id.to_string()]);
         }
     }
 
     /// 记录 Agent 已审查某条款。
     pub fn add_reviewed_by(&self, chunk_id: &str, agent: AgentId) {
-        if let Ok(mut edges) = self.reviewed_by.write() {
-            let entry = edges.entry(chunk_id.to_string()).or_default();
-            if !entry.contains(&agent) {
-                entry.push(agent);
-            }
+        if let Ok(mut state) = self.state.write()
+            && push_unique(
+                state.reviewed_by.entry(chunk_id.to_string()).or_default(),
+                agent,
+            )
+        {
+            bump_versions(&mut state, [chunk_id.to_string()]);
         }
     }
 
     /// 添加 linked_to 边（条款间关联）。
     pub fn add_linked_to(&self, from: &str, to: &str, reason: &str) {
-        if let Ok(mut edges) = self.linked_to.write() {
-            edges
-                .entry(from.to_string())
-                .or_default()
-                .push(LinkedChunk {
+        if let Ok(mut state) = self.state.write()
+            && push_unique(
+                state.linked_to.entry(from.to_string()).or_default(),
+                LinkedChunk {
                     chunk_id: to.to_string(),
                     reason: reason.to_string(),
-                });
+                },
+            )
+        {
+            bump_versions(&mut state, [from.to_string()]);
         }
     }
 
     /// 写入 Agent 节点（Coordinator PRELOAD 阶段调用）。
     pub fn add_agent(&self, agent: AgentNode) {
         let agent_id = agent.agent_id.clone();
-        if let Ok(mut agents) = self.agents.write() {
-            agents.insert(agent_id, agent);
+        if let Ok(mut state) = self.state.write() {
+            state.agents.insert(agent_id, agent);
+            bump_versions(&mut state, std::iter::empty::<String>());
         }
     }
 
     /// 双向写入矛盾边（Agent 调用 search_contradiction 工具时触发）。
     pub fn add_contradicts(&self, chunk_a: &str, chunk_b: &str, reason: &str) {
-        if let Ok(mut edges) = self.contradicts.write() {
-            edges
-                .entry(chunk_a.to_string())
-                .or_default()
-                .push((chunk_b.to_string(), reason.to_string()));
-            edges
-                .entry(chunk_b.to_string())
-                .or_default()
-                .push((chunk_a.to_string(), reason.to_string()));
+        if let Ok(mut state) = self.state.write() {
+            let forward = push_unique(
+                state.contradicts.entry(chunk_a.to_string()).or_default(),
+                (chunk_b.to_string(), reason.to_string()),
+            );
+            let reverse = push_unique(
+                state.contradicts.entry(chunk_b.to_string()).or_default(),
+                (chunk_a.to_string(), reason.to_string()),
+            );
+            if forward || reverse {
+                bump_versions(&mut state, [chunk_a.to_string(), chunk_b.to_string()]);
+            }
         }
     }
 
     /// 查询某条款的矛盾关系。
     pub fn query_contradictions(&self, chunk_id: &str) -> Vec<(String, String)> {
-        self.contradicts
+        self.state
             .read()
             .ok()
-            .and_then(|edges| edges.get(chunk_id).cloned())
+            .and_then(|state| state.contradicts.get(chunk_id).cloned())
             .unwrap_or_default()
     }
 
     /// 查询某条款的 same_law 关联。
     pub fn query_same_law_edges(&self, chunk_id: &str) -> Vec<String> {
-        self.same_law
+        self.state
             .read()
             .ok()
-            .and_then(|edges| edges.get(chunk_id).cloned())
+            .and_then(|state| state.same_law.get(chunk_id).cloned())
             .unwrap_or_default()
     }
 
     /// 自动推导 same_law 边：扫描 cited_by → has_risk，找到共享同一法条的 chunk。
     ///
     /// 在 `add_risk_with_edges()` 末尾调用。
-    fn derive_same_law_edges(&self, law_refs: &[String], chunk_id: &str) {
+    fn derive_same_law_edges_in_state(
+        state: &mut GraphState,
+        law_refs: &[String],
+        chunk_id: &str,
+    ) -> Vec<String> {
         if law_refs.is_empty() {
-            return;
+            return Vec::new();
         }
 
         // 收集引用相同法条的其他 risk_id
         let mut related_risk_ids: Vec<String> = Vec::new();
-        if let Ok(cited_by) = self.cited_by.read() {
-            for law_ref in law_refs {
-                if let Some(risk_ids) = cited_by.get(law_ref) {
-                    for rid in risk_ids {
-                        if !related_risk_ids.contains(rid) {
-                            related_risk_ids.push(rid.clone());
-                        }
+        for law_ref in law_refs {
+            if let Some(risk_ids) = state.cited_by.get(law_ref) {
+                for rid in risk_ids {
+                    if !related_risk_ids.contains(rid) {
+                        related_risk_ids.push(rid.clone());
                     }
                 }
             }
         }
 
         if related_risk_ids.is_empty() {
-            return;
+            return Vec::new();
         }
 
-        // 通过 has_risk 反查 chunk_id → 写入 same_law 边
-        if let (Ok(_has_risk), Ok(risks_map)) = (self.has_risk.read(), self.risks.read()) {
-            for rid in &related_risk_ids {
-                if let Some(rn) = risks_map.get(rid) {
-                    for other_cid in &rn.finding.clause_ids {
-                        if other_cid == chunk_id {
-                            continue;
-                        }
-                        // 双向写入
-                        if let Ok(mut same_law_edges) = self.same_law.write() {
-                            let entry = same_law_edges.entry(chunk_id.to_string()).or_default();
-                            if !entry.contains(other_cid) {
-                                entry.push(other_cid.clone());
-                            }
-                            let reverse = same_law_edges.entry(other_cid.clone()).or_default();
-                            if !reverse.contains(&chunk_id.to_string()) {
-                                reverse.push(chunk_id.to_string());
-                            }
-                        }
-                    }
-                }
+        let related_chunks = related_risk_ids
+            .iter()
+            .filter_map(|risk_id| state.risks.get(risk_id))
+            .flat_map(|risk| risk.finding.clause_ids.iter().cloned())
+            .filter(|other_chunk_id| other_chunk_id != chunk_id)
+            .collect::<HashSet<_>>();
+        let mut affected = Vec::new();
+        for other_chunk_id in related_chunks {
+            let forward = push_unique(
+                state.same_law.entry(chunk_id.to_string()).or_default(),
+                other_chunk_id.clone(),
+            );
+            let reverse = push_unique(
+                state.same_law.entry(other_chunk_id.clone()).or_default(),
+                chunk_id.to_string(),
+            );
+            if forward || reverse {
+                affected.push(chunk_id.to_string());
+                affected.push(other_chunk_id);
             }
+        }
+        affected
+    }
+
+    fn add_law_edges_in_state(state: &mut GraphState, risk_id: &str, law_refs: &[String]) {
+        for law_ref in law_refs {
+            push_unique(
+                state.cites.entry(risk_id.to_string()).or_default(),
+                law_ref.clone(),
+            );
+            push_unique(
+                state.cited_by.entry(law_ref.clone()).or_default(),
+                risk_id.to_string(),
+            );
+            state
+                .laws
+                .entry(law_ref.clone())
+                .or_insert_with(|| LawNode {
+                    law_id: law_ref.clone(),
+                    article_no: law_ref.clone(),
+                    title: String::new(),
+                });
         }
     }
 
     /// 添加 cites 边 + cited_by 反向索引（单条法条引用）。
     pub fn add_cites(&self, risk_id: &str, law_ref: &str) {
-        // cites: risk_id → [law_ref]
-        if let Ok(mut cites) = self.cites.write() {
-            cites
-                .entry(risk_id.to_string())
-                .or_default()
-                .push(law_ref.to_string());
-        }
-        // cited_by 反向索引: law_ref → [risk_id]
-        if let Ok(mut cited_by) = self.cited_by.write() {
-            cited_by
-                .entry(law_ref.to_string())
-                .or_default()
-                .push(risk_id.to_string());
+        if let Ok(mut state) = self.state.write() {
+            let cites_changed = push_unique(
+                state.cites.entry(risk_id.to_string()).or_default(),
+                law_ref.to_string(),
+            );
+            let cited_by_changed = push_unique(
+                state.cited_by.entry(law_ref.to_string()).or_default(),
+                risk_id.to_string(),
+            );
+            if cites_changed || cited_by_changed {
+                let affected = state
+                    .risks
+                    .get(risk_id)
+                    .map(|risk| risk.finding.clause_ids.clone())
+                    .unwrap_or_default();
+                bump_versions(&mut state, affected);
+            }
         }
     }
 
     /// 原子写入 Risk 节点 + has_risk 边 + cites 边。
-    ///
-    /// 在一次写锁内完成 Risk + has_risk + cites，减少（但不消除）中间态窗口。
-    /// 这是 Agent 审查完成后的主要写入入口。
-    pub fn add_risk_with_edges(&self, risk: RiskNode, chunk_id: &str) {
+    pub fn add_risk_with_edges(&self, mut risk: RiskNode, chunk_id: &str) {
         let risk_id = risk.finding.risk_id.clone();
         let law_refs = risk.finding.legal_basis.clone();
-
-        // 1. 写入 Risk 节点
-        {
-            if let Ok(mut risks) = self.risks.write() {
-                risks.insert(risk_id.clone(), risk);
-            }
+        risk.law_refs = law_refs.clone();
+        if let Ok(mut state) = self.state.write() {
+            state.risks.insert(risk_id.clone(), risk);
+            push_unique(
+                state.has_risk.entry(chunk_id.to_string()).or_default(),
+                risk_id.clone(),
+            );
+            Self::add_law_edges_in_state(&mut state, &risk_id, &law_refs);
+            let mut affected = vec![chunk_id.to_string()];
+            affected.extend(Self::derive_same_law_edges_in_state(
+                &mut state, &law_refs, chunk_id,
+            ));
+            bump_versions(&mut state, affected);
         }
-
-        // 2. 写入 has_risk 边
-        {
-            if let Ok(mut edges) = self.has_risk.write() {
-                edges
-                    .entry(chunk_id.to_string())
-                    .or_default()
-                    .push(risk_id.clone());
-            }
-        }
-
-        // 3. 写入 cites + cited_by 边
-        {
-            if let Ok(mut cites) = self.cites.write() {
-                for law_ref in &law_refs {
-                    cites
-                        .entry(risk_id.clone())
-                        .or_default()
-                        .push(law_ref.clone());
-                }
-            }
-            if let Ok(mut cited_by) = self.cited_by.write() {
-                for law_ref in &law_refs {
-                    cited_by
-                        .entry(law_ref.clone())
-                        .or_default()
-                        .push(risk_id.clone());
-                }
-            }
-        }
-
-        // 4. 存储 Law 节点（如果还不存在）
-        {
-            if let Ok(mut laws) = self.laws.write() {
-                for law_ref in &law_refs {
-                    // 用 law_ref 作为 law_id
-                    if !laws.contains_key(law_ref) {
-                        laws.insert(
-                            law_ref.clone(),
-                            LawNode {
-                                law_id: law_ref.clone(),
-                                article_no: law_ref.clone(),
-                                title: String::new(),
-                            },
-                        );
-                    }
-                }
-            }
-        }
-
-        // 5. 自动推导 same_law 边
-        self.derive_same_law_edges(&law_refs, chunk_id);
     }
 
-    /// 写入 Hypothesis（轻量版 add_risk_with_edges）。
-    ///
-    /// 与 add_risk_with_edges 的区别:
-    /// - 不创建 Law 节点（Hypothesis 的法规名未验证，可能是幻觉）
-    /// - 不触发 same_law 推导（避免未验证信息污染图拓扑）
-    /// - 只写入 Risk 节点 + has_risk 边 + cites 边（单向）
-    pub fn add_hypothesis(&self, risk: RiskNode, chunk_id: &str) {
+    /// 写入 Hypothesis（不创建 Law 节点和 same_law 边）。
+    pub fn add_hypothesis(&self, mut risk: RiskNode, chunk_id: &str) {
         let risk_id = risk.finding.risk_id.clone();
         let law_refs = risk.finding.legal_basis.clone();
-
-        // 1. Risk 节点
-        if let Ok(mut risks) = self.risks.write() {
-            risks.insert(risk_id.clone(), risk);
-        }
-
-        // 2. has_risk 边
-        if let Ok(mut edges) = self.has_risk.write() {
-            edges
-                .entry(chunk_id.to_string())
-                .or_default()
-                .push(risk_id.clone());
-        }
-
-        // 3. cites 边（仅单向，不建 cited_by 反向索引，不触发 same_law）
-        if let Ok(mut cites) = self.cites.write() {
-            cites.entry(risk_id).or_default().extend(law_refs);
+        risk.law_refs = law_refs.clone();
+        if let Ok(mut state) = self.state.write() {
+            state.risks.insert(risk_id.clone(), risk);
+            push_unique(
+                state.has_risk.entry(chunk_id.to_string()).or_default(),
+                risk_id.clone(),
+            );
+            for law_ref in law_refs {
+                push_unique(state.cites.entry(risk_id.clone()).or_default(), law_ref);
+            }
+            bump_versions(&mut state, [chunk_id.to_string()]);
         }
     }
 
     /// 查询所有 Hypothesis（BlindSpot 用）。
     pub fn get_hypotheses(&self) -> Vec<RiskFinding> {
-        self.risks
+        self.state
             .read()
             .ok()
-            .map(|m| {
-                m.values()
-                    .filter(|r| r.finding.finding_role == FindingRole::Hypothesis)
-                    .map(|r| r.finding.clone())
+            .map(|state| {
+                state
+                    .risks
+                    .values()
+                    .filter(|risk| risk.finding.finding_role == FindingRole::Hypothesis)
+                    .map(|risk| risk.finding.clone())
                     .collect()
             })
             .unwrap_or_default()
@@ -541,89 +547,27 @@ impl SessionGraph {
 
     // ── 查询 (Agent 每轮 ReAct 调用) ──────────────────────────
 
-    /// 查询某个 Chunk 的完整上下文："谁审过这条？发现了什么风险？跟哪些条款有关联？"
-    pub fn query_clause_context(&self, chunk_id: &str) -> ClauseContext {
-        let reviewed_by = self
-            .reviewed_by
-            .read()
-            .ok()
-            .and_then(|edges| edges.get(chunk_id).cloned())
-            .unwrap_or_default();
-
-        // 通过 has_risk 边获取关联的 risk_id 列表，再查找 RiskNode
-        let risk_ids: Vec<String> = self
-            .has_risk
-            .read()
-            .ok()
-            .and_then(|edges| edges.get(chunk_id).cloned())
-            .unwrap_or_default();
-
-        let risks: Vec<RiskFinding> = if let Ok(risks_map) = self.risks.read() {
-            risk_ids
-                .iter()
-                .filter_map(|rid| risks_map.get(rid))
-                .map(|rn| rn.finding.clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let linked_chunks = self
-            .linked_to
-            .read()
-            .ok()
-            .and_then(|edges| edges.get(chunk_id).cloned())
-            .unwrap_or_default();
-
-        // 通过 cited_by 反向索引查找引用相同法条的其他 chunk
-        let same_law_chunks: Vec<String> = {
-            let mut result = Vec::new();
-            if let (Ok(cited_by), Ok(_has_risk), Ok(risks_map)) = (
-                self.cited_by.read(),
-                self.has_risk.read(),
-                self.risks.read(),
-            ) {
-                // 获取当前条款的所有风险的法条引用
-                let mut all_law_refs: Vec<String> = Vec::new();
-                for rid in &risk_ids {
-                    if let Some(rn) = risks_map.get(rid) {
-                        all_law_refs.extend(rn.law_refs.clone());
-                    }
-                }
-                // 对每条法条，查找引用它的其他风险
-                for law_ref in &all_law_refs {
-                    if let Some(citing_risk_ids) = cited_by.get(law_ref) {
-                        for citing_rid in citing_risk_ids {
-                            // 找到引用此法条的风险节点，再通过 has_risk 反查 chunk
-                            if let Some(citing_rn) = risks_map.get(citing_rid) {
-                                for cid in &citing_rn.finding.clause_ids {
-                                    if cid != chunk_id && !result.contains(cid) {
-                                        result.push(cid.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            result
-        };
-
-        let contradictions = self
+    fn build_clause_context(state: &GraphState, chunk_id: &str) -> ClauseContext {
+        let reviewed_by = state.reviewed_by.get(chunk_id).cloned().unwrap_or_default();
+        let risk_ids = state.has_risk.get(chunk_id).cloned().unwrap_or_default();
+        let risks = risk_ids
+            .iter()
+            .filter_map(|risk_id| state.risks.get(risk_id))
+            .map(|risk| risk.finding.clone())
+            .collect();
+        let linked_chunks = state.linked_to.get(chunk_id).cloned().unwrap_or_default();
+        let same_law_chunks = state.same_law.get(chunk_id).cloned().unwrap_or_default();
+        let contradictions = state
             .contradicts
-            .read()
-            .ok()
-            .and_then(|edges| edges.get(chunk_id).cloned())
-            .map(|pairs| {
-                pairs
-                    .into_iter()
-                    .map(|(other_id, reason)| LinkedChunk {
-                        chunk_id: other_id,
-                        reason,
-                    })
-                    .collect()
+            .get(chunk_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(other_id, reason)| LinkedChunk {
+                chunk_id: other_id,
+                reason,
             })
-            .unwrap_or_default();
+            .collect();
 
         ClauseContext {
             chunk_id: chunk_id.to_string(),
@@ -635,20 +579,33 @@ impl SessionGraph {
         }
     }
 
+    /// 查询某个 Chunk 的完整上下文："谁审过这条？发现了什么风险？跟哪些条款有关联？"
+    pub fn query_clause_context(&self, chunk_id: &str) -> ClauseContext {
+        self.state
+            .read()
+            .ok()
+            .map(|state| Self::build_clause_context(&state, chunk_id))
+            .unwrap_or_else(|| ClauseContext {
+                chunk_id: chunk_id.to_string(),
+                reviewed_by: Vec::new(),
+                risks: Vec::new(),
+                linked_chunks: Vec::new(),
+                same_law_chunks: Vec::new(),
+                contradictions: Vec::new(),
+            })
+    }
+
     /// 查询引用同一法条的所有 chunk_id（通过 cited_by 反向索引 O(1) 查询）。
     pub fn query_same_law_chunks(&self, law_ref: &str) -> Vec<String> {
         let mut result = Vec::new();
-        if let (Ok(cited_by), Ok(_has_risk), Ok(risks_map)) = (
-            self.cited_by.read(),
-            self.has_risk.read(),
-            self.risks.read(),
-        ) && let Some(risk_ids) = cited_by.get(law_ref)
+        if let Ok(state) = self.state.read()
+            && let Some(risk_ids) = state.cited_by.get(law_ref)
         {
-            for rid in risk_ids {
-                if let Some(rn) = risks_map.get(rid) {
-                    for cid in &rn.finding.clause_ids {
-                        if !result.contains(cid) {
-                            result.push(cid.clone());
+            for risk_id in risk_ids {
+                if let Some(risk) = state.risks.get(risk_id) {
+                    for chunk_id in &risk.finding.clause_ids {
+                        if !result.contains(chunk_id) {
+                            result.push(chunk_id.clone());
                         }
                     }
                 }
@@ -658,94 +615,46 @@ impl SessionGraph {
     }
 
     /// 获取完整图快照（BlindSpot / 审计用）。
-    ///
-    /// 在所有 Agent 完成后串行调用，此时图已静止。
     pub fn snapshot(&self) -> GraphSnapshot {
-        GraphSnapshot {
-            chunks: self
-                .chunks
-                .read()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default(),
-            risks: self
-                .risks
-                .read()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default(),
-            has_risk: self
-                .has_risk
-                .read()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default(),
-            reviewed_by: self
-                .reviewed_by
-                .read()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default(),
-            linked_to: self
-                .linked_to
-                .read()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default(),
-            cites: self
-                .cites
-                .read()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default(),
-            cited_by: self
-                .cited_by
-                .read()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default(),
-            agents: self
-                .agents
-                .read()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default(),
-            laws: self.laws.read().ok().map(|g| g.clone()).unwrap_or_default(),
-            cases: self
-                .cases
-                .read()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default(),
-            contradicts: self
-                .contradicts
-                .read()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default(),
-            same_law: self
-                .same_law
-                .read()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default(),
-            review_attempts: self
-                .review_attempts
-                .read()
-                .map_err(|_| "SessionGraph 审查尝试读锁已中毒")
-                .map(|attempts| attempts.clone())
-                .unwrap_or_default(),
-        }
+        self.state
+            .read()
+            .ok()
+            .map(|state| GraphSnapshot {
+                chunks: state.chunks.clone(),
+                risks: state.risks.clone(),
+                has_risk: state.has_risk.clone(),
+                reviewed_by: state.reviewed_by.clone(),
+                linked_to: state.linked_to.clone(),
+                cites: state.cites.clone(),
+                cited_by: state.cited_by.clone(),
+                agents: state.agents.clone(),
+                laws: state.laws.clone(),
+                cases: state.cases.clone(),
+                contradicts: state.contradicts.clone(),
+                same_law: state.same_law.clone(),
+                review_attempts: state.review_attempts.clone(),
+                graph_version: state.graph_version,
+                chunk_versions: state.chunk_versions.clone(),
+            })
+            .unwrap_or_default()
     }
 
     /// 获取图中的条款总数。
     pub fn chunk_count(&self) -> usize {
-        self.chunks.read().ok().map(|c| c.len()).unwrap_or(0)
+        self.state
+            .read()
+            .ok()
+            .map(|state| state.chunks.len())
+            .unwrap_or(0)
     }
 
     /// 获取图中的风险总数。
     pub fn risk_count(&self) -> usize {
-        self.risks.read().ok().map(|r| r.len()).unwrap_or(0)
+        self.state
+            .read()
+            .ok()
+            .map(|state| state.risks.len())
+            .unwrap_or(0)
     }
 }
 
@@ -805,6 +714,7 @@ mod tests {
                 context: None,
             },
             law_refs: vec!["《测试法》第1条".to_string()],
+            state: FindingState::Provisional,
         }
     }
 
@@ -1040,6 +950,18 @@ mod tests {
         assert_eq!(snap.risks.len(), 1);
         assert_eq!(snap.has_risk.len(), 1);
         assert_eq!(snap.reviewed_by.len(), 1);
+    }
+
+    #[test]
+    fn test_snapshot_reads_one_consistent_graph_state() {
+        let graph = SessionGraph::new();
+        graph.add_chunk(make_test_chunk("ch_001"));
+
+        let snapshot = graph.snapshot();
+
+        assert_eq!(snapshot.graph_version, 1);
+        assert_eq!(snapshot.chunk_versions.get("ch_001"), Some(&1));
+        assert!(snapshot.chunks.contains_key("ch_001"));
     }
 
     // ── 矛盾边 (contradicts) ──────────────────────────────────

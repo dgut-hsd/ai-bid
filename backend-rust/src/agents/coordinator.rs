@@ -856,6 +856,7 @@ impl Coordinator {
                                         RiskNode {
                                             finding: finding.clone(),
                                             law_refs: finding.legal_basis.clone(),
+                                            state: FindingState::Provisional,
                                         },
                                         &clause.chunk_id,
                                     );
@@ -1375,6 +1376,7 @@ impl Coordinator {
                             let risk_node = RiskNode {
                                 finding: finding.clone(),
                                 law_refs,
+                                state: FindingState::Provisional,
                             };
                             // 对每个关联的 clause 写入 has_risk 边
                             for cid in &finding.clause_ids {
@@ -1576,6 +1578,7 @@ impl Coordinator {
                             let risk_node = RiskNode {
                                 finding: finding.clone(),
                                 law_refs: finding.legal_basis.clone(),
+                                state: FindingState::Provisional,
                             };
                             for clause_id in &finding.clause_ids {
                                 self.graph.add_risk_with_edges(risk_node.clone(), clause_id);
@@ -2918,6 +2921,7 @@ impl Coordinator {
             let risk_node = RiskNode {
                 finding: finding.clone(),
                 law_refs,
+                state: FindingState::Provisional,
             };
             for cid in &finding.clause_ids {
                 graph_for_write.add_risk_with_edges(risk_node.clone(), cid);
