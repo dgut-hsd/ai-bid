@@ -186,8 +186,11 @@ impl SessionGraph {
         finding_ids: Vec<String>,
     ) -> Result<(), String> {
         match outcome {
-            ReviewAttemptOutcome::Findings if finding_ids.is_empty() => {
-                return Err("Findings 结果的 finding_ids 不得为空".to_string());
+            ReviewAttemptOutcome::Findings => {
+                return Err(
+                    "Findings 结果必须使用 commit_review_result 原子提交 finding 与审查状态"
+                        .to_string(),
+                );
             }
             ReviewAttemptOutcome::NoRisk if !finding_ids.is_empty() => {
                 return Err("NoRisk 结果的 finding_ids 必须为空".to_string());
@@ -1031,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn test_review_attempt_findings_requires_non_empty_finding_ids() {
+    fn complete_review_attempt_rejects_findings_without_ids() {
         let graph = SessionGraph::new();
         graph.add_chunk(make_test_chunk("ch_001"));
         let attempt_id = graph
@@ -1040,9 +1043,9 @@ mod tests {
 
         let error = graph
             .complete_review_attempt(&attempt_id, ReviewAttemptOutcome::Findings, Vec::new())
-            .expect_err("Findings 结果必须关联至少一个 finding_id");
+            .expect_err("Findings 必须通过原子提交接口完成");
 
-        assert!(error.contains("finding_ids"));
+        assert!(error.contains("commit_review_result"));
         let snapshot = graph.snapshot();
         assert_eq!(
             snapshot.review_attempts[&attempt_id].status,
@@ -1077,45 +1080,28 @@ mod tests {
     }
 
     #[test]
-    fn test_review_attempt_completed_findings_records_ids_once() {
+    fn complete_review_attempt_rejects_findings_and_keeps_attempt_started() {
         let graph = SessionGraph::new();
         graph.add_chunk(make_test_chunk("ch_001"));
         let attempt_id = graph
             .start_review_attempt(AgentId::FactCheck, "ch_001")
             .expect("应创建审查尝试");
 
-        graph
+        let error = graph
             .complete_review_attempt(
                 &attempt_id,
                 ReviewAttemptOutcome::Findings,
                 vec!["R_001".to_string()],
             )
-            .expect("Findings 应正常完成");
-        assert!(
-            graph
-                .complete_review_attempt(
-                    &attempt_id,
-                    ReviewAttemptOutcome::Findings,
-                    vec!["R_002".to_string()],
-                )
-                .is_err()
-        );
-        assert!(
-            graph
-                .fail_review_attempt(
-                    &attempt_id,
-                    ReviewAttemptErrorCode::TaskCancelled,
-                    "重复失败",
-                )
-                .is_err()
-        );
+            .expect_err("Findings 必须通过原子提交接口完成");
 
         let snapshot = graph.snapshot();
         let attempt = &snapshot.review_attempts[&attempt_id];
-        assert_eq!(attempt.status, ReviewAttemptStatus::Completed);
-        assert_eq!(attempt.outcome, Some(ReviewAttemptOutcome::Findings));
-        assert_eq!(attempt.finding_ids, vec!["R_001"]);
-        assert_eq!(snapshot.reviewed_by["ch_001"], vec![AgentId::FactCheck]);
+        assert!(error.contains("commit_review_result"));
+        assert_eq!(attempt.status, ReviewAttemptStatus::Started);
+        assert!(attempt.outcome.is_none());
+        assert!(attempt.finding_ids.is_empty());
+        assert!(!snapshot.reviewed_by.contains_key("ch_001"));
     }
 
     #[test]

@@ -858,6 +858,14 @@ impl Coordinator {
                                 graph.commit_review_result(&attempt_id, outcome, &findings)
                             {
                                 eprintln!("  [SCOUT] 完成审查尝试失败: {}", error);
+                                if let Err(fail_error) = graph.fail_review_attempt(
+                                    &attempt_id,
+                                    ReviewAttemptErrorCode::IncompleteOutput,
+                                    &format!("SessionGraph 提交失败: {}", error),
+                                ) {
+                                    eprintln!("  [SCOUT] 记录提交失败也失败: {}", fail_error);
+                                }
+                                findings.clear();
                             }
                         }
                         Err(error_code) => {
@@ -2731,7 +2739,7 @@ impl Coordinator {
         if blind_spot_def.is_none() {
             eprintln!("  [BLINDSPOT] BlindSpotAgent 未注册，回退到 fallback");
             return if self.config.blind_spot_fallback_enabled {
-                self.blind_spot_fallback(Some(&snapshot)).await
+                self.blind_spot_fallback(Some(&snapshot), None).await
             } else {
                 Vec::new()
             };
@@ -2768,50 +2776,10 @@ impl Coordinator {
 
         let total_findings = findings.len();
         let no_risk_count = findings.iter().filter(|f| f.no_risk).count();
-        let real_findings: Vec<RiskFinding> = findings.into_iter().filter(|f| !f.no_risk).collect();
-
-        if real_findings.is_empty() {
-            let completed_no_risk = {
-                let latest_snapshot = self.graph.snapshot();
-                candidate_clauses.iter().all(|clause| {
-                    latest_snapshot.review_attempts.values().any(|attempt| {
-                        attempt.agent_id == AgentId::BlindSpot
-                            && attempt.chunk_id == clause.chunk_id
-                            && attempt.status == ReviewAttemptStatus::Completed
-                            && attempt.outcome == Some(ReviewAttemptOutcome::NoRisk)
-                    })
-                })
-            };
-            if completed_no_risk {
-                eprintln!(
-                    "  [BLINDSPOT] ReAct 已成功覆盖全部 {} 条候选条款，未发现新增风险",
-                    candidate_clauses.len()
-                );
-                return Vec::new();
-            }
-            if no_risk_count > 0 {
-                eprintln!(
-                    "  [BLINDSPOT] ReAct 产出 {} 条 no_risk 结论，无新增风险发现，回退到 fallback",
-                    no_risk_count
-                );
-            } else {
-                eprintln!(
-                    "  [BLINDSPOT] ReAct 无任何产出 (0 条 finding，共 {} 候选条款)，回退到 fallback",
-                    total_findings
-                );
-            }
-            return if self.config.blind_spot_fallback_enabled {
-                self.blind_spot_fallback(Some(&snapshot)).await
-            } else {
-                Vec::new()
-            };
-        }
-
-        eprintln!(
-            "  [BLINDSPOT] ReAct 完成，发现 {} 条新风险 (另有 {} 条 no_risk 结论)",
-            real_findings.len(),
-            no_risk_count
-        );
+        let mut real_findings: Vec<RiskFinding> = findings
+            .into_iter()
+            .filter(|finding| !finding.no_risk && !finding.truncated)
+            .collect();
 
         // 内部去重：同一 Agent 对同一条款的同一 risk_type 只保留 confidence 最高的
         let before_dedup = real_findings.len();
@@ -2826,7 +2794,7 @@ impl Coordinator {
                 seen.insert(key, f);
             }
         }
-        let mut real_findings: Vec<RiskFinding> = seen.into_values().collect();
+        real_findings = seen.into_values().collect();
         if real_findings.len() < before_dedup {
             eprintln!(
                 "  [BLINDSPOT] 内部去重: {} → {} 条 (移除 {} 条重复)",
@@ -2879,10 +2847,55 @@ impl Coordinator {
             }
         }
 
-        // 静态兜底没有 ReviewAttempt，通过幂等接口写入 provisional 发现。
-        if let Err(error) = self.graph.upsert_provisional_findings(&real_findings) {
-            eprintln!("  [BLINDSPOT] 写入 SessionGraph 失败: {}", error);
+        // 以每个候选条款最新一次 BlindSpot 尝试为准，仅兜底失败或未收口条款。
+        let latest_snapshot = self.graph.snapshot();
+        let fallback_chunk_ids: Vec<String> = candidate_clauses
+            .iter()
+            .filter(|clause| {
+                latest_snapshot
+                    .review_attempts
+                    .values()
+                    .filter(|attempt| {
+                        attempt.agent_id == AgentId::BlindSpot
+                            && attempt.chunk_id == clause.chunk_id
+                    })
+                    .max_by(|left, right| left.started_at.cmp(&right.started_at))
+                    .map(|attempt| attempt.status != ReviewAttemptStatus::Completed)
+                    .unwrap_or(true)
+            })
+            .map(|clause| clause.chunk_id.clone())
+            .collect();
+
+        let fallback_findings =
+            if self.config.blind_spot_fallback_enabled && !fallback_chunk_ids.is_empty() {
+                self.blind_spot_fallback(Some(&snapshot), Some(&fallback_chunk_ids))
+                    .await
+            } else {
+                Vec::new()
+            };
+        if real_findings.is_empty() && fallback_findings.is_empty() {
+            if no_risk_count > 0 {
+                eprintln!(
+                    "  [BLINDSPOT] ReAct 已成功收口 {} 条 no_risk 结论，无新增风险",
+                    no_risk_count
+                );
+            } else {
+                eprintln!(
+                    "  [BLINDSPOT] ReAct 无有效 finding（共 {} 条输出），且无待兜底条款",
+                    total_findings
+                );
+            }
+            return Vec::new();
         }
+
+        eprintln!(
+            "  [BLINDSPOT] ReAct 完成，发现 {} 条新风险，静态兜底 {} 条 (另有 {} 条 no_risk 结论)",
+            real_findings.len(),
+            fallback_findings.len(),
+            no_risk_count
+        );
+        real_findings.extend(fallback_findings);
+
         let bus_for_write = self.bus.clone();
         for finding in &real_findings {
             if finding.severity == RiskSeverity::High {
@@ -2902,33 +2915,47 @@ impl Coordinator {
     /// BlindSpot 静态 fallback：确定性逻辑扫描盲点（不调用 LLM）。
     ///
     /// 当 BlindSpotAgent ReAct 失败或无产出时回退到此方法。
-    /// `snapshot` 为 pre-ReAct 快照（由调用方传入），避免 ReAct 已将本 Agent
-    /// 写入 `reviewed_by` 后导致 fallback 无法识别未充分审查的条款。
-    async fn blind_spot_fallback(&self, snapshot: Option<&GraphSnapshot>) -> Vec<RiskFinding> {
+    /// `snapshot` 为 pre-ReAct 快照（由调用方传入）；`explicit_chunk_ids` 存在时
+    /// 只扫描调用方依据最新 ReviewAttempt 判定的失败或未收口条款。
+    async fn blind_spot_fallback(
+        &self,
+        snapshot: Option<&GraphSnapshot>,
+        explicit_chunk_ids: Option<&[String]>,
+    ) -> Vec<RiskFinding> {
         let snapshot: GraphSnapshot = match snapshot {
             Some(s) => s.clone(),
             None => self.graph.snapshot(),
         };
 
         // 找出审查覆盖盲点
-        let unreviewed_chunks: Vec<&String> = snapshot
-            .chunks
-            .keys()
-            .filter(|cid| {
-                !snapshot.reviewed_by.contains_key(*cid)
-                    || snapshot
-                        .reviewed_by
-                        .get(*cid)
-                        .map(|v| v.is_empty())
-                        .unwrap_or(true)
-            })
-            .collect();
+        let unreviewed_chunks: Vec<&String> = match explicit_chunk_ids {
+            Some(chunk_ids) => chunk_ids
+                .iter()
+                .filter(|chunk_id| snapshot.chunks.contains_key(*chunk_id))
+                .collect(),
+            None => snapshot
+                .chunks
+                .keys()
+                .filter(|cid| {
+                    !snapshot.reviewed_by.contains_key(*cid)
+                        || snapshot
+                            .reviewed_by
+                            .get(*cid)
+                            .map(|v| v.is_empty())
+                            .unwrap_or(true)
+                })
+                .collect(),
+        };
 
-        let no_risk_chunks: Vec<&String> = snapshot
-            .chunks
-            .keys()
-            .filter(|cid| !snapshot.has_risk.contains_key(*cid))
-            .collect();
+        let no_risk_chunks: Vec<&String> = if explicit_chunk_ids.is_some() {
+            Vec::new()
+        } else {
+            snapshot
+                .chunks
+                .keys()
+                .filter(|cid| !snapshot.has_risk.contains_key(*cid))
+                .collect()
+        };
 
         eprintln!(
             "  [BLINDSPOT] 未审查: {} 条, 无关联风险: {} 条",
@@ -3059,6 +3086,10 @@ impl Coordinator {
             "  [BLINDSPOT] 发现 {} 条盲点/潜在遗漏",
             blind_findings.len()
         );
+        if let Err(error) = self.graph.upsert_provisional_findings(&blind_findings) {
+            eprintln!("  [BLINDSPOT] 静态兜底写入 SessionGraph 失败: {}", error);
+            return Vec::new();
+        }
         blind_findings
     }
 
@@ -3385,6 +3416,10 @@ mod tests {
 
     struct SlowLlm;
 
+    struct ConditionalBlindSpotLlm {
+        successful_clause_has_finding: bool,
+    }
+
     struct CountingLegalVerifyLlm {
         calls: Arc<AtomicUsize>,
     }
@@ -3489,6 +3524,43 @@ mod tests {
         ) -> Result<LlmResponse> {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             unreachable!("测试应在 LLM 返回前取消任务")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for ConditionalBlindSpotLlm {
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _tool_choice: &ToolChoice,
+        ) -> Result<LlmResponse> {
+            let is_failed = messages.iter().any(|message| match message {
+                ChatMessage::User { content } => content.contains("模拟失败"),
+                _ => false,
+            });
+            if is_failed {
+                return Err(anyhow::anyhow!("模拟 BlindSpot 条款失败"));
+            }
+            let findings = if self.successful_clause_has_finding {
+                vec![make_test_finding("ignored", "ignored", "BlindSpotAgent")]
+            } else {
+                Vec::new()
+            };
+            Ok(LlmResponse {
+                content: None,
+                thought: None,
+                tool_calls: vec![ToolCall {
+                    id: "test-output".to_string(),
+                    name: "output_finding".to_string(),
+                    arguments: serde_json::json!({
+                        "findings": findings,
+                        "has_more": false,
+                        "coverage": [],
+                    }),
+                }],
+                usage: None,
+            })
         }
     }
 
@@ -3842,6 +3914,106 @@ mod tests {
             .expect("BlindSpot 应保留审查尝试");
         assert_eq!(attempt.status, ReviewAttemptStatus::Completed);
         assert_eq!(attempt.outcome, Some(ReviewAttemptOutcome::NoRisk));
+    }
+
+    #[tokio::test]
+    async fn blind_spot_fallback_only_marks_failed_clause_after_mixed_no_risk_result() {
+        let mut config = CoordinatorConfig::default();
+        config.blind_spot_fallback_enabled = true;
+        let coordinator = make_runtime_coordinator(
+            config,
+            Arc::new(|| {
+                Box::new(ConditionalBlindSpotLlm {
+                    successful_clause_has_finding: false,
+                })
+            }),
+        );
+        let clauses = vec![
+            make_test_clause("ch_no_risk", "投标人必须提交完整的履约方案"),
+            make_test_clause("ch_failed", "投标人必须提交完整方案，模拟失败"),
+        ];
+        coordinator.preload_chunks(&clauses);
+        coordinator.preload_agents();
+        let execution_control = coordinator.global_execution_limiter.start_review(2, 1);
+
+        let findings = coordinator.blind_spot_scan(execution_control).await;
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].clause_ids, vec!["ch_failed"]);
+        assert!(!findings[0].no_risk);
+        let snapshot = coordinator.graph.snapshot();
+        assert!(snapshot.has_risk.contains_key("ch_failed"));
+        assert!(!snapshot.has_risk.contains_key("ch_no_risk"));
+    }
+
+    #[tokio::test]
+    async fn blind_spot_fallback_keeps_react_finding_and_marks_failed_clause() {
+        let mut config = CoordinatorConfig::default();
+        config.blind_spot_fallback_enabled = true;
+        let coordinator = make_runtime_coordinator(
+            config,
+            Arc::new(|| {
+                Box::new(ConditionalBlindSpotLlm {
+                    successful_clause_has_finding: true,
+                })
+            }),
+        );
+        let clauses = vec![
+            make_test_clause("ch_finding", "投标人必须提交完整的履约方案"),
+            make_test_clause("ch_failed", "投标人必须提交完整方案，模拟失败"),
+        ];
+        coordinator.preload_chunks(&clauses);
+        coordinator.preload_agents();
+        let execution_control = coordinator.global_execution_limiter.start_review(2, 1);
+
+        let findings = coordinator.blind_spot_scan(execution_control).await;
+
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().any(|finding| {
+            finding.clause_ids == ["ch_finding"] && finding.risk_type != "审查盲点"
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.clause_ids == ["ch_failed"] && finding.risk_type == "审查盲点"
+        }));
+        let snapshot = coordinator.graph.snapshot();
+        assert_eq!(snapshot.risks.len(), 2);
+        assert_eq!(snapshot.has_risk["ch_finding"].len(), 1);
+        assert_eq!(snapshot.has_risk["ch_failed"].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scout_returns_no_finding_when_graph_commit_fails() {
+        let config = CoordinatorConfig::default();
+        let coordinator = make_runtime_coordinator(
+            config,
+            Arc::new(|| {
+                Box::new(ConditionalBlindSpotLlm {
+                    successful_clause_has_finding: true,
+                })
+            }),
+        );
+        coordinator.graph.add_risk_with_edges(
+            RiskNode {
+                finding: make_test_finding("R_001", "existing_chunk", "ExistingAgent"),
+                law_refs: Vec::new(),
+                state: FindingState::Provisional,
+            },
+            "existing_chunk",
+        );
+        let clause = make_test_clause("ch_scout_commit_failed", "投标人必须提交完整方案");
+        coordinator.preload_chunks(std::slice::from_ref(&clause));
+        coordinator.preload_agents();
+
+        coordinator.scout_phase(std::slice::from_ref(&clause)).await;
+
+        let snapshot = coordinator.graph.snapshot();
+        assert!(!snapshot.has_risk.contains_key("ch_scout_commit_failed"));
+        let attempt = snapshot
+            .review_attempts
+            .values()
+            .find(|attempt| attempt.chunk_id == "ch_scout_commit_failed")
+            .expect("应保留失败尝试");
+        assert_eq!(attempt.status, ReviewAttemptStatus::Failed);
     }
 
     #[tokio::test]

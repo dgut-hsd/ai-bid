@@ -614,7 +614,8 @@ impl ReActLoop {
                     }
                 }
             });
-            let clause_findings = self.review_single(clause, &risk_id).await;
+            let mut clause_findings = self.review_single(clause, &risk_id).await;
+            let mut review_succeeded = true;
             if let (Some(graph), Some(attempt_id)) = (&self.graph, attempt_id.as_deref()) {
                 let transition_result = match classify_review_attempt(&clause_findings) {
                     Ok((outcome, _)) => graph
@@ -626,12 +627,21 @@ impl ReActLoop {
                 };
                 if let Err(error) = transition_result {
                     eprintln!("  [SessionGraph] 收口审查尝试失败: {}", error);
+                    review_succeeded = false;
+                    if let Err(fail_error) = graph.fail_review_attempt(
+                        attempt_id,
+                        ReviewAttemptErrorCode::IncompleteOutput,
+                        &format!("SessionGraph 收口失败: {}", error),
+                    ) {
+                        eprintln!("  [SessionGraph] 记录收口失败也失败: {}", fail_error);
+                    }
+                    clause_findings.clear();
                 }
             }
             findings.extend(clause_findings);
 
             // 每审完一条条款后，发送 AgentProgress（SSE 实时推送）
-            if let Some(ref events) = self.review_events {
+            if review_succeeded && let Some(ref events) = self.review_events {
                 let raw_findings = findings.iter().filter(|f| !f.no_risk).count();
                 events.emit(&ReviewEvent::AgentProgress {
                     agent_id: self.config.name.clone(),
@@ -3302,6 +3312,82 @@ mod multi_finding_tests {
         assert_eq!(
             snapshot.reviewed_by["ch_sequential"],
             vec![AgentId::FactCheck]
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_review_drops_finding_when_graph_commit_fails() {
+        let graph = Arc::new(SessionGraph::new());
+        graph.add_chunk(ChunkNode {
+            chunk_id: "ch_commit_failed".to_string(),
+            section_path: vec!["测试".to_string()],
+            page_start: 0,
+            page_end: 0,
+            text_preview: "风险条款".to_string(),
+            tier: RiskTier::Medium,
+        });
+        graph.add_risk_with_edges(
+            RiskNode {
+                finding: RiskFinding::truncated_finding(
+                    "R_001".to_string(),
+                    "existing_chunk".to_string(),
+                    "ExistingAgent",
+                    RiskTier::Medium,
+                    RiskTier::Medium,
+                    "已有风险",
+                ),
+                law_refs: Vec::new(),
+                state: FindingState::Provisional,
+            },
+            "existing_chunk",
+        );
+        let events = Arc::new(ReviewEventBus::new(8));
+        let mut receiver = events.subscribe();
+        let agent = ReActLoop::new(
+            AgentConfig {
+                name: "FactCheckAgent".to_string(),
+                system_prompt: "测试".to_string(),
+                default_max_turns: 1,
+                tool_names: vec!["output_finding".to_string()],
+            },
+            Box::new(GatedFindingLlm {
+                slow_started: Arc::new(Notify::new()),
+                released: Arc::new(AtomicBool::new(true)),
+                release_notify: Arc::new(Notify::new()),
+            }),
+            crate::agents::tools::ToolRegistry::new(),
+        )
+        .with_graph(graph.clone())
+        .with_review_events(events);
+        let clause = ReviewClause {
+            chunk_id: "ch_commit_failed".to_string(),
+            section_path: vec!["测试".to_string()],
+            text: "风险条款".to_string(),
+            page_start: 0,
+            page_end: 0,
+            tier: RiskTier::Medium,
+            tier_max_turns: 1,
+        };
+
+        let findings = agent.review(&[clause]).await;
+
+        assert!(
+            findings.is_empty(),
+            "提交失败的 finding 不得作为成功结果返回"
+        );
+        let snapshot = graph.snapshot();
+        let attempt = snapshot
+            .review_attempts
+            .values()
+            .find(|attempt| attempt.chunk_id == "ch_commit_failed")
+            .expect("应保留失败尝试");
+        assert_eq!(attempt.status, ReviewAttemptStatus::Failed);
+        let emitted_events: Vec<String> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(
+            emitted_events
+                .iter()
+                .all(|event| !event.contains("\"event\":\"agent_progress\"")),
+            "提交失败不得发布成功进度"
         );
     }
 
