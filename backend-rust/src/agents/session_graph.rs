@@ -65,6 +65,49 @@ fn push_unique<T: PartialEq>(items: &mut Vec<T>, value: T) -> bool {
     }
 }
 
+/// 一次原子图提交产生的版本信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphCommit {
+    pub graph_version: u64,
+    pub chunk_versions: HashMap<String, u64>,
+}
+
+fn deduplicate_strings(values: &[String]) -> Vec<String> {
+    let mut unique = Vec::new();
+    for value in values {
+        push_unique(&mut unique, value.clone());
+    }
+    unique
+}
+
+fn normalize_provisional_findings(findings: &[RiskFinding]) -> Result<Vec<RiskNode>, String> {
+    let mut nodes = Vec::new();
+    let mut risk_ids = HashSet::new();
+    for finding in findings.iter().filter(|finding| !finding.no_risk) {
+        if finding.risk_id.trim().is_empty() {
+            return Err("provisional finding 的 risk_id 不得为空".to_string());
+        }
+        if finding.clause_ids.is_empty() {
+            return Err(format!(
+                "provisional finding {} 的 clause_ids 不得为空",
+                finding.risk_id
+            ));
+        }
+        if !risk_ids.insert(finding.risk_id.clone()) {
+            return Err(format!("同次提交包含重复 risk_id: {}", finding.risk_id));
+        }
+        let mut normalized = finding.clone();
+        normalized.clause_ids = deduplicate_strings(&finding.clause_ids);
+        normalized.legal_basis = deduplicate_strings(&finding.legal_basis);
+        nodes.push(RiskNode {
+            law_refs: normalized.legal_basis.clone(),
+            finding: normalized,
+            state: FindingState::Provisional,
+        });
+    }
+    Ok(nodes)
+}
+
 /// 中期记忆：Session Knowledge Graph。
 ///
 /// 线程安全的内存图，Agent 在审查过程中读写。
@@ -175,6 +218,195 @@ impl SessionGraph {
         );
         bump_versions(&mut state, [chunk_id]);
         Ok(())
+    }
+
+    fn validate_risk_conflicts(state: &GraphState, nodes: &[RiskNode]) -> Result<(), String> {
+        for node in nodes {
+            let risk_id = &node.finding.risk_id;
+            if let Some(existing) = state.risks.get(risk_id) {
+                let existing_json = serde_json::to_value(existing)
+                    .map_err(|error| format!("序列化已有风险 {} 失败: {}", risk_id, error))?;
+                let proposed_json = serde_json::to_value(node)
+                    .map_err(|error| format!("序列化待写风险 {} 失败: {}", risk_id, error))?;
+                if existing_json != proposed_json {
+                    return Err(format!("risk_id {} 已存在且内容不同", risk_id));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn upsert_provisional_node_in_state(
+        state: &mut GraphState,
+        node: &RiskNode,
+    ) -> (Vec<String>, bool) {
+        let risk_id = node.finding.risk_id.clone();
+        let mut affected = Vec::new();
+        let mut changed = false;
+        if !state.risks.contains_key(&risk_id) {
+            state.risks.insert(risk_id.clone(), node.clone());
+            changed = true;
+        }
+        for chunk_id in &node.finding.clause_ids {
+            if push_unique(
+                state.has_risk.entry(chunk_id.clone()).or_default(),
+                risk_id.clone(),
+            ) {
+                changed = true;
+                affected.push(chunk_id.clone());
+            }
+        }
+        for law_ref in &node.law_refs {
+            if push_unique(
+                state.cites.entry(risk_id.clone()).or_default(),
+                law_ref.clone(),
+            ) {
+                changed = true;
+            }
+            if push_unique(
+                state.cited_by.entry(law_ref.clone()).or_default(),
+                risk_id.clone(),
+            ) {
+                changed = true;
+            }
+            if !state.laws.contains_key(law_ref) {
+                state.laws.insert(
+                    law_ref.clone(),
+                    LawNode {
+                        law_id: law_ref.clone(),
+                        article_no: law_ref.clone(),
+                        title: String::new(),
+                    },
+                );
+                changed = true;
+            }
+        }
+        for chunk_id in &node.finding.clause_ids {
+            let same_law_affected =
+                Self::derive_same_law_edges_in_state(state, &node.law_refs, chunk_id);
+            if !same_law_affected.is_empty() {
+                changed = true;
+                affected.extend(same_law_affected);
+            }
+        }
+        if changed {
+            affected.extend(node.finding.clause_ids.clone());
+        }
+        (deduplicate_strings(&affected), changed)
+    }
+
+    fn build_graph_commit(
+        state: &GraphState,
+        graph_version: u64,
+        affected: &[String],
+    ) -> GraphCommit {
+        let chunk_versions = deduplicate_strings(affected)
+            .into_iter()
+            .filter_map(|chunk_id| {
+                state
+                    .chunk_versions
+                    .get(&chunk_id)
+                    .copied()
+                    .map(|version| (chunk_id, version))
+            })
+            .collect();
+        GraphCommit {
+            graph_version,
+            chunk_versions,
+        }
+    }
+
+    /// 原子提交单条款审查成功结果。
+    pub fn commit_review_result(
+        &self,
+        attempt_id: &str,
+        outcome: ReviewAttemptOutcome,
+        findings: &[RiskFinding],
+    ) -> Result<GraphCommit, String> {
+        let nodes = normalize_provisional_findings(findings)?;
+        match outcome {
+            ReviewAttemptOutcome::Findings if nodes.is_empty() => {
+                return Err("Findings 结果必须包含至少一个真实 finding".to_string());
+            }
+            ReviewAttemptOutcome::NoRisk if !nodes.is_empty() => {
+                return Err("NoRisk 结果不得包含真实 finding".to_string());
+            }
+            _ => {}
+        }
+
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "SessionGraph 状态写锁已中毒".to_string())?;
+        let (agent_id, attempt_chunk) = {
+            let attempt = state
+                .review_attempts
+                .get(attempt_id)
+                .ok_or_else(|| format!("审查尝试不存在: {}", attempt_id))?;
+            if attempt.status != ReviewAttemptStatus::Started {
+                return Err(format!("审查尝试 {} 已结束，禁止重复流转", attempt_id));
+            }
+            (attempt.agent_id.clone(), attempt.chunk_id.clone())
+        };
+        Self::validate_risk_conflicts(&state, &nodes)?;
+
+        let mut affected = vec![attempt_chunk.clone()];
+        for node in &nodes {
+            let (node_affected, _) = Self::upsert_provisional_node_in_state(&mut state, node);
+            affected.extend(node_affected);
+        }
+        let finding_ids = nodes
+            .iter()
+            .map(|node| node.finding.risk_id.clone())
+            .collect::<Vec<_>>();
+        {
+            let attempt = state
+                .review_attempts
+                .get_mut(attempt_id)
+                .expect("审查尝试已在修改前验证存在");
+            attempt.status = ReviewAttemptStatus::Completed;
+            attempt.outcome = Some(outcome);
+            attempt.finding_ids = finding_ids;
+            attempt.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+        push_unique(
+            state.reviewed_by.entry(attempt_chunk.clone()).or_default(),
+            agent_id,
+        );
+        let affected = deduplicate_strings(&affected);
+        let graph_version = bump_versions(&mut state, affected.clone());
+        Ok(Self::build_graph_commit(&state, graph_version, &affected))
+    }
+
+    /// 为没有 ReviewAttempt 的兼容路径幂等写入 provisional finding。
+    pub fn upsert_provisional_findings(
+        &self,
+        findings: &[RiskFinding],
+    ) -> Result<GraphCommit, String> {
+        let nodes = normalize_provisional_findings(findings)?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "SessionGraph 状态写锁已中毒".to_string())?;
+        Self::validate_risk_conflicts(&state, &nodes)?;
+
+        let mut affected = Vec::new();
+        let mut changed = false;
+        for node in &nodes {
+            let (node_affected, node_changed) =
+                Self::upsert_provisional_node_in_state(&mut state, node);
+            affected.extend(node_affected);
+            changed |= node_changed;
+        }
+        if !changed {
+            return Ok(GraphCommit {
+                graph_version: state.graph_version,
+                chunk_versions: HashMap::new(),
+            });
+        }
+        let affected = deduplicate_strings(&affected);
+        let graph_version = bump_versions(&mut state, affected.clone());
+        Ok(Self::build_graph_commit(&state, graph_version, &affected))
     }
 
     /// 将审查尝试标记为失败；失败尝试不计入 reviewed_by。
@@ -962,6 +1194,131 @@ mod tests {
         assert_eq!(snapshot.graph_version, 1);
         assert_eq!(snapshot.chunk_versions.get("ch_001"), Some(&1));
         assert!(snapshot.chunks.contains_key("ch_001"));
+    }
+
+    #[test]
+    fn commit_review_result_publishes_one_multi_clause_risk_atomically() {
+        let graph = SessionGraph::new();
+        graph.add_chunks(vec![make_test_chunk("ch_001"), make_test_chunk("ch_002")]);
+        let attempt_id = graph
+            .start_review_attempt(AgentId::FactCheck, "ch_001")
+            .expect("应创建尝试");
+        let mut finding = make_test_risk("R_001", "ch_001").finding;
+        finding.clause_ids = vec!["ch_001".into(), "ch_002".into(), "ch_002".into()];
+        finding.legal_basis = vec!["《测试法》第1条".into(), "《测试法》第1条".into()];
+
+        let commit = graph
+            .commit_review_result(&attempt_id, ReviewAttemptOutcome::Findings, &[finding])
+            .expect("应原子提交");
+        let snapshot = graph.snapshot();
+
+        assert_eq!(snapshot.risks.len(), 1);
+        assert_eq!(snapshot.risks["R_001"].state, FindingState::Provisional);
+        assert_eq!(snapshot.has_risk["ch_001"], vec!["R_001"]);
+        assert_eq!(snapshot.has_risk["ch_002"], vec!["R_001"]);
+        assert_eq!(snapshot.cites["R_001"], vec!["《测试法》第1条"]);
+        assert_eq!(snapshot.cited_by["《测试法》第1条"], vec!["R_001"]);
+        assert_eq!(snapshot.reviewed_by["ch_001"], vec![AgentId::FactCheck]);
+        assert_eq!(
+            snapshot.review_attempts[&attempt_id].finding_ids,
+            vec!["R_001"]
+        );
+        assert_eq!(commit.graph_version, snapshot.graph_version);
+        assert_eq!(commit.chunk_versions.len(), 2);
+    }
+
+    #[test]
+    fn invalid_review_commit_rolls_back_every_field_and_version() {
+        let graph = SessionGraph::new();
+        graph.add_chunk(make_test_chunk("ch_001"));
+        let attempt_id = graph
+            .start_review_attempt(AgentId::FactCheck, "ch_001")
+            .expect("应创建尝试");
+        let before = graph.snapshot();
+
+        let error = graph
+            .commit_review_result(&attempt_id, ReviewAttemptOutcome::Findings, &[])
+            .expect_err("空 Findings 必须失败");
+        let after = graph.snapshot();
+
+        assert!(error.contains("Findings"));
+        assert_eq!(after.graph_version, before.graph_version);
+        assert_eq!(after.risks.len(), before.risks.len());
+        assert_eq!(after.has_risk, before.has_risk);
+        assert_eq!(
+            after.review_attempts[&attempt_id].status,
+            ReviewAttemptStatus::Started
+        );
+    }
+
+    #[test]
+    fn no_risk_commit_completes_attempt_without_risk_node() {
+        let graph = SessionGraph::new();
+        graph.add_chunk(make_test_chunk("ch_001"));
+        let attempt_id = graph
+            .start_review_attempt(AgentId::Procedure, "ch_001")
+            .expect("应创建尝试");
+
+        graph
+            .commit_review_result(&attempt_id, ReviewAttemptOutcome::NoRisk, &[])
+            .expect("NoRisk 应成功");
+        let snapshot = graph.snapshot();
+
+        assert!(snapshot.risks.is_empty());
+        assert_eq!(snapshot.reviewed_by["ch_001"], vec![AgentId::Procedure]);
+        assert_eq!(
+            snapshot.review_attempts[&attempt_id].outcome,
+            Some(ReviewAttemptOutcome::NoRisk)
+        );
+    }
+
+    #[test]
+    fn failed_attempt_changes_only_its_chunk_version_and_never_coverage() {
+        let graph = SessionGraph::new();
+        graph.add_chunk(make_test_chunk("ch_001"));
+        let attempt_id = graph
+            .start_review_attempt(AgentId::Procedure, "ch_001")
+            .expect("应创建尝试");
+        let before = graph.snapshot().chunk_versions["ch_001"];
+
+        graph
+            .fail_review_attempt(
+                &attempt_id,
+                ReviewAttemptErrorCode::TaskPanic,
+                "模拟任务异常",
+            )
+            .expect("应收口失败尝试");
+        let snapshot = graph.snapshot();
+
+        assert_eq!(snapshot.chunk_versions["ch_001"], before + 1);
+        assert!(!snapshot.reviewed_by.contains_key("ch_001"));
+        assert!(snapshot.risks.is_empty());
+    }
+
+    #[test]
+    fn repeated_edge_and_identical_upsert_writes_remain_unique() {
+        let graph = SessionGraph::new();
+        graph.add_chunks(vec![make_test_chunk("ch_001"), make_test_chunk("ch_002")]);
+        graph.add_linked_to("ch_001", "ch_002", "同类风险");
+        graph.add_linked_to("ch_001", "ch_002", "同类风险");
+        graph.add_contradicts("ch_001", "ch_002", "要求冲突");
+        graph.add_contradicts("ch_001", "ch_002", "要求冲突");
+        let finding = make_test_risk("R_001", "ch_001").finding;
+
+        graph
+            .upsert_provisional_findings(std::slice::from_ref(&finding))
+            .expect("首次写入应成功");
+        let before_retry = graph.snapshot();
+        graph
+            .upsert_provisional_findings(&[finding])
+            .expect("相同重试应幂等成功");
+        let after_retry = graph.snapshot();
+
+        assert_eq!(after_retry.linked_to["ch_001"].len(), 1);
+        assert_eq!(after_retry.contradicts["ch_001"].len(), 1);
+        assert_eq!(after_retry.contradicts["ch_002"].len(), 1);
+        assert_eq!(after_retry.has_risk["ch_001"], vec!["R_001"]);
+        assert_eq!(after_retry.graph_version, before_retry.graph_version);
     }
 
     // ── 矛盾边 (contradicts) ──────────────────────────────────
