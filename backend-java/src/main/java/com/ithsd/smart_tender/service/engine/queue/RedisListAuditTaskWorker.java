@@ -1,5 +1,7 @@
 package com.ithsd.smart_tender.service.engine.queue;
 
+import com.ithsd.smart_tender.common.TenantContext;
+import com.ithsd.smart_tender.common.TenantContextSnapshot;
 import com.ithsd.smart_tender.service.AuditEngineService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,21 +35,34 @@ public class RedisListAuditTaskWorker {
             long timeout = queueProperties.getBlockMs() != null ? queueProperties.getBlockMs() : 1000;
             
             // LPOP is non-blocking, BLPOP is blocking. Let's use leftPop with timeout which is BLPOP
-            String taskId = redisTemplate.opsForList().leftPop(key, timeout, TimeUnit.MILLISECONDS);
-            
-            if (taskId != null) {
-                log.info("received audit task from redis list, taskId={}", taskId);
+            String payload = redisTemplate.opsForList().leftPop(key, timeout, TimeUnit.MILLISECONDS);
+
+            if (payload != null) {
+                QueuedAuditTask.Decoded task;
                 try {
-                    auditEngineService.start(taskId);
+                    task = QueuedAuditTask.decode(payload);
                 } catch (Exception e) {
-                    log.error("failed to process audit task, taskId={}", taskId, e);
-                    // Simple retry logic could be implemented here if needed, 
-                    // but per requirement we stick to simple list for now.
-                    // If strict reliability is needed, we should push to DLQ or retry queue.
+                    log.error("failed to decode audit task payload, dropping message", e);
+                    return;
                 }
+                log.info("received audit task from redis list, taskId={}, tenantId={}",
+                        task.taskId(), task.context() != null ? task.context().tenantId() : null);
+                process(task);
             }
         } catch (Exception ex) {
             log.error("error polling redis list queue", ex);
+        }
+    }
+
+    private void process(QueuedAuditTask.Decoded task) {
+        TenantContextSnapshot context = task.context();
+        TenantContext.set(context.toContext());
+        try {
+            auditEngineService.start(task.taskId());
+        } catch (Exception e) {
+            log.error("failed to process audit task, taskId={}", task.taskId(), e);
+        } finally {
+            TenantContext.clear();
         }
     }
 }

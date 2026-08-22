@@ -629,11 +629,15 @@ pub fn aggregate(cases: &[CaseResult]) -> RunSummary {
         preferred.iter().filter(|c| c.selected_expected_tool).count(),
         preferred.len(),
     );
-    // Tool Precision: 正确 tool calls / 全部被评分 tool calls
+    // Tool Precision: 正确 tool calls / 全部被评分 tool calls（排除 output_finding 收口调用）
     let (correct_calls, all_calls) = scored.iter().fold((0usize, 0usize), |(cc, ac), c| {
-        let calls = c.tool_calls.len();
-        let ok = c
+        let scored_calls: Vec<_> = c
             .tool_calls
+            .iter()
+            .filter(|r| r.tool_name != "output_finding")
+            .collect();
+        let calls = scored_calls.len();
+        let ok = scored_calls
             .iter()
             .filter(|r| c.expected_tool.as_deref() == Some(r.tool_name.as_str()))
             .count();

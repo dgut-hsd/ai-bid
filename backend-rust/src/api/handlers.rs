@@ -30,6 +30,7 @@ use crate::agents::tools::{
     read_section::ReadSectionTool,
     search_document::SearchDocumentTool,
     search_knowledge::{DashScopeSearchBackend, SearchKnowledgeTool},
+    search_knowledge_base::SearchKnowledgeBaseTool,
     // V2+ 工具
     compare_versions::CompareVersionsTool,
     detect_boilerplate::DetectBoilerplateTool,
@@ -99,6 +100,8 @@ pub struct InternalRequestContext {
 /// 服务全局共享状态。
 #[derive(Clone)]
 pub struct AppState {
+    /// 全进程共享的审核并发额度，所有文档和阶段共同竞争。
+    pub review_execution_limiter: Arc<crate::agents::execution_control::GlobalExecutionLimiter>,
     /// 文档缓存：document_id → 已处理文档
     pub documents: Arc<TokioRwLock<HashMap<String, Arc<DocumentState>>>>,
     /// 嵌入客户端（BGE-M3，启动时加载一次）
@@ -113,6 +116,8 @@ pub struct AppState {
     pub review_event_buses: Arc<TokioMutex<HashMap<String, Arc<ReviewEventBus>>>>,
     /// 异步审查结果缓存：doc_id → CoordinatorOutput
     pub review_results: Arc<TokioMutex<HashMap<String, CoordinatorOutput>>>,
+    /// 异步审查的 token/成本统计：doc_id → ReviewUsage
+    pub review_usages: Arc<TokioMutex<HashMap<String, ReviewUsage>>>,
     /// 异步审查失败信息：doc_id → 错误消息
     pub review_errors: Arc<TokioMutex<HashMap<String, String>>>,
     /// 正在执行的审核任务：doc_id（用于并发控制，防止重复提交）
@@ -159,6 +164,9 @@ impl AppState {
         };
 
         Ok(Self {
+            review_execution_limiter: Arc::new(
+                crate::agents::execution_control::GlobalExecutionLimiter::from_env(),
+            ),
             documents: Arc::new(TokioRwLock::new(HashMap::new())),
             embed_client: Arc::new(StdMutex::new(embed_client)),
             dashscope_search,
@@ -166,6 +174,7 @@ impl AppState {
             embed_engine,
             review_event_buses: Arc::new(TokioMutex::new(HashMap::new())),
             review_results: Arc::new(TokioMutex::new(HashMap::new())),
+            review_usages: Arc::new(TokioMutex::new(HashMap::new())),
             review_errors: Arc::new(TokioMutex::new(HashMap::new())),
             active_reviews: Arc::new(TokioMutex::new(HashSet::new())),
         })
@@ -249,8 +258,23 @@ pub struct ReviewResponse {
     pub document_id: String,
     pub findings: Vec<crate::agents::types::RiskFinding>,
     pub routing_summary: crate::agents::types::RoutingSummary,
+    #[serde(default)]
+    pub execution_summary: crate::agents::types::ExecutionSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_snapshot: Option<crate::agents::types::GraphSnapshot>,
+}
+
+/// 单份文档一次审核的 LLM 消耗与成本估算（benchmark / 前端统计用）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReviewUsage {
+    /// LLM 调用次数（该文档整次审核聚合）
+    pub llm_calls: usize,
+    /// 输入 token 总数（该文档整次审核聚合）
+    pub tokens_input: u64,
+    /// 输出 token 总数（该文档整次审核聚合）
+    pub tokens_output: u64,
+    /// 估算成本（CNY，按当前模型单价）
+    pub cost_cny: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -260,6 +284,9 @@ pub struct ReviewResultResponse {
     pub result: Option<ReviewResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 该文档审核的 LLM token 消耗与成本估算（审核成功后提供）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ReviewUsage>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -705,6 +732,7 @@ pub async fn get_document(
     request_body = ReviewRequest,
     responses(
         (status = 202, description = "Review accepted", body = ReviewAccepted),
+        (status = 400, description = "Invalid review parameters", body = ErrorResponse),
         (status = 404, description = "Document not found", body = ErrorResponse),
         (status = 409, description = "Review already in progress", body = ReviewAccepted)
     )
@@ -722,35 +750,23 @@ pub async fn review_document(
         .clone();
     drop(docs);
 
+    // Agent 选择属于公开请求契约，必须在提交后台任务前完整校验。
+    let enabled_agents = if let Some(agent_names) = req.enabled_agents.as_ref() {
+        let mut parsed_agents = Vec::with_capacity(agent_names.len());
+        for agent_name in agent_names {
+            let agent_id = AgentId::parse(agent_name)
+                .ok_or_else(|| bad_request(&format!("非法 Agent 名称: {}", agent_name)))?;
+            parsed_agents.push(agent_id);
+        }
+        Some(parsed_agents)
+    } else {
+        None
+    };
+
     println!(
         "[REQ] 启动异步审核: doc_id={}, filename={}",
         doc_id, doc.filename
     );
-
-    // 并发控制：检查是否已有进行中的审核（用 active_reviews 标记而非 bus 存在性）
-    {
-        let mut active = state.active_reviews.lock().await;
-        if active.contains(&doc_id) {
-            return Ok((
-                StatusCode::CONFLICT,
-                Json(ReviewAccepted {
-                    status: "conflict".to_string(),
-                    document_id: doc_id,
-                    message: "该文档已有进行中的审核任务".to_string(),
-                }),
-            ));
-        }
-        active.insert(doc_id.clone());
-    }
-
-    // 创建或获取 ReviewEventBus（SSE 客户端可能已提前连接）
-    let review_events = {
-        let mut buses = state.review_event_buses.lock().await;
-        buses
-            .entry(doc_id.clone())
-            .or_insert_with(|| Arc::new(ReviewEventBus::new(review_event_capacity())))
-            .clone()
-    };
 
     // 准备 clause 列表。
     //
@@ -788,6 +804,31 @@ pub async fn review_document(
         })
         .collect();
 
+    // 参数校验完成后再原子占用审核锁，非法请求不得污染任务状态。
+    {
+        let mut active = state.active_reviews.lock().await;
+        if active.contains(&doc_id) {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(ReviewAccepted {
+                    status: "conflict".to_string(),
+                    document_id: doc_id,
+                    message: "该文档已有进行中的审核任务".to_string(),
+                }),
+            ));
+        }
+        active.insert(doc_id.clone());
+    }
+
+    // 创建或获取 ReviewEventBus（SSE 客户端可能已提前连接）。
+    let review_events = {
+        let mut buses = state.review_event_buses.lock().await;
+        buses
+            .entry(doc_id.clone())
+            .or_insert_with(|| Arc::new(ReviewEventBus::new(review_event_capacity())))
+            .clone()
+    };
+
     println!(
         "[REQ] 审核条款数: {}, 启用 Agent: {:?}",
         review_clauses.len(),
@@ -795,7 +836,6 @@ pub async fn review_document(
     );
 
     // 提取后台任务所需数据（脱离 doc 引用）
-    let enabled_agents = req.enabled_agents.clone();
     let chunk_map = doc.chunk_map.clone();
     let review_chunk_map = doc.review_chunk_map.clone();
     let doc_index = doc.doc_index.clone();
@@ -849,7 +889,7 @@ async fn run_review_pipeline(
     state: AppState,
     doc_id: String,
     review_clauses: Vec<ReviewClause>,
-    enabled_agents: Option<Vec<String>>,
+    enabled_agents: Option<Vec<AgentId>>,
     chunk_map: Arc<HashMap<String, Chunk>>,
     review_chunk_map: Arc<HashMap<String, Chunk>>,
     doc_index: Arc<DocumentVectorIndex>,
@@ -875,11 +915,8 @@ async fn run_review_pipeline(
     let trace = Arc::new(TokioMutex::new(TraceLog::new()));
 
     let mut coord_config = CoordinatorConfig::default();
-    if let Some(ref agent_names) = enabled_agents {
-        coord_config.enabled_agents = agent_names
-            .iter()
-            .filter_map(|s| AgentId::parse(s))
-            .collect();
+    if let Some(agent_ids) = enabled_agents {
+        coord_config.enabled_agents = agent_ids;
     }
 
     let llm_factory = Arc::new(move || create_llm_client().expect("创建 LLM 客户端失败"));
@@ -909,16 +946,20 @@ async fn run_review_pipeline(
         {
             registry.register(Box::new(SearchKnowledgeTool::with_dashscope(ds.clone())));
         }
+        // 本地知识库检索（与入库共享 EmbeddingClient，保证向量空间一致）
+        if let Some(ref ec) = ec_for_tools {
+            registry.register(Box::new(SearchKnowledgeBaseTool::new(ec.clone())));
+        }
         registry.register(Box::new(OutputFindingTool));
-        // V2+ 工具
-        registry.register(Box::new(CompareVersionsTool::new(
-            chunk_map_for_tools.clone(),
-            chunk_order_for_tools.clone(),
-        )));
-        registry.register(Box::new(DetectBoilerplateTool::new(
-            chunk_map_for_tools.clone(),
-            chunk_order_for_tools.clone(),
-        )));
+        // V2+ 工具（需要 chunk 数据）
+        registry.register(Box::new(CompareVersionsTool {
+            current_chunks: chunk_map_for_tools.clone(),
+            current_order: chunk_order_for_tools.clone(),
+        }));
+        registry.register(Box::new(DetectBoilerplateTool {
+            chunks: chunk_map_for_tools.clone(),
+            chunk_order: chunk_order_for_tools.clone(),
+        }));
         // V3 采购程序合规审查
         registry.register(Box::new(VerifyProcurementMethodTool));
         registry.register(Box::new(VerifyBidDepositTool));
@@ -978,6 +1019,7 @@ async fn run_review_pipeline(
             graph,
             trace,
         )
+        .with_global_execution_limiter(state.review_execution_limiter.clone())
         .with_review_events(review_events.clone())
         .with_metrics(metrics.clone()),
     );
@@ -986,6 +1028,7 @@ async fn run_review_pipeline(
     match coordinator.review(&review_clauses).await {
         Ok(mut output) => {
             let duration_secs = start_time.elapsed().as_secs_f64();
+            let result_status = output.execution_summary.status.as_str().to_string();
             println!(
                 "[OK] 审核完成: {} 条风险发现, 耗时 {:.1}s",
                 output.findings.len(),
@@ -1020,38 +1063,35 @@ async fn run_review_pipeline(
                     // 避免整页高亮导致"框太大"问题。
                     // 占位 bbox 来自 blocks_from_text()（lopdf 失败降级路径），
                     // 特征是 x0==0.0 && x1==400.0 且高度 ≤20pt。
+                    //
+                    // 同时按 block 真实文本长度累加，估算每个 block 在
+                    // chunk.text 中的字符偏移（用 block 中心位置代表该 block），
+                    // 替代按 index 比例估算——后者在 block 长度差异大时偏移严重。
                     let source_quote = finding.source_quote.clone();
-                    let valid_blocks: Vec<String> = chunk
-                        .source_block_ids
-                        .iter()
-                        .filter(|bid| {
-                            chunk.bbox_refs.iter().any(|r| {
-                                let is_same = &r.block_id == *bid;
-                                let is_placeholder =
-                                    r.bbox.x0 == 0.0 && r.bbox.x1 == 400.0
-                                        && (r.bbox.bottom - r.bbox.top) <= 20.1;
-                                is_same && !is_placeholder
-                            })
-                        })
-                        .cloned()
-                        .collect();
-
-                    // 如果经过滤后为空（全是占位 bbox），则不退化为文本匹配，
-                    // 保持空数组让前端走文本高亮路径。
-                    // 如果仍有过多有效 block（如大 section），取最多前 5 个。
                     let max_blocks = 5usize;
-                    finding.block_ids = if valid_blocks.len() > max_blocks {
-                        // 优选与 source_quote 文本相关的 block
-                        let truncated: Vec<String> = valid_blocks
-                            .into_iter()
-                            .take(max_blocks)
-                            .collect();
-                        truncated
-                    } else {
-                        valid_blocks
-                    };
+                    let mut valid_blocks: Vec<(String, usize)> = Vec::new();
+                    let mut offset_acc = 0usize;
+                    for r in &chunk.bbox_refs {
+                        let is_placeholder =
+                            r.bbox.x0 == 0.0 && r.bbox.x1 == 400.0
+                                && (r.bbox.bottom - r.bbox.top) <= 20.1;
+                        if !is_placeholder {
+                            // 用 block 中心偏移代表其位置，避免长 block 的首字符偏移
+                            // 无法覆盖落在 block 中后段的证据。
+                            valid_blocks
+                                .push((r.block_id.clone(), offset_acc + r.char_count / 2));
+                        }
+                        offset_acc += r.char_count;
+                    }
 
-                    let _ = source_quote; // 预留后续按文本相关性排序
+                    // 统一走可靠性匹配：source_quote 匹配不可靠时返回空，
+                    // 让前端走文本定位（不再区分「块多/块少」两条路径）。
+                    finding.block_ids = select_blocks_by_source_quote(
+                        &valid_blocks,
+                        &source_quote,
+                        &chunk.text,
+                        max_blocks,
+                    );
                 }
             }
             let findings_with_blocks = output
@@ -1104,35 +1144,8 @@ async fn run_review_pipeline(
                 }
             }
 
-            // 存入 review_results 供 GET /result 查询
-            {
-                let mut results = state.review_results.lock().await;
-                results.insert(doc_id.clone(), output.clone());
-            }
-
-            // 写盘: {doc_id}_result.json — 重启后磁盘 fallback
-            {
-                let dir = data_path_str("output/findings");
-                let _ = std::fs::create_dir_all(&dir);
-                let result_path = format!("{}/{}_result.json", dir, doc_id);
-                let persisted = ReviewResultResponse {
-                    status: "completed".to_string(),
-                    result: Some(ReviewResponse {
-                        document_id: doc_id.clone(),
-                        findings: output.findings.clone(),
-                        routing_summary: output.routing_summary.clone(),
-                        graph_snapshot: output.graph_snapshot.clone(),
-                    }),
-                    error: None,
-                };
-                if let Ok(json) = serde_json::to_string_pretty(&persisted) {
-                    let _ = std::fs::write(&result_path, json);
-                    println!("[DISK] result → {}", result_path);
-                }
-            }
-
-            // ── 指标：写盘 ──
-            {
+            // ── 指标：finalize（拿到 token/成本 totals，构造 usage）──
+            let usage = {
                 let mut collector = metrics.lock().await;
                 collector.set_findings_detail(&output.findings);
                 collector.record_stage(
@@ -1178,15 +1191,68 @@ async fn run_review_pipeline(
                     let _ = std::fs::write(&run_path, json);
                     println!("[METRICS] → {}", run_path);
                 }
+
+                let totals = &run_metrics.llm_efficiency.totals;
+                ReviewUsage {
+                    llm_calls: totals.llm_calls,
+                    tokens_input: totals.tokens_input,
+                    tokens_output: totals.tokens_output,
+                    cost_cny: totals.cost_cny,
+                }
+            };
+
+            // 存入 review_results + review_usages 供 GET /result 查询
+            {
+                let mut results = state.review_results.lock().await;
+                results.insert(doc_id.clone(), output.clone());
+                let mut usages = state.review_usages.lock().await;
+                usages.insert(doc_id.clone(), usage.clone());
             }
 
-            // 发送 Done 事件
-            review_events.emit(&crate::agents::review_event::ReviewEvent::Done {
-                total_findings: output.findings.len(),
-                high_risk: high_risk_count,
-                session_id: doc_id.clone(),
-                duration_secs,
-            });
+            // 写盘: {doc_id}_result.json — 重启后磁盘 fallback（含 usage）
+            {
+                let dir = data_path_str("output/findings");
+                let _ = std::fs::create_dir_all(&dir);
+                let result_path = format!("{}/{}_result.json", dir, doc_id);
+                let persisted = ReviewResultResponse {
+                    status: result_status.clone(),
+                    result: Some(ReviewResponse {
+                        document_id: doc_id.clone(),
+                        findings: output.findings.clone(),
+                        routing_summary: output.routing_summary.clone(),
+                        execution_summary: output.execution_summary.clone(),
+                        graph_snapshot: output.graph_snapshot.clone(),
+                    }),
+                    usage: Some(usage.clone()),
+                    error: None,
+                };
+                if let Ok(json) = serde_json::to_string_pretty(&persisted) {
+                    let _ = std::fs::write(&result_path, json);
+                    println!("[DISK] result → {}", result_path);
+                }
+            }
+
+            if output.execution_summary.status
+                == crate::agents::types::ReviewExecutionStatus::PartialFailed
+            {
+                review_events.emit(&crate::agents::review_event::ReviewEvent::PartialDone {
+                    total_findings: output.findings.len(),
+                    high_risk: high_risk_count,
+                    session_id: doc_id.clone(),
+                    duration_secs,
+                    failed_agents: output.execution_summary.failed_agents.clone(),
+                    failed_clauses: output.execution_summary.failed_clauses.clone(),
+                    failed_stages: output.execution_summary.failed_stages.clone(),
+                    budget: output.execution_summary.budget.clone(),
+                });
+            } else {
+                review_events.emit(&crate::agents::review_event::ReviewEvent::Done {
+                    total_findings: output.findings.len(),
+                    high_risk: high_risk_count,
+                    session_id: doc_id.clone(),
+                    duration_secs,
+                });
+            }
         }
         Err(e) => {
             let msg = format!("审核引擎执行失败: {}", e);
@@ -1207,7 +1273,7 @@ async fn run_review_pipeline(
     }
 
     // 延迟清理 ReviewEventBus 和 active_reviews
-    // （给 SSE 客户端时间接收 Done/Error 事件）
+    // （给 SSE 客户端时间接收 Done/PartialDone/Error 事件）
     let cleanup_doc_id = doc_id.clone();
     let cleanup_state = state.clone();
     tokio::spawn(async move {
@@ -1325,7 +1391,7 @@ pub async fn stream_review_events(
         ("doc_id" = String, Path, description = "Document UUID")
     ),
     responses(
-        (status = 200, description = "Review result (status: completed/pending/failed)", body = ReviewResultResponse),
+        (status = 200, description = "Review result (status: completed/partial_failed/pending/failed)", body = ReviewResultResponse),
         (status = 404, description = "No review record found", body = ErrorResponse)
     )
 )]
@@ -1337,14 +1403,17 @@ pub async fn get_review_result(
     {
         let results = state.review_results.lock().await;
         if let Some(output) = results.get(&doc_id) {
+            let usage = state.review_usages.lock().await.get(&doc_id).cloned();
             return Ok(Json(ReviewResultResponse {
-                status: "completed".to_string(),
+                status: output.execution_summary.status.as_str().to_string(),
                 result: Some(ReviewResponse {
                     document_id: doc_id,
                     findings: output.findings.clone(),
                     routing_summary: output.routing_summary.clone(),
+                    execution_summary: output.execution_summary.clone(),
                     graph_snapshot: output.graph_snapshot.clone(),
                 }),
+                usage,
                 error: None,
             }));
         }
@@ -1357,6 +1426,7 @@ pub async fn get_review_result(
             return Ok(Json(ReviewResultResponse {
                 status: "failed".to_string(),
                 result: None,
+                usage: None,
                 error: Some(msg.clone()),
             }));
         }
@@ -1369,6 +1439,7 @@ pub async fn get_review_result(
             return Ok(Json(ReviewResultResponse {
                 status: "pending".to_string(),
                 result: None,
+                usage: None,
                 error: None,
             }));
         }
@@ -2216,6 +2287,195 @@ pub async fn move_metric_experiment_group(
     (StatusCode::OK, Json(serde_json::json!({"ok":true})))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::chunk::ChunkType;
+
+    fn make_test_chunk() -> Chunk {
+        Chunk {
+            chunk_id: "ch_001".to_string(),
+            chunk_type: ChunkType::Leaf,
+            section_path: vec!["测试章节".to_string()],
+            text: "测试条款".to_string(),
+            page_start: 0,
+            page_end: 0,
+            source_block_ids: Vec::new(),
+            bbox_refs: Vec::new(),
+        }
+    }
+
+    fn make_test_document(doc_id: &str) -> Arc<DocumentState> {
+        let chunk = make_test_chunk();
+        let chunk_map = Arc::new(HashMap::from([(chunk.chunk_id.clone(), chunk.clone())]));
+        Arc::new(DocumentState {
+            id: doc_id.to_string(),
+            filename: "test.pdf".to_string(),
+            stem: "test".to_string(),
+            raw_doc: RawDocument {
+                document_id: doc_id.to_string(),
+                source_path: "test.pdf".to_string(),
+                pages: Vec::new(),
+            },
+            sections: Vec::new(),
+            chunks: vec![chunk.clone()],
+            review_chunks: vec![chunk],
+            chunk_map: chunk_map.clone(),
+            review_chunk_map: chunk_map,
+            chunk_order: Arc::new(vec!["ch_001".to_string()]),
+            doc_index: Arc::new(DocumentVectorIndex::new(Vec::new(), Vec::new())),
+            redaction_vault: Arc::new(RedactionVault::default()),
+            desensitization_summary: DesensitizationSummary::default(),
+        })
+    }
+
+    async fn make_test_state(doc_id: &str) -> AppState {
+        let state = AppState {
+            review_execution_limiter: Arc::new(
+                crate::agents::execution_control::GlobalExecutionLimiter::new(
+                    crate::agents::execution_control::ExecutionLimits::default(),
+                ),
+            ),
+            documents: Arc::new(TokioRwLock::new(HashMap::new())),
+            embed_client: Arc::new(StdMutex::new(None)),
+            dashscope_search: None,
+            search_backend: "dashscope".to_string(),
+            embed_engine: "remote".to_string(),
+            review_event_buses: Arc::new(TokioMutex::new(HashMap::new())),
+            review_results: Arc::new(TokioMutex::new(HashMap::new())),
+            review_usages: Arc::new(TokioMutex::new(HashMap::new())),
+            review_errors: Arc::new(TokioMutex::new(HashMap::new())),
+            active_reviews: Arc::new(TokioMutex::new(HashSet::new())),
+        };
+        state
+            .documents
+            .write()
+            .await
+            .insert(doc_id.to_string(), make_test_document(doc_id));
+        state
+    }
+
+    #[tokio::test]
+    async fn invalid_review_request_does_not_reserve_document() {
+        let doc_id = "doc_invalid_request";
+        let state = make_test_state(doc_id).await;
+
+        let response = review_document(
+            State(state.clone()),
+            Path(doc_id.to_string()),
+            Json(ReviewRequest {
+                chunk_ids: Vec::new(),
+                max_clauses: Some(0),
+                enabled_agents: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.expect_err("非法请求应返回错误").0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            !state.active_reviews.lock().await.contains(doc_id),
+            "非法请求不得占用审核锁"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_agent_name_is_rejected_before_review_starts() {
+        let doc_id = "doc_invalid_agent";
+        let state = make_test_state(doc_id).await;
+
+        let response = review_document(
+            State(state.clone()),
+            Path(doc_id.to_string()),
+            Json(ReviewRequest {
+                chunk_ids: Vec::new(),
+                max_clauses: None,
+                enabled_agents: Some(vec!["FactCheck".to_string(), "UnknownAgent".to_string()]),
+            }),
+        )
+        .await;
+
+        let (status, Json(error)) = response.expect_err("非法 Agent 名称应返回错误");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.detail, "非法 Agent 名称: UnknownAgent");
+        assert!(
+            !state.active_reviews.lock().await.contains(doc_id),
+            "非法 Agent 名称不得占用审核锁"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_request_takes_precedence_over_active_review_conflict() {
+        let doc_id = "doc_invalid_while_active";
+        let state = make_test_state(doc_id).await;
+        state.active_reviews.lock().await.insert(doc_id.to_string());
+
+        let response = review_document(
+            State(state),
+            Path(doc_id.to_string()),
+            Json(ReviewRequest {
+                chunk_ids: Vec::new(),
+                max_clauses: Some(0),
+                enabled_agents: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.expect_err("非法请求应优先返回参数错误").0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn review_result_preserves_partial_failed_status() {
+        let doc_id = "doc_partial_result";
+        let state = make_test_state(doc_id).await;
+        state.review_results.lock().await.insert(
+            doc_id.to_string(),
+            CoordinatorOutput {
+                findings: Vec::new(),
+                routing_summary: crate::agents::types::RoutingSummary {
+                    total_clauses: 1,
+                    agent_clause_counts: HashMap::new(),
+                    high_risk_count: 0,
+                    legal_verify_count: 0,
+                    blind_spot_findings: 0,
+                },
+                graph_snapshot: None,
+                execution_summary: crate::agents::types::ExecutionSummary {
+                    status: crate::agents::types::ReviewExecutionStatus::PartialFailed,
+                    successful_agents: 1,
+                    failed_agents: vec![crate::agents::types::AgentExecutionFailure {
+                        agent_id: "missing-agent".to_string(),
+                        message: "Agent 定义未找到".to_string(),
+                    }],
+                    failed_clauses: Vec::new(),
+                    failed_stages: Vec::new(),
+                    budget: None,
+                },
+            },
+        );
+
+        let Json(response) = get_review_result(State(state), Path(doc_id.to_string()))
+            .await
+            .expect("部分失败结果应可查询");
+
+        assert_eq!(response.status, "partial_failed");
+        assert_eq!(
+            response
+                .result
+                .expect("部分失败应保留成功结果")
+                .execution_summary
+                .failed_agents
+                .len(),
+            1
+        );
+    }
+}
+
 /// GET /api/v1/metrics/experiment-groups — 列出所有实验组。
 pub async fn list_metric_experiment_groups() -> (StatusCode, Json<serde_json::Value>) {
     (
@@ -2243,5 +2503,350 @@ pub async fn delete_metric_run(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error":format!("{}",e)})),
         ),
+    }
+}
+
+// ─── Block 匹配辅助函数 ──────────────────────────────────────────────────
+
+/// 判定「可靠匹配」所需的最小 bigram 重叠率。
+const MIN_OVERLAP: f64 = 0.15;
+
+/// 判定「可靠匹配」所需的最小 bigram 命中数。
+///
+/// 至少命中 2 个 bigram，且命中率不低于 [`MIN_OVERLAP`]（向上取整）。
+/// 这样短 quote（bigram 少）会被要求更高的命中率——例如 4 字符 quote 仅 3 个
+/// bigram，命中 1 个的命中率 0.33 虽越过 0.15 门槛，但单点命中不足以视为可靠。
+fn min_hits_required(n_bigrams: usize) -> usize {
+    ((n_bigrams as f64 * MIN_OVERLAP).ceil() as usize).max(2)
+}
+
+/// 判断一个相邻二字组是否参与匹配：两个字符都必须是「有内容」的字符
+/// （字母 / 汉字 / 数字），跳过空白与标点（含中文全角标点 ，。；：等）。
+///
+/// 注意不能只用 `is_ascii_punctuation()`——它不过滤中文全角标点；
+/// `is_alphanumeric()` 对汉字与数字都返回 true，对全角/半角标点返回 false，
+/// 正好满足「保留文字与数字、跳过标点」的需求。
+fn bigram_is_meaningful(a: char, b: char) -> bool {
+    a.is_alphanumeric() && b.is_alphanumeric()
+}
+
+/// 在 `chunk_text` 中寻找与 `source_quote` 的最佳匹配窗口位置。
+///
+/// 使用滑动窗口 + bigram 重叠率计算匹配分数。
+/// 对中文文本，bigram（相邻二字组）能捕获字符顺序，比字符集重叠
+/// 更具区分度，避免"投标人"与"招标投标"的误匹配。
+///
+/// 重叠率 = source_quote 的 bigram 在窗口中的命中数 / source_quote 的 bigram 总数。
+/// 若最佳命中数低于 [`min_hits_required`]，返回 `None`，表示匹配不可靠。
+fn find_quote_position(source_quote: &str, chunk_text: &str) -> Option<(usize, usize)> {
+    const MIN_QUOTE_CHARS: usize = 4;
+
+    let sq: Vec<char> = source_quote.chars().collect();
+    let ct: Vec<char> = chunk_text.chars().collect();
+
+    if sq.len() < MIN_QUOTE_CHARS || ct.is_empty() {
+        return None;
+    }
+
+    // 从 source_quote 构建 bigram 集合（相邻二字组，跳过含空白/标点的）
+    let sq_bigrams: Vec<(char, char)> = sq
+        .windows(2)
+        .filter(|w| bigram_is_meaningful(w[0], w[1]))
+        .map(|w| (w[0], w[1]))
+        .collect();
+
+    if sq_bigrams.is_empty() {
+        return None;
+    }
+
+    let min_hits = min_hits_required(sq_bigrams.len());
+
+    // 从 chunk_text 构建所有位置的 bigram 集合（用于快速查找）
+    let ct_bigram_set: std::collections::HashSet<(char, char)> = ct
+        .windows(2)
+        .filter(|w| bigram_is_meaningful(w[0], w[1]))
+        .map(|w| (w[0], w[1]))
+        .collect();
+
+    // 计算全局 bigram 命中数（用于判断 source_quote 是否与 chunk 整体相关）
+    let global_hits: usize = sq_bigrams
+        .iter()
+        .filter(|bg| ct_bigram_set.contains(bg))
+        .count();
+
+    if global_hits < min_hits {
+        return None;
+    }
+
+    // 滑动窗口精确定位：在 chunk_text 上滑动，
+    // 找到 bigram 命中密度最高的窗口
+    let window_len = sq.len().min(ct.len());
+    let step = (window_len / 4).max(1);
+
+    let mut best_start = 0usize;
+    let mut best_end = window_len;
+    let mut best_score = 0usize;
+
+    for start in (0..=ct.len().saturating_sub(window_len)).step_by(step) {
+        let end = start + window_len;
+        // 窗口内的 bigram 命中数
+        let window_bigrams: std::collections::HashSet<(char, char)> = ct[start..end]
+            .windows(2)
+            .filter(|w| bigram_is_meaningful(w[0], w[1]))
+            .map(|w| (w[0], w[1]))
+            .collect();
+
+        let hits: usize = sq_bigrams
+            .iter()
+            .filter(|bg| window_bigrams.contains(bg))
+            .count();
+        if hits > best_score {
+            best_score = hits;
+            best_start = start;
+            best_end = end;
+        }
+    }
+
+    if best_score < min_hits {
+        return None;
+    }
+
+    Some((best_start, best_end))
+}
+
+/// 基于 `source_quote` 在 chunk text 中的匹配位置，从 `valid_blocks` 中
+/// 选取最近的 `max_blocks` 个 block。
+///
+/// `valid_blocks` 为 `(block_id, 估计字符偏移)` 列表，偏移是每个 block 在
+/// chunk.text 中的估计位置（调用处按真实文本长度累加得到）。函数据此计算
+/// 每个 block 与匹配窗口的距离并排序，取最近的 `max_blocks` 个。
+///
+/// 若 `source_quote` 在 chunk.text 中匹配不可靠（命中数低于阈值），
+/// 返回空 Vec，让前端降级为文本定位而不是错误的高亮 block。
+fn select_blocks_by_source_quote(
+    valid_blocks: &[(String, usize)],
+    source_quote: &str,
+    chunk_text: &str,
+    max_blocks: usize,
+) -> Vec<String> {
+    let n = valid_blocks.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // 尝试定位 source_quote 在 chunk_text 中的匹配窗口
+    let (match_start, _match_end) = match find_quote_position(source_quote, chunk_text) {
+        Some(pos) => pos,
+        None => {
+            // 匹配不可靠 — 返回空，让前端走文本定位
+            return Vec::new();
+        }
+    };
+
+    // 按每个 block 的估计偏移与匹配位置的距离排序
+    let mut scored: Vec<(usize, &String)> = valid_blocks
+        .iter()
+        .map(|(bid, offset)| (offset.abs_diff(match_start), bid))
+        .collect();
+
+    // 按距离升序排列，距离最近的在前
+    scored.sort_by_key(|(d, _)| *d);
+
+    scored
+        .into_iter()
+        .take(max_blocks)
+        .map(|(_, bid)| bid.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod block_matching_tests {
+    use super::*;
+
+    /// 构造一个模拟 chunk.text：N 个 block，每个 block 的文本唯一，以 "\n" 拼接。
+    fn make_chunk_text(block_texts: &[&str]) -> String {
+        block_texts.join("\n")
+    }
+
+    /// 计算每个 block 在 chunk.text 中的字符中心偏移。
+    ///
+    /// 与调用处一致：偏移按 block 文本长度累加（此处额外计入 "\n" 分隔符，
+    /// 使偏移与 make_chunk_text 生成的 chunk.text 字符位置精确对应），
+    /// 每个 block 用其「中心」偏移代表其位置。
+    fn block_centers(block_texts: &[&str]) -> Vec<usize> {
+        let mut acc = 0usize;
+        let mut centers = Vec::with_capacity(block_texts.len());
+        for t in block_texts {
+            let len = t.chars().count();
+            centers.push(acc + len / 2);
+            acc += len + 1; // +1 对应 "\n" 分隔符
+        }
+        centers
+    }
+
+    /// 将 block id 与字符中心偏移配对成 `(block_id, offset)` 列表。
+    fn make_valid_blocks(prefix: &str, block_texts: &[&str]) -> Vec<(String, usize)> {
+        block_centers(block_texts)
+            .into_iter()
+            .enumerate()
+            .map(|(i, off)| (format!("{}_{}", prefix, i), off))
+            .collect()
+    }
+
+    #[test]
+    fn find_quote_position_strong_match() {
+        let chunk = "第一条 投标人资格要求。投标人须为中华人民共和国境内注册的企业法人。";
+        let quote = "投标人须为中华人民共和国境内注册";
+        let pos = find_quote_position(quote, chunk);
+        assert!(pos.is_some(), "强匹配应返回位置");
+    }
+
+    #[test]
+    fn find_quote_position_no_match() {
+        let chunk = "第一条 项目概况与招标范围。本项目位于北京市朝阳区。";
+        let quote = "投标人须具有独立法人资格";
+        let pos = find_quote_position(quote, chunk);
+        assert!(pos.is_none(), "无重叠应返回 None");
+    }
+
+    #[test]
+    fn find_quote_position_short_quote_returns_none() {
+        let chunk = "第一章 总则";
+        let quote = "第";
+        let pos = find_quote_position(quote, chunk);
+        assert!(pos.is_none(), "过短的 quote（<4 字符）应返回 None");
+    }
+
+    #[test]
+    fn find_quote_position_single_bigram_hit_not_reliable() {
+        // 4 字符 quote 仅 3 个 bigram；只命中 1 个时命中率 0.33 虽越过旧阈值 0.15，
+        // 但单点命中不足以视为可靠，现在应返回 None。
+        let chunk = "本项目采用公开投标方式。";
+        let quote = "投标人须";
+        let pos = find_quote_position(quote, chunk);
+        assert!(pos.is_none(), "仅 1 个 bigram 命中不应判定为可靠");
+    }
+
+    #[test]
+    fn select_blocks_returns_empty_when_match_unreliable() {
+        // chunk.text 与 source_quote 无交集
+        let valid_blocks: Vec<(String, usize)> = (0..10)
+            .map(|i| (format!("b_1_{}", i), i))
+            .collect();
+        let chunk_text =
+            "第一章 总则。本办法适用于所有政府采购项目的招标投标活动。".repeat(5);
+        let source_quote = "投标人须为本省注册企业且具有独立法人资格";
+
+        let result =
+            select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 5);
+        assert!(
+            result.is_empty(),
+            "不可靠匹配应返回空，让前端走文本定位"
+        );
+    }
+
+    #[test]
+    fn select_blocks_prefers_latter_half_when_evidence_there() {
+        // 模拟 10 个 block 的大 chunk，证据位于后半段
+        let block_texts: Vec<&str> = vec![
+            "第一条 总则。本办法依据《中华人民共和国招标投标法》制定。",
+            "第二条 适用范围。本办法适用于所有政府采购项目。",
+            "第三条 基本原则。招标投标活动应遵循公开、公平、公正原则。",
+            "第四条 采购人职责。采购人应对采购需求的合法性负责。",
+            "第五条 代理机构。采购代理机构应具备相应的资格条件。",
+            "第六条 招标文件。招标文件不得包含歧视性条款。",
+            "第七条 投标人资格。投标人须为中华人民共和国境内注册的企业法人。",
+            "第八条 联合体投标。两个以上法人可组成联合体参与投标。",
+            "第九条 投标保证金。投标保证金不得超过项目估算价的2%。",
+            "第十条 开标程序。开标应在招标文件确定的提交投标文件截止时间公开进行。",
+        ];
+        let chunk_text = make_chunk_text(&block_texts);
+        let valid_blocks = make_valid_blocks("b_1", &block_texts);
+
+        // 证据在第九条（block_texts[8]，index 8）：投标保证金不得超过项目估算价的2%
+        let source_quote = "投标保证金不得超过项目估算价的2%";
+
+        let result =
+            select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 3);
+
+        assert!(!result.is_empty(), "应找到匹配的 block");
+        // 第九条的 block 是 b_1_8（index 8），应在结果中排在前面
+        assert!(
+            result.contains(&"b_1_8".to_string()),
+            "结果应包含证据所在 block b_1_8（第九条），实际: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn select_blocks_falls_back_to_empty_for_very_different_texts() {
+        let valid_blocks: Vec<(String, usize)> = (0..6)
+            .map(|i| (format!("b_2_{}", i), i))
+            .collect();
+        let chunk_text = "项目名称：XX市污水处理厂建设工程。建设地点：XX市南郊。工期：365天。";
+        let source_quote = "投标人须具备有效的安全生产许可证且在有效期内";
+
+        let result =
+            select_blocks_by_source_quote(&valid_blocks, source_quote, chunk_text, 5);
+        assert!(
+            result.is_empty(),
+            "完全不相关的 source_quote 应返回空 block_ids"
+        );
+    }
+
+    #[test]
+    fn select_blocks_respects_max_blocks_limit() {
+        let block_texts: Vec<String> = (0..20)
+            .map(|i| format!("第{}条 条款内容文本占位。", i + 1))
+            .collect();
+        let block_refs: Vec<&str> = block_texts.iter().map(|s| s.as_str()).collect();
+        let chunk_text = make_chunk_text(&block_refs);
+        let valid_blocks = make_valid_blocks("b_3", &block_refs);
+
+        let source_quote = "第15条 条款内容文本占位";
+
+        let result =
+            select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 5);
+        assert!(
+            result.len() <= 5,
+            "返回的 block 数不应超过 max_blocks=5，实际: {}",
+            result.len()
+        );
+        assert!(
+            result.contains(&"b_3_14".to_string()),
+            "应包含证据所在 block b_3_14（第15条，index 14），实际: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn select_blocks_handles_non_uniform_block_lengths() {
+        // 非均匀场景：前 9 个 block 极短，最后一个 block 极长（800+ 字符），
+        // 证据落在长 block 的中段。若按 index 比例估算偏移，长 block 会被
+        // 误估到 chunk 末尾，导致选中错误的短 block；按真实文本长度累加的
+        // 中心偏移则能正确选中长 block（index 9）。
+        let mut block_texts: Vec<String> = (0..9)
+            .map(|i| format!("第{}条 短条款。", i + 1))
+            .collect();
+        let long_block = format!(
+            "第十条 详细说明。{}投标保证金不得超过项目估算价的2%。{}",
+            "内容".repeat(200),
+            "内容".repeat(200),
+        );
+        block_texts.push(long_block);
+
+        let block_refs: Vec<&str> = block_texts.iter().map(|s| s.as_str()).collect();
+        let chunk_text = make_chunk_text(&block_refs);
+        let valid_blocks = make_valid_blocks("b_nu", &block_refs);
+
+        let source_quote = "投标保证金不得超过项目估算价的2%";
+        let result =
+            select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 3);
+
+        assert!(
+            result.contains(&"b_nu_9".to_string()),
+            "应按真实偏移选中长 block b_nu_9（第十条，index 9），实际: {:?}",
+            result
+        );
     }
 }

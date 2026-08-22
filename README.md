@@ -88,7 +88,7 @@ docker compose ps
 
 ```bash
 # ==== 必填：LLM API 密钥 ====
-DASHSCOPE_API_KEY=sk-ws-H.EIPLYIY.oH9a.MEUCIQD4TkLMZBXWRdaYiC8ZyfLTtR6iuz48RRj_3gXUUrMDiQIgX9TFgBQPR8xHkcZpDZ2KUCjuolnysol6GxKe_VSP7ho
+DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # ==== LLM 协议（dashscope / openai_compatible）====
 AIBID_LLM_PROTOCOL=dashscope

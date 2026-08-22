@@ -1,6 +1,7 @@
 pub mod bus;
 pub mod chat_agent;
 pub mod coordinator;
+pub mod execution_control;
 pub mod fact_check;
 pub mod procedure;
 pub mod procurement_context;

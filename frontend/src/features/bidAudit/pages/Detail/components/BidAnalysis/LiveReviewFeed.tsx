@@ -59,7 +59,7 @@ const isImportant = (type: string) => type === 'output_finding';
 // ─── 事件详情面板（可展开） ──────────────────────────────────
 
 const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
-  const p = event.payload as Record<string, unknown> | undefined;
+  const p = event.payload as Record<string, any> | undefined;
   if (!p) return null;
 
   // agent_thought: 完整推理内容
@@ -396,7 +396,7 @@ const LiveReviewFeed: React.FC<Props> = ({ events }) => {
 
   // 判断事件是否有可展开的详情
   const hasDetail = (event: TraceEvent): boolean => {
-    const p = event.payload as Record<string, unknown> | undefined;
+    const p = event.payload as Record<string, any> | undefined;
     if (!p) return false;
     switch (event.event_type) {
       case 'agent_thought': return !!p.content;
@@ -437,7 +437,7 @@ const LiveReviewFeed: React.FC<Props> = ({ events }) => {
           const expanded = expandedKeys.has(idx);
 
           // tool_result: extract sources from payload
-          const p = event.payload as Record<string, unknown> | undefined;
+          const p = event.payload as Record<string, any> | undefined;
           const sources: SearchSource[] =
             isToolResult && p?.sources
               ? (p.sources as SearchSource[])

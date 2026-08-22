@@ -232,7 +232,7 @@ describe('mapBackendFindings', () => {
   it('maps each element in the array through mapBackendFinding', () => {
     const results = mapBackendFindings([completeBackendFinding, completeBackendFinding] as any);
     expect(results).toHaveLength(2);
-    results.forEach((r, _i) => {
+results.forEach((r) => {
       expect(r.issueNo).toBe('RISK-001');
       expect(r.severity).toBe('high');
     });

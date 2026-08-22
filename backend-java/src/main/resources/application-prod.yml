@@ -4,7 +4,7 @@ server:
 
 security:
   jwt:
-    secret: ${ST_JWT_SECRET:}
+    secret: ${ST_JWT_SECRET:5f71d068faffaa7e5cac07c803f4673fe64c37fbb6c395e7c02747873ba9225d}
     ttl-millis: ${ST_JWT_TTL_MILLIS:86400000}
     accept-legacy-user-id: false
 

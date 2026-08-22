@@ -1,5 +1,7 @@
 package com.ithsd.smart_tender.service.engine.queue;
 
+import com.ithsd.smart_tender.common.TenantContext;
+import com.ithsd.smart_tender.common.TenantContextSnapshot;
 import com.ithsd.smart_tender.service.AuditEngineService;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
@@ -17,6 +19,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -65,17 +68,47 @@ public class RedisStreamAuditTaskWorker {
     }
 
     private void processRecord(MapRecord<String, Object, Object> record) {
-        String taskId = value(record, "taskId");
+        String taskId = value(record, QueuedAuditTask.TASK_ID);
         if (!StringUtils.hasText(taskId)) {
             ack(record.getId().getValue());
             return;
         }
         int retry = parseRetry(value(record, "retry"));
+
+        QueuedAuditTask.Decoded task;
         try {
-            auditEngineService.start(taskId);
+            task = QueuedAuditTask.decode(contextFields(record));
+        } catch (RuntimeException ex) {
+            log.error("failed to decode tenant context for task, taskId={}, dropping message", taskId, ex);
+            ack(record.getId().getValue());
+            return;
+        }
+
+        try {
+            runWithContext(task.context(), () -> auditEngineService.start(task.taskId()));
             ack(record.getId().getValue());
         } catch (RuntimeException ex) {
             handleFailure(record.getId().getValue(), taskId, retry, ex);
+        }
+    }
+
+    private Map<String, String> contextFields(MapRecord<String, Object, Object> record) {
+        Map<String, String> fields = new HashMap<>();
+        fields.put(QueuedAuditTask.TASK_ID, value(record, QueuedAuditTask.TASK_ID));
+        fields.put(QueuedAuditTask.USER_ID, value(record, QueuedAuditTask.USER_ID));
+        fields.put(QueuedAuditTask.TENANT_ID, value(record, QueuedAuditTask.TENANT_ID));
+        fields.put(QueuedAuditTask.ROLE, value(record, QueuedAuditTask.ROLE));
+        fields.put(QueuedAuditTask.SESSION_VERSION, value(record, QueuedAuditTask.SESSION_VERSION));
+        fields.put(QueuedAuditTask.REQUEST_ID, value(record, QueuedAuditTask.REQUEST_ID));
+        return fields;
+    }
+
+    private void runWithContext(TenantContextSnapshot context, Runnable action) {
+        TenantContext.set(context.toContext());
+        try {
+            action.run();
+        } finally {
+            TenantContext.clear();
         }
     }
 

@@ -10,7 +10,7 @@ spring:
     driver-class-name: com.mysql.cj.jdbc.Driver
     url: jdbc:mysql://localhost:3306/smart_tender_system?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8&zeroDateTimeBehavior=convertToNull&useSSL=false&allowPublicKeyRetrieval=true&socketTimeout=30000&connectTimeout=5000
     username: root
-    password: "123456"
+    password: "1234"
     type: com.alibaba.druid.pool.DruidDataSource
     druid:
       test-while-idle: true
@@ -43,6 +43,10 @@ spring:
       mode: always
       schema-locations: classpath:audit_task_event.sql,classpath:trace_schema.sql
   servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
     multipart:
       max-file-size: 50MB
       max-request-size: 50MB
@@ -119,3 +123,4 @@ rust:
     connect-timeout-ms: 5000
     read-timeout-ms: 900000
     health-check-enabled: true
+    internal-secret: ${RUST_API_INTERNAL_SECRET:dev-internal-secret-key-2024}

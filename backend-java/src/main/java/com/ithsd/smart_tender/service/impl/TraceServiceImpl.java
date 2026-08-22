@@ -5,9 +5,11 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.ithsd.smart_tender.mapper.AuditTaskMapper;
 import com.ithsd.smart_tender.mapper.TraceEventBlockMapper;
 import com.ithsd.smart_tender.mapper.TraceEventMapper;
 import com.ithsd.smart_tender.mapper.TraceSessionMapper;
+import com.ithsd.smart_tender.model.entity.AuditTask;
 import com.ithsd.smart_tender.model.entity.TraceEventBlock;
 import com.ithsd.smart_tender.model.entity.TraceEventEntity;
 import com.ithsd.smart_tender.model.entity.TraceSession;
@@ -41,15 +43,18 @@ public class TraceServiceImpl implements TraceService {
     private final TraceSessionMapper sessionMapper;
     private final TraceEventMapper eventMapper;
     private final TraceEventBlockMapper blockMapper;
+    private final AuditTaskMapper auditTaskMapper;
     private final ObjectMapper jsonMapper = new ObjectMapper();
 
     public TraceServiceImpl(
             TraceSessionMapper sessionMapper,
             TraceEventMapper eventMapper,
-            TraceEventBlockMapper blockMapper) {
+            TraceEventBlockMapper blockMapper,
+            AuditTaskMapper auditTaskMapper) {
         this.sessionMapper = sessionMapper;
         this.eventMapper = eventMapper;
         this.blockMapper = blockMapper;
+        this.auditTaskMapper = auditTaskMapper;
     }
 
     // ── 摄入 ──────────────────────────────────────────────────
@@ -128,6 +133,15 @@ public class TraceServiceImpl implements TraceService {
     @Transactional(readOnly = true)
     public PageResult listByTaskId(String taskId, String agent, String severity,
                                                     int page, int size) {
+        // 验证审核任务属于当前租户
+        Long tenantId = TenantScope.requiredTenantId();
+        AuditTask task = auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getTaskId, taskId)
+                .eq(AuditTask::getTenantId, tenantId));
+        if (task == null) {
+            return new PageResult(0L, List.of());
+        }
+
         LambdaQueryWrapper<TraceSession> q = new LambdaQueryWrapper<TraceSession>()
                 .eq(TraceSession::getTaskId, taskId);
         if (agent != null && !agent.isBlank()) {
@@ -152,6 +166,17 @@ public class TraceServiceImpl implements TraceService {
         TraceSession session = sessionMapper.selectById(sessionId);
         if (session == null) {
             return null;
+        }
+
+        // 验证 session 关联的审核任务属于当前租户
+        Long tenantId = TenantScope.requiredTenantId();
+        if (session.getTaskId() != null) {
+            AuditTask task = auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
+                    .eq(AuditTask::getTaskId, session.getTaskId())
+                    .eq(AuditTask::getTenantId, tenantId));
+            if (task == null) {
+                return null;
+            }
         }
 
         List<TraceEventEntity> entities = eventMapper.selectList(

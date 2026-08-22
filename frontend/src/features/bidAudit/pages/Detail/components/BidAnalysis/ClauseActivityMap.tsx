@@ -375,7 +375,7 @@ const SectionTreeNodeView: React.FC<{
                       title={`跳转到第 ${clause.pageNumber} 页`}
                       onClick={(e) => {
                         e.stopPropagation();
-                        if (clause.pageNumber != null) onLocateIssuePage(clause.pageNumber);
+onLocateIssuePage(clause.pageNumber!);
                       }}
                     >
                       p.{clause.pageNumber}
@@ -437,7 +437,7 @@ function stripEmoji(s: string): string {
 /** 单个 trace 事件行 — 可点击展开详情 */
 const TraceEventRow: React.FC<{ ev: TraceEvent }> = ({ ev }) => {
   const [expanded, setExpanded] = useState(false);
-  const p = ev.payload as Record<string, unknown> | undefined;
+  const p = ev.payload as Record<string, any> | undefined;
   const hasDetail = !!p && (
     ev.event_type === 'agent_thought' || ev.event_type === 'tool_call' ||
     ev.event_type === 'tool_result' || ev.event_type === 'output_finding' ||
@@ -483,7 +483,19 @@ const TraceEventRow: React.FC<{ ev: TraceEvent }> = ({ ev }) => {
             </div>
           ) : null}
           {/* tool_call: 完整参数 */}
-          {null /* DIAG-486 */}
+          {ev.event_type === 'tool_call' && p.arguments && (
+            <div style={{
+              padding: '4px 8px', background: '#e6f4ff', border: '1px solid #91caff',
+              borderRadius: 3, maxHeight: 150, overflowY: 'auto',
+              fontFamily: 'monospace', color: '#595959', lineHeight: '16px',
+            }}>
+              {Object.entries(p.arguments as Record<string, unknown>)
+                .filter(([k]) => !k.startsWith('_'))
+                .map(([k, v]) => (
+                  <div key={k}><span style={{ color: '#1677ff' }}>{k}:</span> {typeof v === 'string' ? v : JSON.stringify(v)}</div>
+                ))}
+            </div>
+          )}
           {/* tool_result: 内容预览 */}
           {ev.event_type === 'tool_result' && (
             <>

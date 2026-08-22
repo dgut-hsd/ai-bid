@@ -78,8 +78,10 @@ impl ValidateCalculationTool {
         let mut steps: Vec<String> = Vec::new();
         let mut resolved = formula.to_string();
 
-        // 1. 替换变量为数值
-        for (var, val) in values {
+        // 1. 替换变量为数值（按名称长度降序替换，避免短名覆盖长名，如 "x" 破坏 "xy"、"成交价" 破坏 "成交价格"）
+        let mut sorted_vars: Vec<(&String, &f64)> = values.iter().collect();
+        sorted_vars.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(b.0)));
+        for (var, val) in sorted_vars {
             resolved = resolved.replace(var, &val.to_string());
         }
 

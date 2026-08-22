@@ -4,6 +4,8 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ithsd.smart_tender.common.BaseContext;
 import com.ithsd.smart_tender.common.BizException;
 import com.ithsd.smart_tender.common.TenantAuthException;
+import com.ithsd.smart_tender.common.TenantContext;
+import com.ithsd.smart_tender.common.TenantContextSnapshot;
 import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
 import com.ithsd.smart_tender.mapper.KnowledgeFileMapper;
@@ -115,10 +117,16 @@ public class AuditTaskServiceImpl implements AuditTaskService {
 
         // 必须在当前事务提交后再 dispatch，否则 @Async 线程查不到刚插入的 task
         final String taskId = entity.getTaskId();
+        final TenantContextSnapshot ctxSnapshot = TenantContext.snapshot();
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                taskDispatcher.dispatch(taskId);
+                TenantContext.set(ctxSnapshot != null ? ctxSnapshot.toContext() : null);
+                try {
+                    taskDispatcher.dispatch(taskId);
+                } finally {
+                    TenantContext.clear();
+                }
             }
         });
         return new AuditTaskCreateVO(entity.getTaskId());

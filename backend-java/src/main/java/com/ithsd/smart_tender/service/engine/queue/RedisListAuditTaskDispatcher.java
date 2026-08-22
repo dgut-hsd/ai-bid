@@ -1,5 +1,6 @@
 package com.ithsd.smart_tender.service.engine.queue;
 
+import com.ithsd.smart_tender.common.TenantContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -22,7 +23,9 @@ public class RedisListAuditTaskDispatcher implements AuditTaskDispatcher {
     public void dispatch(String taskId) {
         try {
             String key = queueProperties.getStreamKey(); // reusing streamKey config as list key
-            redisTemplate.opsForList().rightPush(key, taskId);
+            // 把租户上下文一并入队，worker 线程才能重建 TenantContext 发起 Rust 内部签名请求。
+            String payload = QueuedAuditTask.encode(taskId, TenantContext.snapshot());
+            redisTemplate.opsForList().rightPush(key, payload);
             log.info("audit task dispatched to redis list, taskId={}, key={}", taskId, key);
         } catch (Exception ex) {
             log.error("failed to dispatch audit task to redis list, taskId={}", taskId, ex);

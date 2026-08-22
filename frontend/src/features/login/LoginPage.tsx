@@ -34,10 +34,15 @@ export function LoginPage() {
          const response = await loginMutate({ phone, password });
 
          if (response.code === 200 && response.data) {
+            const user = response.data.user_info;
             dispatch(
                setCredentials({
                   token: response.data.token,
-                  userInfo: response.data.userInfo,
+                  userInfo: {
+                     id: user.user_id,
+                     username: user.username,
+                     realName: user.real_name ?? user.username,
+                  },
                   rememberMe: remember,
                })
             );

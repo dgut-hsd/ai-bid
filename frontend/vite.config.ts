@@ -3,7 +3,7 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 
-const javaApiTarget = process.env.AIBID_JAVA_BASE_URL || 'http://127.0.0.1:8086';
+const javaApiTarget = process.env.AIBID_JAVA_BASE_URL || 'http://127.0.0.1:3000';
 const frontendPort = Number(process.env.AIBID_FRONTEND_PORT || 5173);
 
 // https://vite.dev/config/

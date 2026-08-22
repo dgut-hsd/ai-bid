@@ -52,6 +52,7 @@ mod micro_benchmark {
     // ─── Micro Benchmark ────────────────────────────────────────
 
     #[test]
+    #[ignore = "micro benchmark：硬性延迟断言依赖机器性能，CI 上 flaky，手动运行 cargo test -- --ignored"]
     fn bench_verify_bid_deposit() {
         let tool = VerifyBidDepositTool;
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -70,6 +71,7 @@ mod micro_benchmark {
     }
 
     #[test]
+    #[ignore = "micro benchmark：硬性延迟断言依赖机器性能，CI 上 flaky，手动运行 cargo test -- --ignored"]
     fn bench_verify_announcement_period_smoke() {
         // debug timing smoke test（非可信生产 P99）：验证 verify_announcement_period 新 Contract。
         let tool = VerifyAnnouncementPeriodTool;
@@ -97,6 +99,7 @@ mod micro_benchmark {
     }
 
     #[test]
+    #[ignore = "micro benchmark：硬性延迟断言依赖机器性能，CI 上 flaky，手动运行 cargo test -- --ignored"]
     fn bench_detect_subjective_scoring_normal() {
         let tool = DetectSubjectiveScoringTool;
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -111,6 +114,7 @@ mod micro_benchmark {
     }
 
     #[test]
+    #[ignore = "micro benchmark：硬性延迟断言依赖机器性能，CI 上 flaky，手动运行 cargo test -- --ignored"]
     fn bench_detect_subjective_scoring_long_text() {
         let tool = DetectSubjectiveScoringTool;
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -129,6 +133,7 @@ mod micro_benchmark {
     }
 
     #[test]
+    #[ignore = "micro benchmark：硬性延迟断言依赖机器性能，CI 上 flaky，手动运行 cargo test -- --ignored"]
     fn bench_check_imported_products_long_text() {
         let tool = CheckImportedProductsTool;
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -147,6 +152,7 @@ mod micro_benchmark {
     }
 
     #[test]
+    #[ignore = "micro benchmark：硬性延迟断言依赖机器性能，CI 上 flaky，手动运行 cargo test -- --ignored"]
     fn bench_validate_scoring_formula() {
         let tool = ValidateScoringFormulaTool;
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -166,6 +172,7 @@ mod micro_benchmark {
     }
 
     #[test]
+    #[ignore = "micro benchmark：硬性延迟断言依赖机器性能，CI 上 flaky，手动运行 cargo test -- --ignored"]
     fn bench_validate_weight_distribution() {
         let tool = ValidateWeightDistributionTool;
         let rt = tokio::runtime::Runtime::new().unwrap();

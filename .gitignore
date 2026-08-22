@@ -46,6 +46,7 @@ __pycache__/
 .runtime-data/
 env/
 data/
+dump.rdb
 
 # ── Python 缓存 ──
 __pycache__/
