@@ -21,6 +21,9 @@ public class AuditIssue implements Serializable {
     @TableId(value = "id", type = IdType.AUTO)
     private Long id;
 
+    @TableField("tenant_id")
+    private Long tenantId;
+
     private Long auditId;
 
     private String issueNo;

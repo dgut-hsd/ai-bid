@@ -38,18 +38,10 @@ describe('loginApi', () => {
     expect(response.data?.current_tenant).toBeNull();
   });
 
-  it('refreshes using the refreshToken instead of the (possibly expired) access token', async () => {
-    localStorage.setItem('refreshToken', 'rt-123');
+  it('refreshes with the current Bearer session and does not require a refresh token', async () => {
     const response = await loginApi.refresh();
 
-    expect(post).toHaveBeenCalledWith(
-      '/api/auth/refresh',
-      {},
-      expect.objectContaining({
-        headers: { Authorization: 'Bearer rt-123' },
-      })
-    );
+    expect(post).toHaveBeenCalledWith('/api/auth/refresh', {});
     expect(response.data?.token).toBe('access-token');
-    localStorage.removeItem('refreshToken');
   });
 });

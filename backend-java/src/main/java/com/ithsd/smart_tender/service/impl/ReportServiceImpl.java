@@ -1,6 +1,6 @@
 package com.ithsd.smart_tender.service.impl;
 
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.mapper.AuditReportMapper;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
@@ -37,20 +37,21 @@ public class ReportServiceImpl implements ReportService {
     @Override
     public ReportVO generateReport(String auditIdOrTaskId) {
         Long tenantId = TenantScope.requiredTenantId();
-        Long auditId = resolveAuditId(auditIdOrTaskId, tenantId);
-        AuditTask task = auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
-                .eq(AuditTask::getId, auditId)
-                .eq(AuditTask::getTenantId, tenantId));
+        Long auditId = resolveAuditId(auditIdOrTaskId);
+        AuditTask task = auditTaskMapper.selectOne(new QueryWrapper<AuditTask>()
+                .eq("id", auditId)
+                .eq("tenant_id", tenantId));
         if (task == null) {
-            throw new RuntimeException("审核任务不存在");
+            throw TenantScope.resourceNotFound();
         }
-
+        
         if (task.getTaskStatus() != 2) {
             throw new RuntimeException("审核任务尚未完成，无法生成报告");
         }
 
-        LambdaQueryWrapper<AuditReport> existWrapper = new LambdaQueryWrapper<>();
-        existWrapper.eq(AuditReport::getAuditId, auditId);
+        QueryWrapper<AuditReport> existWrapper = new QueryWrapper<>();
+        existWrapper.eq("audit_id", auditId)
+                .eq("tenant_id", tenantId);
         AuditReport existReport = auditReportMapper.selectOne(existWrapper);
         if (existReport != null) {
             ReportVO vo = new ReportVO();
@@ -58,17 +59,18 @@ public class ReportServiceImpl implements ReportService {
             return vo;
         }
 
-        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
-                .eq(Tender::getId, task.getBidId())
-                .eq(Tender::getTenantId, tenantId));
+        Tender tender = tenderMapper.selectOne(new QueryWrapper<Tender>()
+                .eq("id", task.getBidId())
+                .eq("tenant_id", tenantId));
         if (tender == null) {
-            throw new RuntimeException("标书信息不存在");
+            throw TenantScope.resourceNotFound();
         }
 
-        LambdaQueryWrapper<AuditIssue> issueWrapper = new LambdaQueryWrapper<>();
-        issueWrapper.eq(AuditIssue::getAuditId, auditId)
-                    .orderByAsc(AuditIssue::getSeverity)
-                    .orderByAsc(AuditIssue::getCategory);
+        QueryWrapper<AuditIssue> issueWrapper = new QueryWrapper<>();
+        issueWrapper.eq("audit_id", auditId)
+                    .eq("tenant_id", tenantId)
+                    .orderByAsc("severity")
+                    .orderByAsc("category");
         List<AuditIssue> issues = auditIssueMapper.selectList(issueWrapper);
 
         User auditor = null;
@@ -79,6 +81,7 @@ public class ReportServiceImpl implements ReportService {
         String docContent = generateMarkdownReport(task, tender, issues, auditor);
 
         AuditReport report = new AuditReport();
+        report.setTenantId(tenantId);
         report.setAuditId(auditId);
         report.setDocContent(docContent);
         report.setGenerateTime(LocalDateTime.now());
@@ -93,58 +96,57 @@ public class ReportServiceImpl implements ReportService {
     @Override
     public String getReportContent(String auditIdOrTaskId) {
         Long tenantId = TenantScope.requiredTenantId();
-        Long auditId = resolveAuditId(auditIdOrTaskId, tenantId);
-
-        // 验证审核任务属于当前租户
-        AuditTask task = auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
-                .eq(AuditTask::getId, auditId)
-                .eq(AuditTask::getTenantId, tenantId));
-        if (task == null) {
-            return null;
-        }
-
-        LambdaQueryWrapper<AuditReport> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(AuditReport::getAuditId, auditId);
+        Long auditId = resolveAuditId(auditIdOrTaskId);
+        QueryWrapper<AuditReport> wrapper = new QueryWrapper<>();
+        wrapper.eq("audit_id", auditId)
+                .eq("tenant_id", tenantId);
         AuditReport report = auditReportMapper.selectOne(wrapper);
-
+        
         if (report == null) {
-            return null;
+            throw TenantScope.resourceNotFound();
         }
-
+        
         return report.getDocContent();
     }
 
-    private Long resolveAuditId(String auditIdOrTaskId, Long tenantId) {
+    private Long resolveAuditId(String auditIdOrTaskId) {
+        Long tenantId = TenantScope.requiredTenantId();
         if (auditIdOrTaskId == null || auditIdOrTaskId.isBlank()) {
-            throw new RuntimeException("审核任务标识不能为空");
+            throw TenantScope.resourceNotFound();
         }
         try {
             Long numericId = Long.parseLong(auditIdOrTaskId);
             // 1) 前端路由参数当前语义是 bidId：优先按 bid_id 找最新任务，避免与 audit_task.id 数值冲突
-            LambdaQueryWrapper<AuditTask> byBidIdWrapper = new LambdaQueryWrapper<>();
-            byBidIdWrapper.eq(AuditTask::getBidId, numericId)
-                    .eq(AuditTask::getTenantId, tenantId)
-                    .orderByDesc(AuditTask::getCreateTime)
+            QueryWrapper<AuditTask> byBidIdWrapper = new QueryWrapper<>();
+            byBidIdWrapper.eq("bid_id", numericId)
+                    .eq("tenant_id", tenantId)
+                    .orderByDesc("create_time")
                     .last("LIMIT 1");
             AuditTask byBidId = auditTaskMapper.selectOne(byBidIdWrapper);
             if (byBidId != null && byBidId.getId() != null) {
                 return byBidId.getId();
             }
             // 2) 回退兼容：若不是 bidId，再按 audit_task 主键(id)解释
-            AuditTask byAuditId = auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
-                    .eq(AuditTask::getId, numericId)
-                    .eq(AuditTask::getTenantId, tenantId));
+            AuditTask byAuditId = auditTaskMapper.selectOne(new QueryWrapper<AuditTask>()
+                    .eq("id", numericId)
+                    .eq("tenant_id", tenantId));
             if (byAuditId != null && byAuditId.getId() != null) {
                 return byAuditId.getId();
             }
+            if (TenantScope.requiredTenantId() != null) {
+                throw TenantScope.resourceNotFound();
+            }
             throw new RuntimeException("审核任务不存在");
         } catch (NumberFormatException ignore) {
-            LambdaQueryWrapper<AuditTask> wrapper = new LambdaQueryWrapper<>();
-            wrapper.eq(AuditTask::getTaskId, auditIdOrTaskId)
-                    .eq(AuditTask::getTenantId, tenantId)
+            QueryWrapper<AuditTask> wrapper = new QueryWrapper<>();
+            wrapper.eq("task_id", auditIdOrTaskId)
+                    .eq("tenant_id", tenantId)
                     .last("LIMIT 1");
             AuditTask task = auditTaskMapper.selectOne(wrapper);
             if (task == null || task.getId() == null) {
+                if (TenantScope.requiredTenantId() != null) {
+                    throw TenantScope.resourceNotFound();
+                }
                 throw new RuntimeException("审核任务不存在");
             }
             return task.getId();

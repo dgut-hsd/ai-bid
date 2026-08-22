@@ -40,8 +40,7 @@ spring:
     baseline-on-migrate: true
   sql:
     init:
-      mode: always
-      schema-locations: classpath:audit_task_event.sql,classpath:trace_schema.sql
+      mode: never
   servlet:
     encoding:
       charset: UTF-8
@@ -109,6 +108,7 @@ audit:
     poll-delay-ms: 500
     max-retry: 3
     dlq-stream-key: queue:audit:tasks:dlq
+    dlq-list-key: queue:audit:tasks:list-dlq
   sse:
     replay-max-events: 100
   async:

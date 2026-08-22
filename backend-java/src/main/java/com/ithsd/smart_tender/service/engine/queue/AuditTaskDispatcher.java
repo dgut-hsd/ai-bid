@@ -1,5 +1,5 @@
 package com.ithsd.smart_tender.service.engine.queue;
 
 public interface AuditTaskDispatcher {
-    void dispatch(String taskId);
+    void dispatch(AuditTaskEnvelope envelope);
 }

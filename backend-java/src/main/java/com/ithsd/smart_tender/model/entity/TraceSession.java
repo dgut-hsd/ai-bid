@@ -19,6 +19,9 @@ public class TraceSession implements Serializable {
     @TableId(value = "id", type = IdType.ASSIGN_UUID)
     private String id;
 
+    @TableField("tenant_id")
+    private Long tenantId;
+
     @TableField("task_id")
     private String taskId;
 
@@ -80,6 +83,9 @@ public class TraceSession implements Serializable {
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
+
+    public Long getTenantId() { return tenantId; }
+    public void setTenantId(Long tenantId) { this.tenantId = tenantId; }
 
     public String getTaskId() { return taskId; }
     public void setTaskId(String taskId) { this.taskId = taskId; }
