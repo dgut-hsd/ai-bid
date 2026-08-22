@@ -31,6 +31,7 @@ public class AsyncConfig {
         executor.setTaskDecorator(TenantContext::wrap);
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(10);
+        executor.setTaskDecorator(TenantContext::wrap);
         executor.setRejectedExecutionHandler((r, e) -> {
             log.warn("audit executor rejected task, active={}, queueSize={}", e.getActiveCount(), e.getQueue().size());
             new ThreadPoolExecutor.CallerRunsPolicy().rejectedExecution(r, e);

@@ -77,6 +77,7 @@ pub async fn ingest_file(
     filename: &str,
     category: &str,
     applicable_scope: &str,
+    tenant_id: &str,
 ) -> Result<IngestResult> {
     let start = std::time::Instant::now();
     let store = QdrantStore::from_env().context("Qdrant 初始化失败")?;
@@ -85,14 +86,16 @@ pub async fn ingest_file(
     let filename = filename.to_string();
     let category = category.to_string();
     let applicable_scope = applicable_scope.to_string();
+    let tenant_id = tenant_id.to_string();
 
     // CPU 密集阶段移出异步 worker：解析/切分/嵌入均为同步重计算
     // （闭包 move 输入，外面仍需 filename/category 构造返回值，故先克隆）
     let prep_filename = filename.clone();
     let prep_category = category.clone();
     let prep_scope = applicable_scope.clone();
+    let prep_tenant = tenant_id.clone();
     let prepared = tokio::task::spawn_blocking(move || {
-        prepare_ingest_blocking(upload_path, &prep_filename, &prep_category, &prep_scope)
+        prepare_ingest_blocking(upload_path, &prep_filename, &prep_category, &prep_scope, &prep_tenant)
     })
     .await
     .context("入库阻塞任务执行失败")?
@@ -120,6 +123,7 @@ fn prepare_ingest_blocking(
     filename: &str,
     category: &str,
     applicable_scope: &str,
+    tenant_id: &str,
 ) -> Result<PreparedIngest> {
     let tmp_dir = data_path_str("tmp");
     fs::create_dir_all(&tmp_dir).context("创建临时目录失败")?;
@@ -286,6 +290,7 @@ fn prepare_ingest_blocking(
             page_start: meta.page_start,
             page_end: meta.page_end,
             ingested_at: now.clone(),
+            tenant_id: tenant_id.to_string(),
         })
         .collect();
 

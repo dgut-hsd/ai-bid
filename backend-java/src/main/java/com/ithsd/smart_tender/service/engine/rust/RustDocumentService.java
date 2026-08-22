@@ -95,7 +95,9 @@ public class RustDocumentService {
                 .eq("id", bidId)
                 .eq("tenant_id", tenantId));
         if (tender == null) {
-            throw TenantScope.resourceNotFound();
+            // 缓存查找：查不到一律返回 null（不抛异常），保证 recover 的优雅降级。
+            // 租户隔离由上面的 tenant_id 谓词保证，与"返回 null"无关，跨租户不会泄露。
+            return null;
         }
         return tender.getRustDocumentId();
     }

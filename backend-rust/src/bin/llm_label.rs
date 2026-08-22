@@ -1,4 +1,4 @@
-﻿//! LLM 预标注工具 —— 对规则引擎漏检（FN）条款调用 qwen-plus 进行分类标注，
+//! LLM 预标注工具 —— 对规则引擎漏检（FN）条款调用 qwen-plus 进行分类标注，
 //! 生成结构化 JSON 用于人工复核和规则库扩充。
 //!
 //! ## P3a: LLM 预标注 Prompt Schema
@@ -262,10 +262,10 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let specific_ids: HashSet<String> = if !args.is_empty() {
-        eprintln!("??  模式：仅对指定 finding_id 运行 LLM：{:?}", args);
+        eprintln!("!!  模式：仅对指定 finding_id 运行 LLM：{:?}", args);
         args.iter().cloned().collect()
     } else {
-        eprintln!("??  模式：对 blind-v2 全部 11 个 FN 条款运行 LLM 预标注");
+        eprintln!("!!  模式：对 blind-v2 全部 11 个 FN 条款运行 LLM 预标注");
         FN_FINDING_IDS.iter().map(|s| s.to_string()).collect()
     };
 

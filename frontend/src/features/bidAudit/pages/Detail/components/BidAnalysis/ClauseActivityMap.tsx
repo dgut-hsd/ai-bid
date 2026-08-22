@@ -375,7 +375,7 @@ const SectionTreeNodeView: React.FC<{
                       title={`跳转到第 ${clause.pageNumber} 页`}
                       onClick={(e) => {
                         e.stopPropagation();
-                        onLocateIssuePage(clause.pageNumber);
+onLocateIssuePage(clause.pageNumber!);
                       }}
                     >
                       p.{clause.pageNumber}
@@ -437,7 +437,7 @@ function stripEmoji(s: string): string {
 /** 单个 trace 事件行 — 可点击展开详情 */
 const TraceEventRow: React.FC<{ ev: TraceEvent }> = ({ ev }) => {
   const [expanded, setExpanded] = useState(false);
-  const p = ev.payload as Record<string, unknown> | undefined;
+  const p = ev.payload as Record<string, any> | undefined;
   const hasDetail = !!p && (
     ev.event_type === 'agent_thought' || ev.event_type === 'tool_call' ||
     ev.event_type === 'tool_result' || ev.event_type === 'output_finding' ||
@@ -473,15 +473,15 @@ const TraceEventRow: React.FC<{ ev: TraceEvent }> = ({ ev }) => {
       {expanded && hasDetail && p && (
         <div style={{ padding: '4px 8px 6px 28px', fontSize: 10 }}>
           {/* agent_thought: 完整推理 */}
-          {ev.event_type === 'agent_thought' && p.content && (
+          {ev.event_type === 'agent_thought' && typeof p.content === 'string' ? (
             <div style={{
               padding: '4px 8px', background: '#fffbe6', border: '1px solid #ffe58f',
               borderRadius: 3, maxHeight: 180, overflowY: 'auto', whiteSpace: 'pre-wrap',
               wordBreak: 'break-word', color: '#595959', lineHeight: '16px',
             }}>
-              {String(p.content)}
+              {p.content}
             </div>
-          )}
+          ) : null}
           {/* tool_call: 完整参数 */}
           {ev.event_type === 'tool_call' && p.arguments && (
             <div style={{
@@ -499,7 +499,7 @@ const TraceEventRow: React.FC<{ ev: TraceEvent }> = ({ ev }) => {
           {/* tool_result: 内容预览 */}
           {ev.event_type === 'tool_result' && (
             <>
-              {p.text_preview && (
+              {Boolean(p.text_preview) && (
                 <div style={{
                   padding: '4px 8px', background: '#f6ffed', border: '1px solid #b7eb8f',
                   borderRadius: 3, maxHeight: 150, overflowY: 'auto', whiteSpace: 'pre-wrap',
@@ -544,7 +544,7 @@ const TraceEventRow: React.FC<{ ev: TraceEvent }> = ({ ev }) => {
               <span>📥 {String(p.tokens_input ?? '-')} in</span>
               <span>📤 {String(p.tokens_output ?? '-')} out</span>
               <span>⏱ {String(p.duration_ms ?? '-')}ms</span>
-              {p.tools_called && <span>🔧 {String((p.tools_called as string[]).join(', ') || '(无)')}</span>}
+              {Boolean(p.tools_called) && <span>🔧 {String((p.tools_called as string[]).join(', ') || '(无)')}</span>}
             </div>
           )}
         </div>

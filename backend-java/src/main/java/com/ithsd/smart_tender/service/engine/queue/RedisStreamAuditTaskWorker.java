@@ -71,8 +71,14 @@ public class RedisStreamAuditTaskWorker {
         try {
             envelope = AuditTaskEnvelope.fromRedisFields(record.getValue());
         } catch (IllegalArgumentException ex) {
-            log.warn("discarding invalid audit task envelope from redis stream, messageId={}"
+            // 旧格式在途任务（字段为驼峰 taskId 等）解析失败：勿静默 ACK，原样落入 DLQ 再 ACK
+            log.warn("routing unparseable/legacy audit task to DLQ, messageId={}"
                     , record.getId().getValue(), ex);
+            Map<String, String> fields = new LinkedHashMap<>();
+            record.getValue().forEach((k, v) -> fields.put(String.valueOf(k), String.valueOf(v)));
+            fields.put("reason", ex.getMessage() == null ? "unparseable/legacy payload" : ex.getMessage());
+            redisTemplate.opsForStream().add(
+                    MapRecord.<String, String, String>create(queueProperties.getDlqStreamKey(), fields));
             ack(record.getId().getValue());
             return;
         }

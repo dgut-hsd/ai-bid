@@ -49,6 +49,7 @@ impl AgentRegistry {
                 ],
                 tool_names: &[
                     "web_search",
+                    "search_knowledge_base",
                     "search_document",
                     "read_section",
                     "output_finding",
@@ -57,6 +58,8 @@ impl AgentRegistry {
                     "compare_with_template",
                     // 数值/计算校验
                     "validate_calculation",
+                    // 版本差异对比
+                    "compare_versions",
                 ],
             },
         );
@@ -135,6 +138,8 @@ impl AgentRegistry {
                     // 义务提取识别排他性组合
                     "extract_obligations",
                     "check_cross_reference",
+                    // 模板残骸检测
+                    "detect_boilerplate",
                 ],
             },
         );
@@ -236,7 +241,7 @@ impl AgentRegistry {
                 default_max_turns: 8,
                 complexity: AgentComplexity::Low,
                 section_keywords: &[], // Coordinator 按需调用，不参与路由
-                tool_names: &["web_search", "search_document", "output_finding"],
+tool_names: &["web_search", "search_knowledge_base", "search_document", "output_finding", "output_verification_batch"],
             },
         );
 
@@ -426,6 +431,26 @@ mod tests {
         assert_eq!(config.name, "FactCheckAgent");
         assert_eq!(config.default_max_turns, 10);
         assert!(!config.tool_names.is_empty());
+    }
+
+    /// 知识库检索工具的权限授予集成测试：
+    /// 需要引用本地法规原文的 Agent（FactCheck / LegalVerify）
+    /// 必须被授予 search_knowledge_base 工具权限，否则工具注册了也无法被调用。
+    #[test]
+    fn test_search_knowledge_base_granted_to_relevant_agents() {
+        let registry = AgentRegistry::builtin();
+
+        let fact_check = registry.get(AgentId::FactCheck).unwrap();
+        assert!(
+            fact_check.tool_names.contains(&"search_knowledge_base"),
+            "FactCheckAgent 必须被授予 search_knowledge_base"
+        );
+
+        let legal_verify = registry.get(AgentId::LegalVerify).unwrap();
+        assert!(
+            legal_verify.tool_names.contains(&"search_knowledge_base"),
+            "LegalVerifyAgent 必须被授予 search_knowledge_base"
+        );
     }
 
     #[test]

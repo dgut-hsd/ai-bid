@@ -25,6 +25,9 @@
 //! 每个 Agent 获得独立的 LLM 客户端和工具集。
 
 use crate::agents::bus::AgentBus;
+use crate::agents::execution_control::{
+    ExecutionStage, GlobalExecutionLimiter, ReviewExecutionControl,
+};
 use crate::agents::react_loop::{LlmClient, ReActLoop};
 use crate::agents::registry::AgentRegistry;
 use crate::agents::review_event::{FindingChange, FindingLifecycle, ReviewEvent, ReviewEventBus};
@@ -48,6 +51,29 @@ fn severity_str(s: &RiskSeverity) -> &'static str {
         RiskSeverity::Low => "low",
         RiskSeverity::Info => "info",
     }
+}
+
+struct AgentTaskOutput {
+    findings: Vec<RiskFinding>,
+    successful_clauses: usize,
+    failed_clauses: Vec<ClauseExecutionFailure>,
+}
+
+struct ExecuteAgentsOutput {
+    findings: Vec<RiskFinding>,
+    execution_summary: ExecutionSummary,
+}
+
+/// 取消尚未完成的 Agent，同时取回取消前已经完成但尚未轮询的结果。
+async fn abort_and_drain_agent_tasks(
+    join_set: &mut JoinSet<AgentTaskOutput>,
+) -> Vec<Result<(tokio::task::Id, AgentTaskOutput), tokio::task::JoinError>> {
+    join_set.abort_all();
+    let mut results = Vec::new();
+    while let Some(result) = join_set.join_next_with_id().await {
+        results.push(result);
+    }
+    results
 }
 
 // ─── 批量搜索辅助函数 ────────────────────────────────────────────
@@ -168,6 +194,7 @@ pub struct Coordinator {
     metrics: Option<Arc<Mutex<crate::metrics::MetricsCollector>>>,
     /// ★ 跨 Agent 共享搜索缓存（避免不同 Agent 重复搜索相同的法规）
     pub shared_search_cache: Arc<Mutex<HashMap<(String, String), serde_json::Value>>>,
+    global_execution_limiter: Arc<GlobalExecutionLimiter>,
 }
 
 impl Coordinator {
@@ -204,6 +231,7 @@ impl Coordinator {
             review_events: None,
             metrics: None,
             shared_search_cache,
+            global_execution_limiter: Arc::new(GlobalExecutionLimiter::from_env()),
         };
 
         // 启动时加载已有动态 Agent
@@ -215,6 +243,11 @@ impl Coordinator {
         }
 
         coordinator
+    }
+
+    pub fn with_global_execution_limiter(mut self, limiter: Arc<GlobalExecutionLimiter>) -> Self {
+        self.global_execution_limiter = limiter;
+        self
     }
 
     /// 设置 SSE 实时推送通道。
@@ -291,6 +324,19 @@ impl Coordinator {
             message: "关键词路由中...".to_string(),
         });
         let routing = self.route_clauses(clauses);
+        let routed_clause_ids: HashSet<&str> = routing
+            .values()
+            .flatten()
+            .map(|clause| clause.chunk_id.as_str())
+            .collect();
+        let unrouted_clauses: Vec<&ReviewClause> = clauses
+            .iter()
+            .filter(|clause| !routed_clause_ids.contains(clause.chunk_id.as_str()))
+            .collect();
+        let effective_tasks = routing.values().map(Vec::len).sum();
+        let execution_control = self
+            .global_execution_limiter
+            .start_review(effective_tasks, clauses.len());
 
         // [2] PRELOAD: 所有 Chunk 节点写入 SessionGraph
         self.preload_chunks(clauses);
@@ -313,7 +359,21 @@ impl Coordinator {
             total_phases: 7,
             message: "批量预搜索法规中...".to_string(),
         });
-        self.batch_search_phase(clauses).await;
+        let batch_timeout = execution_control
+            .pipeline_remaining()
+            .unwrap_or_default()
+            .min(execution_control.limits().batch_search_timeout);
+        if tokio::time::timeout(
+            batch_timeout,
+            self.batch_search_phase(clauses, execution_control.clone()),
+        )
+        .await
+        .is_err()
+        {
+            execution_control
+                .record_stage_failure(ExecutionStage::BatchSearch, "BatchSearch 阶段超过 120 秒");
+            execution_control.record_pipeline_timeout_if_expired();
+        }
 
         // ── 指标：BatchSearch 阶段耗时 ──
         let batch_search_duration = phase_start.elapsed().as_millis() as u64;
@@ -348,7 +408,25 @@ impl Coordinator {
                 status: "running".to_string(),
             });
         }
-        let all_findings = self.execute_agents(&routing).await;
+        let execution = self
+            .execute_agents(&routing, execution_control.clone())
+            .await?;
+        let mut execution_summary = execution.execution_summary;
+        if !unrouted_clauses.is_empty() {
+            execution_summary.status = ReviewExecutionStatus::PartialFailed;
+            execution_summary
+                .failed_clauses
+                .extend(
+                    unrouted_clauses
+                        .into_iter()
+                        .map(|clause| ClauseExecutionFailure {
+                            agent_id: "Router".to_string(),
+                            clause_id: clause.chunk_id.clone(),
+                            message: "条款未命中任何已启用 Agent 的路由关键词".to_string(),
+                        }),
+                );
+        }
+        let all_findings = execution.findings;
 
         // ── 指标：Execute 阶段耗时 + per-agent finding 统计 ──
         let exec_duration = phase_start.elapsed().as_millis() as u64;
@@ -450,32 +528,53 @@ impl Coordinator {
         });
 
         // [5] LEGAL VERIFY: 对抗法条验证
-        let legal_verify_count = if self.config.enable_legal_verify {
-            emit(&ReviewEvent::Phase {
-                phase: crate::agents::review_event::PipelinePhase::LegalVerify,
-                phase_index: 4,
-                total_phases: 7,
-                message: "法条引用对抗验证中...".to_string(),
-            });
-            let lv_count = self.legal_verify(&mut merged).await;
-            // 逐条确认通过验证的 finding（进入 L1 主视图）
-            // B-2 已在 execute_agents 发射 finding_added；此处改用 finding_updated 避免重复，
-            // 并保留"法条验证通过 → 确认为 Verified"的语义（update 而非 re-add）
-            for f in merged.iter().filter(|f| !f.no_risk) {
-                emit(&ReviewEvent::FindingUpdated {
-                    risk_id: f.risk_id.clone(),
-                    changes: vec![FindingChange {
-                        field: "lifecycle".to_string(),
-                        old_value: None,
-                        new_value: Some("verified".to_string()),
-                    }],
-                    reason: "法条验证通过，确认为有效风险".to_string(),
+        execution_control.record_pipeline_timeout_if_expired();
+        let legal_verify_count =
+            if self.config.enable_legal_verify && !execution_control.pipeline_expired() {
+                emit(&ReviewEvent::Phase {
+                    phase: crate::agents::review_event::PipelinePhase::LegalVerify,
+                    phase_index: 4,
+                    total_phases: 7,
+                    message: "法条引用对抗验证中...".to_string(),
                 });
-            }
-            lv_count
-        } else {
-            0
-        };
+                let legal_timeout = execution_control
+                    .pipeline_remaining()
+                    .unwrap_or_default()
+                    .min(execution_control.limits().legal_verify_timeout);
+                let lv_count = match tokio::time::timeout(
+                    legal_timeout,
+                    self.legal_verify(&mut merged, execution_control.clone()),
+                )
+                .await
+                {
+                    Ok(count) => {
+                        // B-2 已在 execute_agents 发射 finding_added；此处更新生命周期，避免重复新增。
+                        for f in merged.iter().filter(|f| !f.no_risk) {
+                            emit(&ReviewEvent::FindingUpdated {
+                                risk_id: f.risk_id.clone(),
+                                changes: vec![FindingChange {
+                                    field: "lifecycle".to_string(),
+                                    old_value: None,
+                                    new_value: Some("verified".to_string()),
+                                }],
+                                reason: "法条验证通过，确认为有效风险".to_string(),
+                            });
+                        }
+                        count
+                    }
+                    Err(_) => {
+                        execution_control.record_stage_failure(
+                            ExecutionStage::LegalVerify,
+                            "LegalVerify 阶段超过 5 分钟",
+                        );
+                        execution_control.record_pipeline_timeout_if_expired();
+                        0
+                    }
+                };
+                lv_count
+            } else {
+                0
+            };
 
         // ── 指标：LegalVerify 阶段耗时 ──
         let lv_duration = phase_start.elapsed().as_millis() as u64;
@@ -519,7 +618,24 @@ impl Coordinator {
             total_phases: 7,
             message: "高风险辩论裁决中...".to_string(),
         });
-        self.debate_high_risk(&mut merged).await;
+        execution_control.record_pipeline_timeout_if_expired();
+        if !execution_control.pipeline_expired() {
+            let debate_timeout = execution_control
+                .pipeline_remaining()
+                .unwrap_or_default()
+                .min(execution_control.limits().debate_timeout);
+            if tokio::time::timeout(
+                debate_timeout,
+                self.debate_high_risk(&mut merged, execution_control.clone()),
+            )
+            .await
+            .is_err()
+            {
+                execution_control
+                    .record_stage_failure(ExecutionStage::Debate, "Debate 阶段超过 5 分钟");
+                execution_control.record_pipeline_timeout_if_expired();
+            }
+        }
         // Debate/LegalVerify 都可能回写 severity 或 Critical。最终出口再次执行
         // 统一分类、证据准入和跨 Agent 去重，禁止下游阶段绕过政策。
         merged = self.merge_findings_v3(merged, &emit).retained;
@@ -586,10 +702,23 @@ impl Coordinator {
             lv = legal_verify_count,
         );
 
+        let mut execution_summary = execution_summary;
+        execution_summary.failed_stages = execution_control.failed_stages();
+        execution_summary.budget = Some(execution_control.budget_usage());
+        if !execution_summary.failed_stages.is_empty()
+            || execution_summary
+                .budget
+                .as_ref()
+                .is_some_and(|budget| budget.exhausted)
+        {
+            execution_summary.status = ReviewExecutionStatus::PartialFailed;
+        }
+
         Ok(CoordinatorOutput {
             findings,
             routing_summary,
             graph_snapshot,
+            execution_summary,
         })
     }
 
@@ -614,7 +743,20 @@ impl Coordinator {
                └──────────────────────────────────────────────────────────────┘"
         );
 
-        let blind_spot_findings = self.blind_spot_scan().await;
+        let execution_control = self.global_execution_limiter.start_review(10, 10);
+        let blind_spot_findings = match tokio::time::timeout(
+            execution_control.limits().legal_verify_timeout,
+            self.blind_spot_scan(execution_control.clone()),
+        )
+        .await
+        {
+            Ok(findings) => findings,
+            Err(_) => {
+                execution_control
+                    .record_stage_failure(ExecutionStage::BlindSpot, "BlindSpot 阶段超过 5 分钟");
+                Vec::new()
+            }
+        };
 
         let real_count = blind_spot_findings.iter().filter(|f| !f.no_risk).count();
         let no_risk_count = blind_spot_findings.iter().filter(|f| f.no_risk).count();
@@ -728,7 +870,11 @@ impl Coordinator {
     /// risk_type 映射以及 clause 文本关键词中提取。
     /// 直接调用 web_search 工具（不经过 LLM），搜索结果供 Execute Phase
     /// Agent 直接引用，避免每个 Agent 独立重复搜索。
-    async fn batch_search_phase(&self, clauses: &[ReviewClause]) {
+    async fn batch_search_phase(
+        &self,
+        clauses: &[ReviewClause],
+        execution_control: Arc<ReviewExecutionControl>,
+    ) {
         let hypotheses = self.graph.get_hypotheses();
         if hypotheses.is_empty() {
             eprintln!("  [BATCH_SEARCH] 无 Scout Hypothesis，从 clause 文本提取搜索 query...");
@@ -807,8 +953,10 @@ impl Coordinator {
 
         for (query, category) in unique_queries {
             let tf = tools_factory.clone();
+            let control = execution_control.clone();
             join_set.spawn(async move {
-                let tools = tf();
+                let _permit = control.acquire().await?;
+                let tools = tf().into_controlled(control);
                 let result = match tools.get("web_search") {
                     Some(web_search_tool) => {
                         web_search_tool
@@ -820,7 +968,7 @@ impl Coordinator {
                     }
                     None => Err(anyhow::anyhow!("web_search 工具未注册")),
                 };
-                (query, category, result)
+                Ok::<_, anyhow::Error>((query, category, result))
             });
         }
 
@@ -828,15 +976,18 @@ impl Coordinator {
         let mut query_results: HashMap<(String, String), serde_json::Value> = HashMap::new();
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
-                Ok((query, category, Ok(result))) => {
+                Ok(Ok((query, category, Ok(result)))) => {
                     eprintln!("  [BATCH_SEARCH] ✅ {} [{}]", query, category);
                     query_results.insert((query, category), result);
                 }
-                Ok((query, _category, Err(e))) => {
+                Ok(Ok((query, _category, Err(e)))) => {
                     eprintln!("  [BATCH_SEARCH] ❌ {} — {}", query, e);
                 }
+                Ok(Err(e)) => {
+                    eprintln!("  [BATCH_SEARCH] ❌ 并发控制失败: {}", e);
+                }
                 Err(e) => {
-                    eprintln!("  [BATCH_SEARCH] ❌ join error: {}", e);
+                    eprintln!("  [BATCH_SEARCH] ? join error: {}", e);
                 }
             }
         }
@@ -910,7 +1061,7 @@ impl Coordinator {
     /// 将条款按关键词路由到各 Agent。
     ///
     /// 每条条款可以被多个 Agent 审查（一对多路由）。
-    /// 路由策略：条款文本包含 Agent 的 `section_keywords` 中任一关键词 → 分配。
+    /// 路由策略：仅当 Agent 配置了 `section_keywords`，且条款文本命中任一关键词时分配。
     fn route_clauses(&self, clauses: &[ReviewClause]) -> HashMap<AgentId, Vec<ReviewClause>> {
         let mut routing: HashMap<AgentId, Vec<ReviewClause>> = HashMap::new();
 
@@ -918,23 +1069,27 @@ impl Coordinator {
             let text_lower = clause.text.to_lowercase();
             for agent_id in &self.config.enabled_agents {
                 // 获取 Agent 的路由关键词（固定 Agent 从 registry，动态 Agent 从 dynamic_definitions）
-                let keywords: Vec<String> = match agent_id {
+                let keywords: Option<Vec<String>> = match agent_id {
                     AgentId::Dynamic(id) => self
                         .dynamic_definitions
                         .get(id)
-                        .map(|d| d.section_keywords.clone())
-                        .unwrap_or_default(),
+                        .map(|d| d.section_keywords.clone()),
                     _ => self
                         .registry
                         .get(agent_id.clone())
-                        .map(|d| d.section_keywords.iter().map(|s| s.to_string()).collect())
-                        .unwrap_or_default(),
+                        .map(|d| d.section_keywords.iter().map(|s| s.to_string()).collect()),
                 };
 
-                let should_route = keywords.is_empty() // BlindSpot/LegalVerify 等不参与路由
-                    || keywords
-                        .iter()
-                        .any(|kw| text_lower.contains(&kw.to_lowercase()));
+                let should_route = match keywords {
+                    Some(keywords) => {
+                        !keywords.is_empty()
+                            && keywords
+                                .iter()
+                                .any(|kw| text_lower.contains(&kw.to_lowercase()))
+                    }
+                    // 缺失定义必须进入 Execute 的显式失败上报，不能静默丢弃。
+                    None => true,
+                };
 
                 if should_route {
                     routing
@@ -945,30 +1100,18 @@ impl Coordinator {
             }
         }
 
-        // 确保每条条款至少分配给一个已启用的 Agent（优先 FactCheck）
-        let has_factcheck = self.config.enabled_agents.contains(&AgentId::FactCheck);
-        for clause in clauses {
-            let mut assigned = false;
-            for clauses_list in routing.values() {
-                if clauses_list.iter().any(|c| c.chunk_id == clause.chunk_id) {
-                    assigned = true;
-                    break;
-                }
-            }
-            if !assigned && has_factcheck {
-                routing
-                    .entry(AgentId::FactCheck)
-                    .or_default()
-                    .push(clause.clone());
-            } else if !assigned {
-                // Fallback: 分配给第一个启用的 Agent
-                if let Some(first_enabled) = self.config.enabled_agents.first() {
+        // 仅当调用方显式选择 FactCheck 时，才允许它承接未命中的条款。
+        if self.config.enabled_agents.contains(&AgentId::FactCheck) {
+            for clause in clauses {
+                let assigned = routing.values().any(|agent_clauses| {
+                    agent_clauses.iter().any(|c| c.chunk_id == clause.chunk_id)
+                });
+                if !assigned {
                     routing
-                        .entry(first_enabled.clone())
+                        .entry(AgentId::FactCheck)
                         .or_default()
                         .push(clause.clone());
                 }
-                // 如果没有启用的 Agent,条款被静默丢弃(不会崩溃)
             }
         }
 
@@ -1027,8 +1170,10 @@ impl Coordinator {
     async fn execute_agents(
         &self,
         routing: &HashMap<AgentId, Vec<ReviewClause>>,
-    ) -> Vec<RiskFinding> {
-        let mut handles = Vec::new();
+        execution_control: Arc<ReviewExecutionControl>,
+    ) -> Result<ExecuteAgentsOutput> {
+        let mut join_set = JoinSet::new();
+        let mut task_meta = HashMap::new();
 
         for (agent_id, clauses) in routing {
             if clauses.is_empty() {
@@ -1038,6 +1183,10 @@ impl Coordinator {
             let agent_id = agent_id.clone();
             let clauses = clauses.clone();
             let clauses_total = clauses.len();
+            let clause_ids = clauses
+                .iter()
+                .map(|c| c.chunk_id.clone())
+                .collect::<Vec<_>>();
             let bus = self.bus.clone();
             let graph = self.graph.clone();
             let trace = self.trace.clone();
@@ -1057,8 +1206,9 @@ impl Coordinator {
             let tools_factory = self.tools_factory.clone();
             let max_parallel = self.config.max_parallel_clauses;
             let shared_search_cache = self.shared_search_cache.clone();
+            let execution_control = execution_control.clone();
 
-            let handle = tokio::spawn(async move {
+            let abort_handle = join_set.spawn(async move {
                 let agent_name = agent_id.to_string();
                 if let Some(def) = registry_def {
                     eprintln!(
@@ -1068,7 +1218,7 @@ impl Coordinator {
                         max_parallel,
                     );
 
-                    let findings = crate::agents::react_loop::review_clauses_parallel(
+                    let report = crate::agents::react_loop::review_clauses_parallel_report(
                         &clauses,
                         {
                             let def = def.clone();
@@ -1097,14 +1247,26 @@ impl Coordinator {
                                 agent
                             }
                         },
-                        &*llm_factory,
-                        &*tools_factory,
+                        llm_factory,
+                        tools_factory,
                         max_parallel,
                         Some(graph_for_write.clone()),
                         review_events.clone(),
                         &agent_name,
+                        Some(execution_control),
                     )
                     .await;
+
+                    let findings = report.findings;
+                    let failed_clauses: Vec<ClauseExecutionFailure> = report
+                        .failed_clauses
+                        .into_iter()
+                        .map(|failure| ClauseExecutionFailure {
+                            agent_id: agent_name.clone(),
+                            clause_id: failure.clause_id,
+                            message: failure.message,
+                        })
+                        .collect();
 
                     let raw_findings = findings.iter().filter(|f| !f.no_risk).count();
                     eprintln!(
@@ -1120,36 +1282,40 @@ impl Coordinator {
                             clauses_done: clauses_total,
                             clauses_total,
                             raw_findings,
-                            status: "completed".to_string(),
-                    });
-                }
-
-                // B-2 流式发射：每个 Agent 审查完成即把其发现推向前端
-                // 不再等 MERGE/LEGAL_VERIFY，也不依赖 enable_legal_verify 开关
-                // 重复/被合并项由 merge_findings_v3 后续发 finding_removed 自动清理
-                if let Some(ref events) = review_events {
-                    for f in findings.iter().filter(|f| !f.no_risk) {
-                        events.emit(&ReviewEvent::FindingAdded {
-                            risk_id: f.risk_id.clone(),
-                            severity: severity_str(&f.severity).to_string(),
-                            is_critical: f.is_critical,
-                            critical_reason: f.critical_reason.clone(),
-                            risk_type: f.risk_type.clone(),
-                            agent: f.agent.clone(),
-                            confidence: f.confidence as f64,
-                            clause_ids: f.clause_ids.clone(),
-                            source_quote: f.source_quote.chars().take(500).collect(),
-                            legal_basis: f.legal_basis.clone(),
-                            reason: f.reason.chars().take(500).collect(),
-                            suggestion: f.suggestion.clone(),
-                            lifecycle: FindingLifecycle::Verified,
-                            page_number: f.page_number,
-                            section_path: f.section_path.clone(),
+                            status: if failed_clauses.is_empty() {
+                                "completed".to_string()
+                            } else {
+                                "partial_failed".to_string()
+                            },
                         });
                     }
-                }
 
-                // 将发现写入 SessionGraph（共享工作区）
+                    // B-2 流式发射：每个 Agent 审查完成即把其发现推向前端
+                    // 不再等 MERGE/LEGAL_VERIFY，也不依赖 enable_legal_verify 开关
+                    // 重复/被合并项由 merge_findings_v3 后续发 finding_removed 自动清理
+                    if let Some(ref events) = review_events {
+                        for f in findings.iter().filter(|f| !f.no_risk) {
+                            events.emit(&ReviewEvent::FindingAdded {
+                                risk_id: f.risk_id.clone(),
+                                severity: severity_str(&f.severity).to_string(),
+                                is_critical: f.is_critical,
+                                critical_reason: f.critical_reason.clone(),
+                                risk_type: f.risk_type.clone(),
+                                agent: f.agent.clone(),
+                                confidence: f.confidence as f64,
+                                clause_ids: f.clause_ids.clone(),
+                                source_quote: f.source_quote.chars().take(500).collect(),
+                                legal_basis: f.legal_basis.clone(),
+                                reason: f.reason.chars().take(500).collect(),
+                                suggestion: f.suggestion.clone(),
+                                lifecycle: FindingLifecycle::Verified,
+                                page_number: f.page_number,
+                                section_path: f.section_path.clone(),
+                            });
+                        }
+                    }
+
+                    // 将发现写入 SessionGraph（共享工作区）
                     for finding in &findings {
                         if !finding.no_risk {
                             let law_refs = finding.legal_basis.clone();
@@ -1166,28 +1332,184 @@ impl Coordinator {
                         }
                     }
 
-                    findings
+                    AgentTaskOutput {
+                        findings,
+                        successful_clauses: report.successful_clauses,
+                        failed_clauses,
+                    }
                 } else {
                     eprintln!("  [EXECUTE] 错误: Agent 定义未找到: {}", agent_name);
-                    Vec::new()
+                    AgentTaskOutput {
+                        findings: Vec::new(),
+                        successful_clauses: 0,
+                        failed_clauses: clauses
+                            .iter()
+                            .map(|clause| ClauseExecutionFailure {
+                                agent_id: agent_name.clone(),
+                                clause_id: clause.chunk_id.clone(),
+                                message: "Agent 定义未找到".to_string(),
+                            })
+                            .collect(),
+                    }
                 }
             });
 
-            handles.push(handle);
+            task_meta.insert(abort_handle.id(), (agent_id_str, clause_ids));
         }
 
         // 等待所有 Agent 完成
         let mut all_findings = Vec::new();
-        for handle in handles {
-            match handle.await {
-                Ok(findings) => all_findings.extend(findings),
-                Err(e) => {
+        let total_agents = task_meta.len();
+        let mut successful_agents = 0;
+        let mut failed_agents = Vec::new();
+        let mut failed_clauses = Vec::new();
+        let execute_timeout = execution_control
+            .pipeline_remaining()
+            .unwrap_or_default()
+            .min(execution_control.limits().execute_timeout);
+        let deadline = tokio::time::Instant::now() + execute_timeout;
+
+        while !join_set.is_empty() {
+            match tokio::time::timeout_at(deadline, join_set.join_next_with_id()).await {
+                Ok(Some(Ok((task_id, report)))) => {
+                    let (agent_id, _) = task_meta
+                        .remove(&task_id)
+                        .unwrap_or_else(|| ("unknown-agent".to_string(), Vec::new()));
+                    if report.successful_clauses > 0 {
+                        successful_agents += 1;
+                    } else {
+                        failed_agents.push(AgentExecutionFailure {
+                            agent_id: agent_id.clone(),
+                            message: "Agent 所有条款均执行失败".to_string(),
+                        });
+                    }
+                    // 失败占位 finding 仅用于兼容单 Agent 调用，不得混入可展示审核结果。
+                    all_findings.extend(
+                        report
+                            .findings
+                            .into_iter()
+                            .filter(|finding| !finding.truncated),
+                    );
+                    failed_clauses.extend(report.failed_clauses);
+                }
+                Ok(Some(Err(e))) => {
+                    let (agent_id, clause_ids) = task_meta
+                        .remove(&e.id())
+                        .unwrap_or_else(|| ("unknown-agent".to_string(), Vec::new()));
                     eprintln!("  [EXECUTE] Agent task panicked: {}", e);
+                    let message = format!("Agent task 异常终止: {}", e);
+                    failed_agents.push(AgentExecutionFailure {
+                        agent_id: agent_id.clone(),
+                        message: message.clone(),
+                    });
+                    failed_clauses.extend(clause_ids.into_iter().map(|clause_id| {
+                        ClauseExecutionFailure {
+                            agent_id: agent_id.clone(),
+                            clause_id,
+                            message: message.clone(),
+                        }
+                    }));
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    // abort_all 不会取消已经完成但尚未轮询的任务；必须带 task_id
+                    // 排空 JoinSet 并先保留这些结果，再把真正未完成的任务记为超时。
+                    for result in abort_and_drain_agent_tasks(&mut join_set).await {
+                        match result {
+                            Ok((task_id, report)) => {
+                                let (agent_id, _) = task_meta
+                                    .remove(&task_id)
+                                    .unwrap_or_else(|| ("unknown-agent".to_string(), Vec::new()));
+                                if report.successful_clauses > 0 {
+                                    successful_agents += 1;
+                                } else {
+                                    failed_agents.push(AgentExecutionFailure {
+                                        agent_id: agent_id.clone(),
+                                        message: "Agent 所有条款均执行失败".to_string(),
+                                    });
+                                }
+                                all_findings.extend(
+                                    report
+                                        .findings
+                                        .into_iter()
+                                        .filter(|finding| !finding.truncated),
+                                );
+                                failed_clauses.extend(report.failed_clauses);
+                            }
+                            Err(e) if e.is_cancelled() => {
+                                // 保留 task_meta，稍后统一记录为超时取消。
+                            }
+                            Err(e) => {
+                                let (agent_id, clause_ids) = task_meta
+                                    .remove(&e.id())
+                                    .unwrap_or_else(|| ("unknown-agent".to_string(), Vec::new()));
+                                let message = format!("Agent task 异常终止: {}", e);
+                                failed_agents.push(AgentExecutionFailure {
+                                    agent_id: agent_id.clone(),
+                                    message: message.clone(),
+                                });
+                                failed_clauses.extend(clause_ids.into_iter().map(|clause_id| {
+                                    ClauseExecutionFailure {
+                                        agent_id: agent_id.clone(),
+                                        clause_id,
+                                        message: message.clone(),
+                                    }
+                                }));
+                            }
+                        }
+                    }
+                    execution_control.record_stage_failure(
+                        ExecutionStage::Execute,
+                        "Agent Execute 阶段超过 20 分钟",
+                    );
+                    execution_control.record_pipeline_timeout_if_expired();
+                    for (_task_id, (agent_id, clause_ids)) in task_meta.drain() {
+                        let message = "Agent Execute 阶段超时取消".to_string();
+                        failed_agents.push(AgentExecutionFailure {
+                            agent_id: agent_id.clone(),
+                            message: message.clone(),
+                        });
+                        failed_clauses.extend(clause_ids.into_iter().map(|clause_id| {
+                            ClauseExecutionFailure {
+                                agent_id: agent_id.clone(),
+                                clause_id,
+                                message: message.clone(),
+                            }
+                        }));
+                    }
+                    break;
                 }
             }
         }
 
-        all_findings
+        if total_agents > 0 && successful_agents == 0 {
+            return Err(anyhow::anyhow!(
+                "所有已路由 Agent 均执行失败: {}",
+                failed_agents
+                    .iter()
+                    .map(|failure| failure.agent_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        let status = if failed_agents.is_empty() && failed_clauses.is_empty() {
+            ReviewExecutionStatus::Completed
+        } else {
+            ReviewExecutionStatus::PartialFailed
+        };
+
+        Ok(ExecuteAgentsOutput {
+            findings: all_findings,
+            execution_summary: ExecutionSummary {
+                status,
+                successful_agents,
+                failed_agents,
+                failed_clauses,
+                failed_stages: Vec::new(),
+                budget: None,
+            },
+        })
     }
 
     // ── [4] MERGE: 合并 + 去重 ───────────────────────────────
@@ -1470,8 +1792,8 @@ impl Coordinator {
     ///   ├─ Step A: LegalDomain 自动分类（纯规则，零 LLM）
     ///   │
     ///   ├─ Step B: 规则预筛（已知法规直通，跳过 LLM）
-    ///   │    ├─ 法条名称/条款号合法 → ✅ 直接通过（~70%）
-    ///   │    └─ 无法判断 → ➡ 进入 LLM 批量验证
+    ///   │    ├─ 法条名称/条款号合法 → ? 直接通过（~70%）
+    ///   │    └─ 无法判断 → ? 进入 LLM 批量验证
     ///   │
     ///   ├─ Step C: LLM 批量验证（按 legal_domain 分组）
     ///   │    每组一条 prompt → 一次 ReAct → 输出该组所有验证结论
@@ -1483,7 +1805,11 @@ impl Coordinator {
     ///
     /// - 旧版：每条 finding 独立 ReAct（N 条 = N 个 ReAct = 6N 次 LLM 调用）
     /// - 新版：按领域分组批量（N 条 ≈ 3-5 组 ≈ 3-5 个 ReAct ≈ 12-20 次 LLM 调用）
-    async fn legal_verify(&self, findings: &mut [RiskFinding]) -> usize {
+    async fn legal_verify(
+        &self,
+        findings: &mut [RiskFinding],
+        execution_control: Arc<ReviewExecutionControl>,
+    ) -> usize {
         let to_verify: Vec<RiskFinding> = findings
             .iter()
             .filter(|f| {
@@ -1518,6 +1844,12 @@ impl Coordinator {
         let legal_def = self.registry.get(AgentId::LegalVerify);
 
         for (domain, group) in &domain_groups {
+            // Other 有专用逐条验证路径；仅在 Agent 可用时跳过批量路径，
+            // Agent 未注册时仍保留下面的静态 fallback，避免漏验证。
+            if *domain == LegalDomain::Other && legal_def.is_some() {
+                continue;
+            }
+
             // ── Step B: 规则预筛 ──
             let (verified, ambiguous): (Vec<&RiskFinding>, Vec<&RiskFinding>) = group
                 .iter()
@@ -1528,7 +1860,7 @@ impl Coordinator {
                 for original in findings.iter_mut() {
                     if original.risk_id == vf.risk_id {
                         original.reason.push_str(&format!(
-                            "\n[LegalVerify] ✅ 规则直通验证通过 (domain={})。",
+                            "\n[LegalVerify] ? 规则直通验证通过 (domain={})。",
                             domain
                         ));
                         total_verified += 1;
@@ -1574,12 +1906,26 @@ impl Coordinator {
                     "output_verification_batch".into(),
                 ];
 
-                let llm = (self.llm_factory)();
+                let _permit = match execution_control.acquire().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        execution_control.record_stage_failure(
+                            ExecutionStage::LegalVerify,
+                            format!("获取并发名额失败: {}", e),
+                        );
+                        continue;
+                    }
+                };
+                let llm = crate::agents::execution_control::ControlledLlmClient::wrap(
+                    (self.llm_factory)(),
+                    execution_control.clone(),
+                );
                 let mut tools = (self.tools_factory)();
                 // 注册批量验证工具（替换掉单条 output_finding）
                 tools.register(Box::new(
                     crate::agents::tools::output_verification_batch::OutputVerificationBatchTool,
                 ));
+                let tools = tools.into_controlled(execution_control.clone());
 
                 let agent = ReActLoop::new(config, llm, tools)
                     .with_print_lock(self.print_lock.clone())
@@ -1601,7 +1947,7 @@ impl Coordinator {
                                     if original.risk_id == entry.risk_id {
                                         if entry.is_valid && entry.confidence >= 0.5 {
                                             original.reason.push_str(&format!(
-                                                "\n[LegalVerify] ✅ 批量验证通过 (domain={}, confidence={:.2})。",
+                                                "\n[LegalVerify] ? 批量验证通过 (domain={}, confidence={:.2})。",
                                                 domain, entry.confidence
                                             ));
                                             // 回写修正后的法条引用
@@ -1613,7 +1959,7 @@ impl Coordinator {
                                             original.severity = RiskSeverity::Info;
                                             original.clear_criticality();
                                             original.reason.push_str(&format!(
-                                                "\n[LegalVerify] ❌ 批量验证未通过 (domain={}, confidence={:.2}): {}。已降级。",
+                                                "\n[LegalVerify] ? 批量验证未通过 (domain={}, confidence={:.2}): {}。已降级。",
                                                 domain, entry.confidence, entry.reason
                                             ));
                                         }
@@ -1623,7 +1969,7 @@ impl Coordinator {
                                 }
                             }
                         } else {
-                            eprintln!("    [{}] ⚠️ 批量结果 JSON 解析失败", domain);
+                            eprintln!("    [{}] !! 批量结果 JSON 解析失败", domain);
                         }
                         break; // 只解析第一个 BATCH_VERIFICATION 标记
                     }
@@ -1648,7 +1994,7 @@ impl Coordinator {
                                 original.clear_criticality();
                                 original
                                     .reason
-                                    .push_str("\n[LegalVerify] ❌ 置信度不足，已降级 (fallback)。");
+                                    .push_str("\n[LegalVerify] ? 置信度不足，已降级 (fallback)。");
                             }
                             total_verified += 1;
                             break;
@@ -1680,8 +2026,21 @@ impl Coordinator {
                 };
 
                 let config = def.to_agent_config();
-                let llm = (self.llm_factory)();
-                let tools = (self.tools_factory)();
+                let _permit = match execution_control.acquire().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        execution_control.record_stage_failure(
+                            ExecutionStage::LegalVerify,
+                            format!("获取并发名额失败: {}", e),
+                        );
+                        continue;
+                    }
+                };
+                let llm = crate::agents::execution_control::ControlledLlmClient::wrap(
+                    (self.llm_factory)(),
+                    execution_control.clone(),
+                );
+                let tools = (self.tools_factory)().into_controlled(execution_control.clone());
                 let agent = ReActLoop::new(config, llm, tools)
                     .with_print_lock(self.print_lock.clone())
                     .with_search_cache(self.shared_search_cache.clone());
@@ -1703,10 +2062,10 @@ impl Coordinator {
                                 original.clear_criticality();
                                 original
                                     .reason
-                                    .push_str("\n[LegalVerify] ❌ 法条引用验证未通过，已降级。");
+                                    .push_str("\n[LegalVerify] ? 法条引用验证未通过，已降级。");
                             } else {
                                 original.reason.push_str(&format!(
-                                    "\n[LegalVerify] ✅ 法条引用验证通过 (confidence={:.2})。",
+                                    "\n[LegalVerify] ? 法条引用验证通过 (confidence={:.2})。",
                                     vf.confidence
                                 ));
                                 if !vf.legal_basis.is_empty() {
@@ -1837,7 +2196,7 @@ impl Coordinator {
             f.reason.chars().take(500).collect::<String>()
         ));
         task.push_str("请对上述法条引用进行对抗性验证，使用 output_finding 输出验证结论。\n\n");
-        task.push_str("🛑 无论验证通过或修正，每条 legal_basis 必须包含可验证的 URL 链接（Markdown 格式: [法条名](URL)），禁止输出纯文本法条名。");
+        task.push_str("? 无论验证通过或修正，每条 legal_basis 必须包含可验证的 URL 链接（Markdown 格式: [法条名](URL)），禁止输出纯文本法条名。");
         task
     }
 
@@ -1881,7 +2240,7 @@ impl Coordinator {
         }
 
         task.push_str("---\n\n");
-        task.push_str("🛑 现在调用 **output_verification_batch** 输出所有验证结论。\n");
+        task.push_str("? 现在调用 **output_verification_batch** 输出所有验证结论。\n");
         task.push_str("每条 corrected_legal_basis 必须包含可验证的 URL 链接（Markdown 格式: [法条名](URL)）。");
         task
     }
@@ -1896,10 +2255,10 @@ impl Coordinator {
                     finding.clear_criticality();
                     finding
                         .reason
-                        .push_str("\n[LegalVerify] ❌ 法条引用置信度不足，已降级 (fallback)。");
+                        .push_str("\n[LegalVerify] ? 法条引用置信度不足，已降级 (fallback)。");
                 } else {
                     finding.reason.push_str(&format!(
-                        "\n[LegalVerify] ✅ 法条引用置信度充足 (fallback, confidence={:.2})。",
+                        "\n[LegalVerify] ? 法条引用置信度充足 (fallback, confidence={:.2})。",
                         finding.confidence
                     ));
                 }
@@ -1912,7 +2271,11 @@ impl Coordinator {
     /// 对 High + confidence ≤ 0.85 的发现启动 DebateAgent 辩论。
     /// ≤ 0.85（非 < 0.85）——LLM 的自然置信度下限约 0.85，
     /// 含等号能捕获所有"不够确信"的 High 发现。
-    async fn debate_high_risk(&self, findings: &mut [RiskFinding]) {
+    async fn debate_high_risk(
+        &self,
+        findings: &mut [RiskFinding],
+        execution_control: Arc<ReviewExecutionControl>,
+    ) {
         let candidates: Vec<RiskFinding> = findings
             .iter()
             .filter(|f| {
@@ -1972,21 +2335,31 @@ impl Coordinator {
                     tier_max_turns: 8,
                 };
 
-                let def = debate_def.unwrap();
-                let config = def.to_agent_config();
-                let llm = (self.llm_factory)();
-                let tools = (self.tools_factory)();
-                let agent = ReActLoop::new(config, llm, tools)
-                    .with_print_lock(self.print_lock.clone())
-                    .with_search_cache(self.shared_search_cache.clone());
+                let def = debate_def.unwrap().clone();
+                let llm_factory = self.llm_factory.clone();
+                let tools_factory = self.tools_factory.clone();
+                let print_lock = self.print_lock.clone();
+                let search_cache = self.shared_search_cache.clone();
+                let control = execution_control.clone();
                 let risk_id = candidate.risk_id.clone();
-                tokio::spawn(async move { (risk_id, agent.review(&[debate_clause]).await) })
+                tokio::spawn(async move {
+                    let _permit = control.acquire().await?;
+                    let llm = crate::agents::execution_control::ControlledLlmClient::wrap(
+                        llm_factory(),
+                        control.clone(),
+                    );
+                    let tools = tools_factory().into_controlled(control);
+                    let agent = ReActLoop::new(def.to_agent_config(), llm, tools)
+                        .with_print_lock(print_lock)
+                        .with_search_cache(search_cache);
+                    Ok::<_, anyhow::Error>((risk_id, agent.review(&[debate_clause]).await))
+                })
             })
             .collect();
 
         for handle in debate_handles {
             match handle.await {
-                Ok((risk_id, debate_findings)) => {
+                Ok(Ok((risk_id, debate_findings))) => {
                     for df in &debate_findings {
                         if df.no_risk {
                             continue;
@@ -2010,6 +2383,9 @@ impl Coordinator {
                             );
                         }
                     }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("  [DEBATE] 并发控制失败: {}", e);
                 }
                 Err(e) => {
                     eprintln!("  [DEBATE] spawn 失败: {}", e);
@@ -2076,7 +2452,7 @@ impl Coordinator {
             ));
             for (cid, pairs) in &snapshot.contradicts {
                 for (other_cid, reason) in pairs {
-                    ctx.push_str(&format!("- {} ↔ {} : {}\n", cid, other_cid, reason));
+                    ctx.push_str(&format!("- {} ? {} : {}\n", cid, other_cid, reason));
                 }
             }
             ctx.push('\n');
@@ -2138,7 +2514,10 @@ impl Coordinator {
     /// 2. 构建图上下文 → 构造 ReviewClause 列表（上限 50 条）
     /// 3. 启动 BlindSpotAgent ReAct 循环
     /// 4. ReAct 无产出或出错时回退到 blind_spot_fallback()
-    async fn blind_spot_scan(&self) -> Vec<RiskFinding> {
+    async fn blind_spot_scan(
+        &self,
+        execution_control: Arc<ReviewExecutionControl>,
+    ) -> Vec<RiskFinding> {
         let snapshot = self.graph.snapshot();
 
         // 识别候选条款：未审查 OR (≤1 Agent 审查且无风险发现)
@@ -2224,8 +2603,18 @@ impl Coordinator {
         let def = blind_spot_def.unwrap();
         let mut config = def.to_agent_config();
         config.system_prompt = format!("{}\n\n{}", config.system_prompt, graph_context);
-        let llm = (self.llm_factory)();
-        let tools = (self.tools_factory)();
+        let _permit = match execution_control.acquire().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                eprintln!("  [BLINDSPOT] 获取并发名额失败: {}", e);
+                return Vec::new();
+            }
+        };
+        let llm = crate::agents::execution_control::ControlledLlmClient::wrap(
+            (self.llm_factory)(),
+            execution_control.clone(),
+        );
+        let tools = (self.tools_factory)().into_controlled(execution_control);
         let graph = self.graph.clone();
         let bus = self.bus.clone();
         let trace = self.trace.clone();
@@ -2556,7 +2945,7 @@ impl Coordinator {
             .count();
 
         eprintln!(
-            "  [TRIAGE] 🔴High={} 🟡Medium={} 🟢Low={} ℹ️Info={}",
+            "  [TRIAGE] ?High={} ?Medium={} ?Low={} ??Info={}",
             high, medium, low, info
         );
 
@@ -2834,6 +3223,111 @@ fn dedup_legal_basis(a: &[String], b: &[String]) -> Vec<String> {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+    use crate::agents::react_loop::{ChatMessage, LlmResponse, ToolCall, ToolChoice};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct NoRiskLlm;
+
+    struct ConditionalPanicLlm;
+
+    struct CountingLegalVerifyLlm {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for NoRiskLlm {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _tool_choice: &ToolChoice,
+        ) -> Result<LlmResponse> {
+            Ok(LlmResponse {
+                content: None,
+                thought: None,
+                tool_calls: vec![ToolCall {
+                    id: "test-output".to_string(),
+                    name: "output_finding".to_string(),
+                    arguments: serde_json::json!({
+                        "findings": [],
+                        "has_more": false,
+                        "coverage": [],
+                    }),
+                }],
+                usage: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for ConditionalPanicLlm {
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            tools: &[serde_json::Value],
+            tool_choice: &ToolChoice,
+        ) -> Result<LlmResponse> {
+            let should_panic = messages.iter().any(|message| match message {
+                ChatMessage::User { content } => content.contains("模拟条款崩溃"),
+                _ => false,
+            });
+            if should_panic {
+                panic!("模拟单条条款 task 崩溃");
+            }
+            NoRiskLlm.chat(messages, tools, tool_choice).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for CountingLegalVerifyLlm {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            tools: &[serde_json::Value],
+            _tool_choice: &ToolChoice,
+        ) -> Result<LlmResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let is_batch = tools.iter().any(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(|name| name.as_str())
+                    == Some("output_verification_batch")
+            });
+            let tool_call = if is_batch {
+                ToolCall {
+                    id: "test-batch-output".to_string(),
+                    name: "output_verification_batch".to_string(),
+                    arguments: serde_json::json!({
+                        "verifications": [{
+                            "risk_id": "R_OTHER",
+                            "is_valid": true,
+                            "corrected_legal_basis": [],
+                            "confidence": 0.9,
+                            "reason": "批量验证通过",
+                        }],
+                    }),
+                }
+            } else {
+                let mut finding = make_test_finding("ignored", "ignored", "LegalVerify");
+                finding.confidence = 0.9;
+                ToolCall {
+                    id: "test-single-output".to_string(),
+                    name: "output_finding".to_string(),
+                    arguments: serde_json::json!({
+                        "findings": [finding],
+                        "has_more": false,
+                        "coverage": [],
+                    }),
+                }
+            };
+
+            Ok(LlmResponse {
+                content: None,
+                thought: None,
+                tool_calls: vec![tool_call],
+                usage: None,
+            })
+        }
+    }
 
     /// 创建一个只用于离线测试的 Coordinator。
     /// llm_factory 和 tools_factory 是 dummy（不应被调用）。
@@ -2855,7 +3349,25 @@ mod tests {
             review_events: None,
             metrics: None,
             shared_search_cache: Arc::new(Mutex::new(HashMap::new())),
+            global_execution_limiter: Arc::new(GlobalExecutionLimiter::new(
+                crate::agents::execution_control::ExecutionLimits::default(),
+            )),
         }
+    }
+
+    fn make_runtime_coordinator(
+        config: CoordinatorConfig,
+        llm_factory: Arc<dyn Fn() -> Box<dyn LlmClient> + Send + Sync>,
+    ) -> Coordinator {
+        Coordinator::new(
+            config,
+            AgentRegistry::builtin(),
+            llm_factory,
+            Arc::new(ToolRegistry::new),
+            Arc::new(AgentBus::new(4)),
+            Arc::new(SessionGraph::new()),
+            Arc::new(Mutex::new(TraceLog::new())),
+        )
     }
 
     fn make_test_clause(id: &str, text: &str) -> ReviewClause {
@@ -2903,6 +3415,183 @@ mod tests {
             section_path: None,
             context: None,
         }
+    }
+
+    #[tokio::test]
+    async fn other_legal_domain_is_verified_only_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = calls.clone();
+        let coordinator = make_runtime_coordinator(
+            CoordinatorConfig::default(),
+            Arc::new(move || {
+                Box::new(CountingLegalVerifyLlm {
+                    calls: factory_calls.clone(),
+                })
+            }),
+        );
+        let mut findings = vec![make_test_finding("R_OTHER", "ch_other", "FactCheck")];
+        let execution_control = coordinator.global_execution_limiter.start_review(1, 1);
+
+        let verified_count = coordinator
+            .legal_verify(&mut findings, execution_control)
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "Other 不应重复调用 LLM");
+        assert_eq!(verified_count, 1, "Other 不应重复累计验证计数");
+        assert_eq!(
+            findings[0].reason.matches("[LegalVerify]").count(),
+            1,
+            "Other 不应重复拼接验证原因"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_factory_panic_must_fail_review() {
+        let mut config = CoordinatorConfig::default();
+        config.enabled_agents = vec![AgentId::FactCheck];
+        let coordinator =
+            make_runtime_coordinator(config, Arc::new(|| panic!("模拟 LLM 客户端初始化崩溃")));
+
+        let result = coordinator
+            .review(&[make_test_clause("ch_panic", "封面格式要求")])
+            .await;
+
+        assert!(result.is_err(), "Agent 崩溃时不得返回审核成功");
+    }
+
+    #[tokio::test]
+    async fn one_successful_agent_and_one_failed_agent_is_partial_failed() {
+        let mut config = CoordinatorConfig::default();
+        config.enabled_agents = vec![
+            AgentId::FactCheck,
+            AgentId::Dynamic("missing-agent".to_string()),
+        ];
+        let coordinator = make_runtime_coordinator(config, Arc::new(|| Box::new(NoRiskLlm)));
+
+        let mut output = coordinator
+            .review(&[make_test_clause("ch_partial", "封面格式要求")])
+            .await
+            .expect("至少一个 Agent 成功时应保留审核结果");
+        output.graph_snapshot = None;
+        let json = serde_json::to_value(output).expect("结果应可序列化");
+
+        assert_eq!(
+            json["execution_summary"]["status"], "partial_failed",
+            "部分 Agent 失败必须显式标记"
+        );
+        assert_eq!(json["execution_summary"]["successful_agents"], 1);
+        assert_eq!(
+            json["execution_summary"]["failed_agents"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn one_failed_clause_keeps_agent_result_but_marks_partial_failed() {
+        let mut config = CoordinatorConfig::default();
+        config.enabled_agents = vec![AgentId::FactCheck];
+        let coordinator =
+            make_runtime_coordinator(config, Arc::new(|| Box::new(ConditionalPanicLlm)));
+
+        let output = coordinator
+            .review(&[
+                make_test_clause("ch_ok", "封面格式要求"),
+                make_test_clause("ch_failed", "格式要求：模拟条款崩溃"),
+            ])
+            .await
+            .expect("仍有成功条款时应保留 Agent 结果");
+
+        assert_eq!(
+            output.execution_summary.status,
+            ReviewExecutionStatus::PartialFailed
+        );
+        assert_eq!(output.execution_summary.successful_agents, 1);
+        assert!(output.execution_summary.failed_agents.is_empty());
+        assert_eq!(output.execution_summary.failed_clauses.len(), 1);
+        assert!(output.findings.iter().all(|finding| !finding.truncated));
+        assert_eq!(
+            output.execution_summary.failed_clauses[0].clause_id,
+            "ch_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_drain_keeps_completed_unpolled_agent_result() {
+        let mut join_set = JoinSet::new();
+        let completed = join_set.spawn(async {
+            AgentTaskOutput {
+                findings: Vec::new(),
+                successful_clauses: 1,
+                failed_clauses: Vec::new(),
+            }
+        });
+        join_set.spawn(async {
+            std::future::pending::<()>().await;
+            unreachable!("挂起任务应被取消")
+        });
+        while !completed.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let results = abort_and_drain_agent_tasks(&mut join_set).await;
+
+        assert!(results.iter().any(|result| matches!(
+            result,
+            Ok((_, report)) if report.successful_clauses == 1
+        )));
+        assert!(results.iter().any(|result| matches!(
+            result,
+            Err(error) if error.is_cancelled()
+        )));
+    }
+
+    #[tokio::test]
+    async fn unmatched_clause_is_recorded_as_partial_failure() {
+        let mut config = CoordinatorConfig::default();
+        config.enabled_agents = vec![AgentId::SemanticRisk];
+        let coordinator = make_runtime_coordinator(config, Arc::new(|| Box::new(NoRiskLlm)));
+
+        let output = coordinator
+            .review(&[
+                make_test_clause("ch_matched", "指定品牌要求"),
+                make_test_clause("ch_unmatched", "本文件是采购文件组成部分"),
+            ])
+            .await
+            .expect("已路由条款成功时应保留审核结果");
+
+        assert_eq!(
+            output.execution_summary.status,
+            ReviewExecutionStatus::PartialFailed
+        );
+        assert!(
+            output
+                .execution_summary
+                .failed_clauses
+                .iter()
+                .any(|failure| {
+                    failure.clause_id == "ch_unmatched" && failure.agent_id == "Router"
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn all_unmatched_clauses_are_not_reported_completed() {
+        let mut config = CoordinatorConfig::default();
+        config.enabled_agents = vec![AgentId::SemanticRisk];
+        let coordinator = make_runtime_coordinator(config, Arc::new(|| Box::new(NoRiskLlm)));
+
+        let output = coordinator
+            .review(&[make_test_clause("ch_unmatched", "本文件是采购文件组成部分")])
+            .await
+            .expect("漏路由应通过结构化失败返回");
+
+        assert_eq!(
+            output.execution_summary.status,
+            ReviewExecutionStatus::PartialFailed
+        );
+        assert_eq!(output.execution_summary.failed_clauses.len(), 1);
     }
 
     // ── [1] ROUTE 测试 ───────────────────────────────────────
@@ -2982,21 +3671,23 @@ mod tests {
     fn test_route_empty_keywords_skip() {
         let mut config = CoordinatorConfig::default();
         // BlindSpot/LegalVerify/Debate 的 section_keywords 为空，不参与路由
-        config.enabled_agents = vec![AgentId::BlindSpot, AgentId::LegalVerify, AgentId::Debate];
+        config.enabled_agents = vec![
+            AgentId::BlindSpot,
+            AgentId::LegalVerify,
+            AgentId::Debate,
+            AgentId::Scout,
+        ];
         let registry = AgentRegistry::builtin();
         let coordinator = make_test_coordinator(config, registry);
 
         let clauses = vec![make_test_clause("ch_001", "任意文本")];
 
         let routing = coordinator.route_clauses(&clauses);
-        // 空 keywords → 命中（所有 clause 进入）→ 但由于 no Reviewer，fallback 到 FactCheck
-        // 实际逻辑：空 keywords 导致 should_route=true，但 FactCheck 不在 enabled_agents
-        // → 条款被分配给 BlindSpot/LegalVerify/Debate（空 keywords 的 Agent）
-        assert!(!routing.is_empty());
+        assert!(routing.is_empty(), "空关键词 Agent 不得进入普通 Execute");
     }
 
     #[test]
-    fn test_route_fallback_to_factcheck() {
+    fn test_route_does_not_enable_unrequested_factcheck() {
         let mut config = CoordinatorConfig::default();
         config.enabled_agents = vec![AgentId::SemanticRisk]; // 只有 SemanticRisk
         let registry = AgentRegistry::builtin();
@@ -3009,15 +3700,29 @@ mod tests {
         )];
 
         let routing = coordinator.route_clauses(&clauses);
-        // fallback: 即使 FactCheck 不在 enabled_agents，也应通过 fallback 逻辑分配
-        let factcheck_clauses = routing.get(&AgentId::FactCheck);
         assert!(
-            factcheck_clauses.is_some()
-                && factcheck_clauses
-                    .unwrap()
-                    .iter()
-                    .any(|c| c.chunk_id == "ch_006"),
-            "无匹配条款应 fallback 到 FactCheckAgent"
+            routing.is_empty(),
+            "无匹配时不得启用未被请求的 FactCheckAgent"
+        );
+    }
+
+    #[test]
+    fn test_route_fallback_to_requested_factcheck() {
+        let mut config = CoordinatorConfig::default();
+        config.enabled_agents = vec![AgentId::SemanticRisk, AgentId::FactCheck];
+        let registry = AgentRegistry::builtin();
+        let coordinator = make_test_coordinator(config, registry);
+        let clauses = vec![make_test_clause(
+            "ch_006",
+            "本文件为竞争性磋商文件的组成部分",
+        )];
+
+        let routing = coordinator.route_clauses(&clauses);
+
+        assert_eq!(
+            routing.get(&AgentId::FactCheck).map(Vec::len),
+            Some(1),
+            "显式请求 FactCheck 时应保留兜底路由"
         );
     }
 

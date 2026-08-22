@@ -1,7 +1,6 @@
 package com.ithsd.smart_tender.service.engine.rust;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
-import com.ithsd.smart_tender.common.TenantAuthException;
 import com.ithsd.smart_tender.common.TenantContext;
 import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.mapper.TenderMapper;
@@ -17,7 +16,6 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.verify;
@@ -53,13 +51,8 @@ class RustDocumentServiceTenantIsolationTest {
 
     @Test
     void cachedDocumentLookup_hidesAnotherTenantsTender() {
-        assertThatThrownBy(() -> documentService.getCachedDocumentId(88L))
-                .isInstanceOf(TenantAuthException.class)
-                .satisfies(error -> {
-                    TenantAuthException tenantError = (TenantAuthException) error;
-                    assertThat(tenantError.getStatus()).isEqualTo(404);
-                    assertThat(tenantError.getErrorCode()).isEqualTo("RESOURCE_NOT_FOUND");
-                });
+        // 缓存查找契约：跨租户/查不到一律返回 null（不抛 404），保证 recover 优雅降级。
+        assertThat(documentService.getCachedDocumentId(88L)).isNull();
 
         ArgumentCaptor<QueryWrapper<Tender>> query = ArgumentCaptor.forClass(QueryWrapper.class);
         verify(tenderMapper).selectOne(query.capture());

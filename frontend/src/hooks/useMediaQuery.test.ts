@@ -1,3 +1,4 @@
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useMediaQuery, useIsMobile } from './useMediaQuery';
 
@@ -50,7 +51,7 @@ describe('useMediaQuery', () => {
    });
 
    it('reacts to a dynamic viewport change via the change event listener', () => {
-      const listeners = new Map<string, (event: Partial<MediaQueryListEvent>) => void>();
+      const listeners = new Map<string, (event: MediaQueryListEvent) => void>();
 
       window.matchMedia = vi.fn().mockImplementation((query: string) => ({
          matches: false,

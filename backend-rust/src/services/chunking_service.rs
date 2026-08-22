@@ -961,14 +961,19 @@ fn extract_table_keys(text: &str) -> Vec<String> {
 ///
 /// 调用时机：`chunk_sections()` 之后、序列化到 JSON 或存入 `DocumentState` 之前。
 pub fn populate_bbox_refs(chunks: &mut [Chunk], raw_doc: &RawDocument) {
-    let mut block_map: HashMap<String, (usize, crate::domain::raw_document::BBox, f64)> =
+    let mut block_map: HashMap<String, (usize, crate::domain::raw_document::BBox, f64, usize)> =
         HashMap::new();
 
     for page in &raw_doc.pages {
         for block in &page.blocks {
             block_map.insert(
                 block.id.clone(),
-                (page.page_index, block.bbox.clone(), page.width),
+                (
+                    page.page_index,
+                    block.bbox.clone(),
+                    page.width,
+                    block.text.chars().count(),
+                ),
             );
         }
     }
@@ -976,12 +981,13 @@ pub fn populate_bbox_refs(chunks: &mut [Chunk], raw_doc: &RawDocument) {
     for chunk in chunks.iter_mut() {
         let mut refs: Vec<BlockBBox> = Vec::with_capacity(chunk.source_block_ids.len());
         for block_id in &chunk.source_block_ids {
-            if let Some((page, bbox, page_width)) = block_map.get(block_id) {
+            if let Some((page, bbox, page_width, char_count)) = block_map.get(block_id) {
                 refs.push(BlockBBox {
                     block_id: block_id.clone(),
                     page: *page,
                     bbox: bbox.clone(),
                     page_width: *page_width,
+                    char_count: *char_count,
                 });
             }
         }

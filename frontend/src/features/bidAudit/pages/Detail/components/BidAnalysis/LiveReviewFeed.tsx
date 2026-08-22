@@ -11,13 +11,12 @@ import {
   LinkOutlined,
   BarChartOutlined,
   CaretRightOutlined,
-  CodeOutlined,
   FileTextOutlined,
 } from '@ant-design/icons';
 import type { TraceEvent } from '@/types/audit';
 import { AGENT_LABELS } from '@/types/audit';
 
-const { Text, Paragraph } = Typography;
+const { Text } = Typography;
 
 interface Props {
   events: TraceEvent[];
@@ -60,7 +59,7 @@ const isImportant = (type: string) => type === 'output_finding';
 // ─── 事件详情面板（可展开） ──────────────────────────────────
 
 const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
-  const p = event.payload as Record<string, unknown> | undefined;
+  const p = event.payload as Record<string, any> | undefined;
   if (!p) return null;
 
   // agent_thought: 完整推理内容
@@ -91,7 +90,6 @@ const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
   // tool_call: 完整参数
   if (event.event_type === 'tool_call' && p.arguments) {
     const args = p.arguments as Record<string, unknown>;
-    const toolName = (p.tool_name as string) || '';
     return (
       <div style={{ marginTop: 6 }}>
         <Text type="secondary" style={{ fontSize: 10, display: 'block', marginBottom: 2 }}>
@@ -126,11 +124,10 @@ const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
 
   // tool_result: 返回内容
   if (event.event_type === 'tool_result') {
-    const toolName = event.summary?.split(' ')[0] || event.summary || '';
     return (
       <div style={{ marginTop: 6 }}>
         {/* read_section 文本预览 */}
-        {p.text_preview && (
+        {Boolean(p.text_preview) && (
           <div>
             <Text type="secondary" style={{ fontSize: 10, display: 'block', marginBottom: 2 }}>
               📖 读取的条款文本 {p.truncated ? '(截取前2000字符)' : ''}：
@@ -198,7 +195,7 @@ const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
         )}
 
         {/* 通用 raw_preview */}
-        {p.raw_preview && !p.text_preview && (
+        {Boolean(p.raw_preview) && !p.text_preview && (
           <div>
             <Text type="secondary" style={{ fontSize: 10, display: 'block', marginBottom: 2 }}>
               📋 工具返回内容 {p.truncated ? '(截断)' : ''}：
@@ -242,7 +239,7 @@ const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
             ⚠️ 审查截断 — max_turns 耗尽，置信度低，建议人工复核
           </div>
         )}
-        {p.source_quote && (
+        {Boolean(p.source_quote) && (
           <div>
             <Text type="secondary" style={{ fontSize: 10 }}>
               <FileTextOutlined style={{ marginRight: 4 }} />原文摘录：
@@ -263,7 +260,7 @@ const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
             </div>
           </div>
         )}
-        {p.reason && (
+        {Boolean(p.reason) && (
           <div>
             <Text type="secondary" style={{ fontSize: 10 }}>
               <BulbOutlined style={{ marginRight: 4 }} />推理链：
@@ -286,7 +283,7 @@ const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
             </div>
           </div>
         )}
-        {p.legal_basis && Array.isArray(p.legal_basis) && (p.legal_basis as unknown[]).length > 0 && (
+        {Array.isArray(p.legal_basis) && (p.legal_basis as unknown[]).length > 0 && (
           <div>
             <Text type="secondary" style={{ fontSize: 10 }}>⚖️ 法规依据：</Text>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 2 }}>
@@ -296,7 +293,7 @@ const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
             </div>
           </div>
         )}
-        {p.citations && Array.isArray(p.citations) && (p.citations as unknown[]).length > 0 && (
+        {Array.isArray(p.citations) && (p.citations as unknown[]).length > 0 && (
           <div>
             <Text type="secondary" style={{ fontSize: 10 }}>🔗 搜索来源：</Text>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 2 }}>
@@ -313,7 +310,7 @@ const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
             </div>
           </div>
         )}
-        {p.case_refs && Array.isArray(p.case_refs) && (p.case_refs as unknown[]).length > 0 && (
+        {Array.isArray(p.case_refs) && (p.case_refs as unknown[]).length > 0 && (
           <div>
             <Text type="secondary" style={{ fontSize: 10 }}>📚 案例引用：</Text>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 2 }}>
@@ -323,7 +320,7 @@ const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
             </div>
           </div>
         )}
-        {p.suggestion && (
+        {Boolean(p.suggestion) && (
           <div>
             <Text type="secondary" style={{ fontSize: 10 }}>💡 修改建议：</Text>
             <div style={{
@@ -361,7 +358,7 @@ const EventDetail: React.FC<{ event: TraceEvent }> = ({ event }) => {
         <span>📥 输入 tokens: <Text strong style={{ color: '#722ed1' }}>{String(p.tokens_input ?? '-')}</Text></span>
         <span>📤 输出 tokens: <Text strong style={{ color: '#722ed1' }}>{String(p.tokens_output ?? '-')}</Text></span>
         <span>⏱ 耗时: <Text strong style={{ color: '#722ed1' }}>{String(p.duration_ms ?? '-')}ms</Text></span>
-        {p.tools_called && Array.isArray(p.tools_called) && (
+        {Array.isArray(p.tools_called) && (p.tools_called as string[]).length > 0 && (
           <span>🔧 工具: {(p.tools_called as string[]).join(', ') || '(纯文本)'}</span>
         )}
         {p.produced_finding !== undefined && (
@@ -399,7 +396,7 @@ const LiveReviewFeed: React.FC<Props> = ({ events }) => {
 
   // 判断事件是否有可展开的详情
   const hasDetail = (event: TraceEvent): boolean => {
-    const p = event.payload as Record<string, unknown> | undefined;
+    const p = event.payload as Record<string, any> | undefined;
     if (!p) return false;
     switch (event.event_type) {
       case 'agent_thought': return !!p.content;
@@ -440,7 +437,7 @@ const LiveReviewFeed: React.FC<Props> = ({ events }) => {
           const expanded = expandedKeys.has(idx);
 
           // tool_result: extract sources from payload
-          const p = event.payload as Record<string, unknown> | undefined;
+          const p = event.payload as Record<string, any> | undefined;
           const sources: SearchSource[] =
             isToolResult && p?.sources
               ? (p.sources as SearchSource[])

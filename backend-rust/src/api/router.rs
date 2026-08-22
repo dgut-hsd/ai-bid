@@ -372,6 +372,7 @@ fn hex_nibble(value: u8) -> Option<u8> {
             handlers::ReviewAccepted,
             handlers::ReviewResponse,
             handlers::ReviewResultResponse,
+            handlers::ReviewUsage,
             handlers::SearchResponse,
             handlers::SearchResultGroup,
             handlers::SearchHitDto,
@@ -490,6 +491,16 @@ pub fn build(state: AppState) -> Router {
             "/knowledge/ingest",
             post(knowledge_handlers::ingest_knowledge),
         )
+        // 知识库向量删除（Java 删除标准库文件时联动调用）
+        .route(
+            "/knowledge/document/:document_id",
+            delete(knowledge_handlers::delete_knowledge_document),
+        )
+        // 知识库检索（检索组）
+        .route(
+            "/knowledge/search",
+            post(knowledge_handlers::search_knowledge),
+        )
         // SSE 实时推送 + 异步审查结果
         .route(
             "/review/:doc_id/stream",
@@ -590,6 +601,9 @@ mod tests {
 
     fn document_router(config: InternalAuthConfig) -> Router {
         let state = AppState {
+            review_execution_limiter: Arc::new(
+                crate::agents::execution_control::GlobalExecutionLimiter::from_env(),
+            ),
             documents: Arc::new(tokio::sync::RwLock::new(HashMap::from([(
                 handlers::DocumentKey::new("100", "shared-doc"),
                 test_document_state(),
@@ -600,6 +614,7 @@ mod tests {
             embed_engine: "test".to_string(),
             review_event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             review_results: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            review_usages: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             review_errors: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             active_reviews: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         };
