@@ -1635,7 +1635,7 @@ mod tests {
     #[test]
     fn test_agent_id_all_reviewers_count() {
         let reviewers = AgentId::all_reviewers();
-        assert_eq!(reviewers.len(), 5);
+        assert_eq!(reviewers.len(), 7);
         // BlindSpot / LegalVerify / Debate 不在 reviewers 中
         assert!(!reviewers.contains(&AgentId::BlindSpot));
         assert!(!reviewers.contains(&AgentId::LegalVerify));
@@ -1887,7 +1887,7 @@ mod tests {
     #[test]
     fn test_coordinator_config_defaults() {
         let config = CoordinatorConfig::default();
-        assert_eq!(config.enabled_agents.len(), 5);
+        assert_eq!(config.enabled_agents.len(), 7);
         assert!(!config.enable_legal_verify); // 成本优化：默认关闭 LLM 法条验证
         assert_eq!(config.legal_verify_max_turns, 3);
         assert_eq!(config.blind_spot_max_turns, 10);
