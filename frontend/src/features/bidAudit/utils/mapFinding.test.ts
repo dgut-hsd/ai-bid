@@ -115,9 +115,9 @@ describe('mapBackendFinding', () => {
   it('maps citations with site_name → siteName', () => {
     const result = mapBackendFinding(completeBackendFinding as any);
     expect(result.citations).toHaveLength(1);
-    expect(result.citations[0].title).toBe('招标投标法');
-    expect(result.citations[0].url).toBe('http://example.com/law');
-    expect(result.citations[0].siteName).toBe('国家法律法规数据库');
+    expect(result.citations![0].title).toBe('招标投标法');
+    expect(result.citations![0].url).toBe('http://example.com/law');
+    expect(result.citations![0].siteName).toBe('国家法律法规数据库');
   });
 
   it('defaults to empty array when citations is null', () => {
@@ -175,15 +175,15 @@ describe('mapBackendFinding', () => {
   it('handles section_path: single element, multiple elements, empty, null', () => {
     const single = mapBackendFinding({ ...completeBackendFinding, section_path: ['第一章'] } as any);
     expect(single.anchorSection).toBe('第一章');
-    expect(single.location.sectionName).toBe('第一章');
+    expect(single.location!.sectionName).toBe('第一章');
 
     const empty = mapBackendFinding({ ...completeBackendFinding, section_path: [] } as any);
     expect(empty.anchorSection).toBeUndefined();
-    expect(empty.location.sectionName).toBe('');
+    expect(empty.location!.sectionName).toBe('');
 
     const nil = mapBackendFinding({ ...completeBackendFinding, section_path: null } as any);
     expect(nil.anchorSection).toBeUndefined();
-    expect(nil.location.sectionName).toBe('');
+    expect(nil.location!.sectionName).toBe('');
   });
 
   it('handles non-array legal_basis and case_refs gracefully', () => {
@@ -196,7 +196,7 @@ describe('mapBackendFinding', () => {
   it('handles negative page_number: anchorPage undefined, location preserves raw value', () => {
     const result = mapBackendFinding({ ...completeBackendFinding, page_number: -1 } as any);
     expect(result.anchorPage).toBeUndefined();
-    expect(result.location.pageNumber).toBe(-1);
+    expect(result.location!.pageNumber).toBe(-1);
   });
 
   it('sets default values for noRisk/truncated/tierEscalated when fields are missing', () => {
@@ -232,7 +232,7 @@ describe('mapBackendFindings', () => {
   it('maps each element in the array through mapBackendFinding', () => {
     const results = mapBackendFindings([completeBackendFinding, completeBackendFinding] as any);
     expect(results).toHaveLength(2);
-    results.forEach((r) => {
+results.forEach((r) => {
       expect(r.issueNo).toBe('RISK-001');
       expect(r.severity).toBe('high');
     });
@@ -271,7 +271,7 @@ describe('ensureAuditIssue', () => {
     expect(result.issueNo).toBe('RISK-001');
     expect(result.severity).toBe('high');
     expect(result.anchorPage).toBe(5);
-    expect(result.location.pageNumber).toBe(5);
+    expect(result.location!.pageNumber).toBe(5);
   });
 
   it('returns a frontend-format object as-is without re-mapping', () => {
