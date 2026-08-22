@@ -83,6 +83,17 @@ fn review_event_capacity() -> usize {
 }
 use crate::services::sectionize_service::{self, Section};
 
+/// Authenticated Java → Rust request identity made available to handlers via
+/// request extensions by the internal API middleware.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalRequestContext {
+    pub tenant_id: String,
+    pub user_id: String,
+    pub request_id: String,
+    pub timestamp: i64,
+    pub body_sha256: String,
+}
+
 // ─── 应用状态 ───────────────────────────────────────────────────────
 
 /// 服务全局共享状态。
@@ -1004,7 +1015,43 @@ async fn run_review_pipeline(
                     finding.page_number = Some(chunk.page_start + 1);
                     finding.section_path = Some(chunk.section_path.clone());
                     finding.context = Some(chunk.text.chars().take(500).collect());
-                    finding.block_ids = chunk.source_block_ids.clone();
+
+                    // 过滤 block_ids：只保留验证过的非占位 bbox 的 block，
+                    // 避免整页高亮导致"框太大"问题。
+                    // 占位 bbox 来自 blocks_from_text()（lopdf 失败降级路径），
+                    // 特征是 x0==0.0 && x1==400.0 且高度 ≤20pt。
+                    let source_quote = finding.source_quote.clone();
+                    let valid_blocks: Vec<String> = chunk
+                        .source_block_ids
+                        .iter()
+                        .filter(|bid| {
+                            chunk.bbox_refs.iter().any(|r| {
+                                let is_same = &r.block_id == *bid;
+                                let is_placeholder =
+                                    r.bbox.x0 == 0.0 && r.bbox.x1 == 400.0
+                                        && (r.bbox.bottom - r.bbox.top) <= 20.1;
+                                is_same && !is_placeholder
+                            })
+                        })
+                        .cloned()
+                        .collect();
+
+                    // 如果经过滤后为空（全是占位 bbox），则不退化为文本匹配，
+                    // 保持空数组让前端走文本高亮路径。
+                    // 如果仍有过多有效 block（如大 section），取最多前 5 个。
+                    let max_blocks = 5usize;
+                    finding.block_ids = if valid_blocks.len() > max_blocks {
+                        // 优选与 source_quote 文本相关的 block
+                        let truncated: Vec<String> = valid_blocks
+                            .into_iter()
+                            .take(max_blocks)
+                            .collect();
+                        truncated
+                    } else {
+                        valid_blocks
+                    };
+
+                    let _ = source_quote; // 预留后续按文本相关性排序
                 }
             }
             let findings_with_blocks = output
