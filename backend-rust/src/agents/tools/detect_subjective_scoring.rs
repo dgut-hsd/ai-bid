@@ -233,8 +233,8 @@ impl DetectSubjectiveScoringTool {
             }
 
             (s.to_string(), rl.to_string(), sugg)
-        } else if has_weak_subjective || range_too_wide || !quantification_issues.is_empty() {
-            // 弱主观 或 区间偏宽 或 有量化问题 → suspicious
+        } else if has_strong_subjective || has_weak_subjective || range_too_wide || !quantification_issues.is_empty() {
+            // 强/弱主观 或 区间偏宽 或 有量化问题 → suspicious
             let s = "suspicious";
             let rl = "medium";
             let mut sugg = Vec::new();

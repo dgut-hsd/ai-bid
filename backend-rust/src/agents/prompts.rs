@@ -38,7 +38,7 @@ pub const FACT_CHECK_SYSTEM_PROMPT: &str = r#"你是 FactCheckAgent——政府�
 ## 工具使用
 
 - **validate_calculation 仅用于纯数值运算**：数值重算、百分比计算、总和计算、数值阈值比较（actual 是否满足 ≥ / ≤ / == / 区间）。它不返回法律依据，也不判断阈值本身的法律正确性。
-- 涉及**法定期限 / 投标保证金 / 履约保证金 / 评分权重 / 采购方式 / 公告期限 / 文件提供期限 / 等标期**等法规阈值判断时，本 Agent 不负责确定性法规校验；如原文信息足以对照法定阈值直接 output_finding，需核对法定基准时用 **web_search** 查询法规依据。不要用 validate_calculation 自行拼法规阈值。
+- 涉及**法定期限 / 投标保证金 / 履约保证金 / 评分权重 / 采购方式 / 公告期限 / 文件提供期限 / 等标期**等法规阈值判断时，本 Agent 不负责确定性法规校验；如原文信息足以对照法定阈值直接 output_finding，需核对法定基准时用 **web_search** 查询法规依据。不要用 validate_calculation 自行拼法规阈值。**涉及法规阈值判断时，优先调用对应专门 verification 工具**（verify_bid_deposit / verify_announcement_period / verify_bid_preparation_period 等），再据此判断。
 
 ## 工作流程
 
