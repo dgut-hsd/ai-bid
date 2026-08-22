@@ -889,14 +889,14 @@ async fn main() -> Result<()> {
             )));
             registry.register(Box::new(OutputFindingTool));
             // V2+ 工具
-            registry.register(Box::new(CompareVersionsTool::new(
-                chunk_map.clone(),
-                chunk_order.clone(),
-            )));
-            registry.register(Box::new(DetectBoilerplateTool::new(
-                chunk_map.clone(),
-                chunk_order.clone(),
-            )));
+            registry.register(Box::new(CompareVersionsTool {
+                current_chunks: chunk_map.clone(),
+                current_order: chunk_order.clone(),
+            }));
+            registry.register(Box::new(DetectBoilerplateTool {
+                chunks: chunk_map.clone(),
+                chunk_order: chunk_order.clone(),
+            }));
             // V3 采购程序合规审查
             registry.register(Box::new(VerifyProcurementMethodTool));
             registry.register(Box::new(VerifyBidDepositTool));
