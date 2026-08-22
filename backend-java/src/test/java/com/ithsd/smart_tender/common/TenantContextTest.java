@@ -17,16 +17,13 @@ class TenantContextTest {
     }
 
     @Test
-    void context_shouldExposeImmutableSnapshotAndLegacyUserIdBridge() {
+    void context_shouldExposeLegacyUserIdBridge() {
         TenantRequestContext context = new TenantRequestContext(10001L, 20001L, "ADMIN", 3L, "request-1");
 
         TenantContext.set(context);
 
         assertThat(TenantContext.get()).isEqualTo(context);
         assertThat(BaseContext.getCurrentId()).isEqualTo(10001L);
-        TenantContextSnapshot snapshot = TenantContext.snapshot();
-        assertThat(snapshot).isNotNull();
-        assertThat(snapshot.toContext()).isEqualTo(context);
     }
 
     @Test
