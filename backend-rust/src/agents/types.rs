@@ -348,6 +348,12 @@ pub struct RiskFinding {
     /// 哪些 Agent 验证了此发现（Verified 来源）
     #[serde(default)]
     pub verified_by: Vec<String>,
+    /// 证据核验器结论（support/refute/insufficient），EvidenceVerifier 阶段回写
+    #[serde(default)]
+    pub evidence_verdict: Option<String>,
+    /// 证据核验器的理由
+    #[serde(default)]
+    pub verifier_reason: Option<String>,
 
     // ── 框架自动填充的定位字段（用于 Java 侧映射 AuditIssueEntity） ──
     /// 起始页码 (0-based)，框架从关联 ReviewClause 自动填充
@@ -454,6 +460,8 @@ impl RiskFinding {
             verification_required: Vec::new(),
             hypothesized_by: Vec::new(),
             verified_by: Vec::new(),
+            evidence_verdict: None,
+            verifier_reason: None,
             page_number: None,
             section_path: None,
             context: None,
@@ -500,6 +508,8 @@ impl RiskFinding {
             verification_required: Vec::new(),
             hypothesized_by: Vec::new(),
             verified_by: Vec::new(),
+            evidence_verdict: None,
+            verifier_reason: None,
             page_number: None,
             section_path: None,
             context: None,
@@ -999,6 +1009,8 @@ pub struct CoordinatorConfig {
     pub enabled_agents: Vec<AgentId>,
     /// 是否启用 Legal Verify 对抗法条验证
     pub enable_legal_verify: bool,
+    /// 是否启用 Evidence Verifier 证据核验（证伪导向 NLI 三分类，Triage 前）
+    pub enable_evidence_verify: bool,
     /// Legal Verify 的最大 ReAct 轮次
     pub legal_verify_max_turns: usize,
     /// BlindSpot ReAct 的最大轮次
@@ -1014,6 +1026,7 @@ impl Default for CoordinatorConfig {
         Self {
             enabled_agents: AgentId::all_reviewers(),
             enable_legal_verify: false, // 成本优化：关闭 LLM 法条验证
+            enable_evidence_verify: true, // 证据核验：离线实验 precision 100%，默认开启
             legal_verify_max_turns: 3,
             blind_spot_max_turns: 10,
             blind_spot_fallback_enabled: true,
