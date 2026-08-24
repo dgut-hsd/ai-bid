@@ -349,25 +349,170 @@ fn review_result_path(doc_id: &str) -> String {
     )
 }
 
+#[derive(Debug, Clone)]
+struct ReviewArtifactPaths {
+    findings: String,
+    routing_summary: String,
+    graph_snapshot: String,
+    result: String,
+}
+
+impl ReviewArtifactPaths {
+    fn all(&self) -> [&str; 4] {
+        [
+            &self.findings,
+            &self.routing_summary,
+            &self.graph_snapshot,
+            &self.result,
+        ]
+    }
+}
+
+fn review_artifact_paths(doc_id: &str, filename: &str) -> ReviewArtifactPaths {
+    let file_stem = std::path::Path::new(filename)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("document");
+    let disk_stem = format!("{}_{}", file_stem, &doc_id[..8.min(doc_id.len())]);
+    let dir = data_path_str("output/findings");
+    ReviewArtifactPaths {
+        findings: format!("{}/{}_findings.json", dir, disk_stem),
+        routing_summary: format!("{}/{}_routing_summary.json", dir, disk_stem),
+        graph_snapshot: format!("{}/{}_graph_snapshot.json", dir, disk_stem),
+        result: review_result_path(doc_id),
+    }
+}
+
+fn quarantine_review_artifacts_with<F>(
+    paths: &ReviewArtifactPaths,
+    quarantine_id: &str,
+    mut rename: F,
+) -> Result<Vec<String>, String>
+where
+    F: FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+{
+    let mut quarantined: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for source in paths.all() {
+        let source = std::path::Path::new(source);
+        if !source.exists() {
+            continue;
+        }
+        let target = std::path::PathBuf::from(format!(
+            "{}.stale-{}",
+            source.to_string_lossy(),
+            quarantine_id
+        ));
+        if let Err(error) = rename(source, &target) {
+            let mut rollback_errors = Vec::new();
+            for (original, isolated) in quarantined.iter().rev() {
+                if let Err(rollback_error) = rename(isolated, original) {
+                    rollback_errors.push(format!("{}: {}", original.display(), rollback_error));
+                }
+            }
+            let rollback_detail = if rollback_errors.is_empty() {
+                String::new()
+            } else {
+                format!("；回滚失败: {}", rollback_errors.join(", "))
+            };
+            return Err(format!(
+                "隔离上一轮磁盘审核结果失败（{}）: {}{}",
+                source.display(),
+                error,
+                rollback_detail
+            ));
+        }
+        quarantined.push((source.to_path_buf(), target));
+    }
+    Ok(quarantined
+        .into_iter()
+        .map(|(_, isolated)| isolated.to_string_lossy().into_owned())
+        .collect())
+}
+
 /// 原子接受新的文档审核轮次；冲突时不清理上一轮结果。
-async fn try_accept_review_run(state: &AppState, doc_id: &str) -> Result<bool, String> {
+async fn try_accept_review_run(
+    state: &AppState,
+    doc_id: &str,
+    filename: &str,
+) -> Result<bool, String> {
+    try_accept_review_run_with(state, doc_id, filename, |source, target| {
+        std::fs::rename(source, target)
+    })
+    .await
+}
+
+async fn try_accept_review_run_with<F>(
+    state: &AppState,
+    doc_id: &str,
+    filename: &str,
+    rename: F,
+) -> Result<bool, String>
+where
+    F: FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+{
     let mut active = state.active_reviews.lock().await;
     if active.contains(doc_id) {
         return Ok(false);
     }
-    active.insert(doc_id.to_string());
 
-    let result_path = review_result_path(doc_id);
-    if let Err(error) = std::fs::remove_file(&result_path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        active.remove(doc_id);
-        return Err(format!("清理上一轮磁盘审核结果失败: {}", error));
-    }
+    // 同目录 rename 先隔离全部旧产物；任一失败会回滚，避免只清掉部分事实来源。
+    let artifact_paths = review_artifact_paths(doc_id, filename);
+    let quarantine_id = Uuid::new_v4().to_string();
+    let quarantined = quarantine_review_artifacts_with(&artifact_paths, &quarantine_id, rename)?;
     state.review_results.lock().await.remove(doc_id);
     state.review_usages.lock().await.remove(doc_id);
     state.review_errors.lock().await.remove(doc_id);
+    active.insert(doc_id.to_string());
+    drop(active);
+
+    // canonical 路径已原子隔离；隔离文件只是非权威垃圾，删除失败不影响新轮次语义。
+    for path in quarantined {
+        if let Err(error) = std::fs::remove_file(&path) {
+            eprintln!(
+                "[WARN] 清理隔离审核结果失败: path={}, error={}",
+                path, error
+            );
+        }
+    }
     Ok(true)
+}
+
+async fn install_review_event_bus(state: &AppState, doc_id: &str) -> Arc<ReviewEventBus> {
+    let review_events = Arc::new(ReviewEventBus::new(review_event_capacity()));
+    state
+        .review_event_buses
+        .lock()
+        .await
+        .insert(doc_id.to_string(), review_events.clone());
+    review_events
+}
+
+async fn remove_review_event_bus_if_current(
+    state: &AppState,
+    doc_id: &str,
+    expected: &Arc<ReviewEventBus>,
+) -> bool {
+    let mut buses = state.review_event_buses.lock().await;
+    if buses
+        .get(doc_id)
+        .is_some_and(|current| Arc::ptr_eq(current, expected))
+    {
+        buses.remove(doc_id);
+        true
+    } else {
+        false
+    }
+}
+
+fn schedule_review_event_bus_cleanup(
+    state: AppState,
+    doc_id: String,
+    review_events: Arc<ReviewEventBus>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        remove_review_event_bus_if_current(&state, &doc_id, &review_events).await;
+    });
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────
@@ -842,7 +987,7 @@ pub async fn review_document(
         .collect();
 
     // 参数校验完成后再原子接受新轮次；并发冲突不得清理上一轮结果。
-    match try_accept_review_run(&state, &doc_id).await {
+    match try_accept_review_run(&state, &doc_id, &doc.filename).await {
         Ok(true) => {}
         Ok(false) => {
             return Ok((
@@ -857,14 +1002,8 @@ pub async fn review_document(
         Err(error) => return Err(server_error_fmt(&error)),
     }
 
-    // 创建或获取 ReviewEventBus（SSE 客户端可能已提前连接）。
-    let review_events = {
-        let mut buses = state.review_event_buses.lock().await;
-        buses
-            .entry(doc_id.clone())
-            .or_insert_with(|| Arc::new(ReviewEventBus::new(review_event_capacity())))
-            .clone()
-    };
+    // 每轮安装独立总线；旧轮延迟清理只能删除自身总线。
+    let review_events = install_review_event_bus(&state, &doc_id).await;
 
     println!(
         "[REQ] 审核条款数: {}, 启用 Agent: {:?}",
@@ -1148,16 +1287,11 @@ async fn run_review_pipeline(
 
                 // 后处理失败不得进入任何结果写入路径，同时仍需释放任务占用状态。
                 state.active_reviews.lock().await.remove(&doc_id);
-                let cleanup_doc_id = doc_id.clone();
-                let cleanup_state = state.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    cleanup_state
-                        .review_event_buses
-                        .lock()
-                        .await
-                        .remove(&cleanup_doc_id);
-                });
+                schedule_review_event_bus_cleanup(
+                    state.clone(),
+                    doc_id.clone(),
+                    review_events.clone(),
+                );
                 return;
             }
 
@@ -1186,33 +1320,27 @@ async fn run_review_pipeline(
 
             // ── 写盘：findings ──
             {
-                let disk_stem = {
+                let filename = {
                     let docs = state.documents.read().await;
                     if let Some(doc) = docs.get(&doc_id) {
-                        let file_stem = std::path::Path::new(&doc.filename)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("document");
-                        format!("{}_{}", file_stem, &doc_id[..8.min(doc_id.len())])
+                        doc.filename.clone()
                     } else {
-                        format!("doc_{}", &doc_id[..8.min(doc_id.len())])
+                        "doc.pdf".to_string()
                     }
                 };
+                let artifact_paths = review_artifact_paths(&doc_id, &filename);
                 let dir = data_path_str("output/findings");
                 let _ = std::fs::create_dir_all(&dir);
-                let findings_path = format!("{}/{}_findings.json", dir, disk_stem);
                 if let Ok(json) = serde_json::to_string_pretty(&output.findings) {
-                    let _ = std::fs::write(&findings_path, json);
-                    println!("[DISK] findings → {}", findings_path);
+                    let _ = std::fs::write(&artifact_paths.findings, json);
+                    println!("[DISK] findings → {}", artifact_paths.findings);
                 }
-                let summary_path = format!("{}/{}_routing_summary.json", dir, disk_stem);
                 if let Ok(json) = serde_json::to_string_pretty(&output.routing_summary) {
-                    let _ = std::fs::write(&summary_path, json);
+                    let _ = std::fs::write(&artifact_paths.routing_summary, json);
                 }
                 if let Some(ref snap) = output.graph_snapshot {
-                    let snap_path = format!("{}/{}_graph_snapshot.json", dir, disk_stem);
                     if let Ok(json) = serde_json::to_string_pretty(snap) {
-                        let _ = std::fs::write(&snap_path, json);
+                        let _ = std::fs::write(&artifact_paths.graph_snapshot, json);
                     }
                 }
             }
@@ -1350,13 +1478,7 @@ async fn run_review_pipeline(
 
     // 延迟清理 ReviewEventBus
     // （给 SSE 客户端时间接收 Done/PartialDone/Error 事件）
-    let cleanup_doc_id = doc_id.clone();
-    let cleanup_state = state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let mut buses = cleanup_state.review_event_buses.lock().await;
-        buses.remove(&cleanup_doc_id);
-    });
+    schedule_review_event_bus_cleanup(state, doc_id, review_events);
 }
 
 /// GET /api/v1/review/:doc_id/stream
@@ -2652,6 +2774,54 @@ mod tests {
         }
     }
 
+    fn write_test_review_artifacts(paths: &ReviewArtifactPaths) {
+        for path in paths.all() {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                std::fs::create_dir_all(parent).expect("应创建测试输出目录");
+            }
+            std::fs::write(path, r#"{"status":"completed"}"#).expect("应写入旧磁盘结果");
+        }
+    }
+
+    fn remove_test_review_artifacts(paths: &ReviewArtifactPaths) {
+        for path in paths.all() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_bus_cleanup_does_not_remove_new_run_bus() {
+        let doc_id = "doc_bus_generation";
+        let state = make_test_state(doc_id).await;
+        let run1_bus = install_review_event_bus(&state, doc_id).await;
+        let run2_bus = install_review_event_bus(&state, doc_id).await;
+        let mut run2_events = run2_bus.subscribe();
+
+        assert!(
+            !remove_review_event_bus_if_current(&state, doc_id, &run1_bus).await,
+            "旧轮清理不得删除新轮总线"
+        );
+        assert!(Arc::ptr_eq(
+            state
+                .review_event_buses
+                .lock()
+                .await
+                .get(doc_id)
+                .expect("新轮总线应保留"),
+            &run2_bus
+        ));
+
+        run2_bus.emit(&crate::agents::review_event::ReviewEvent::Error {
+            message: "run2-event".to_string(),
+            session_id: doc_id.to_string(),
+        });
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), run2_events.recv())
+            .await
+            .expect("新轮事件应及时到达")
+            .expect("新轮总线应保持连接");
+        assert!(event.contains("run2-event"));
+    }
+
     #[tokio::test]
     async fn accepted_rerun_clears_old_success_before_sync_failure() {
         let doc_id = format!("doc_rerun_{}", uuid::Uuid::new_v4());
@@ -2671,19 +2841,24 @@ mod tests {
             .lock()
             .await
             .insert(doc_id.clone(), "旧错误".to_string());
-        let result_path = review_result_path(&doc_id);
-        std::fs::create_dir_all(data_path_str("output/findings")).expect("应创建测试输出目录");
-        std::fs::write(&result_path, r#"{"status":"completed"}"#).expect("应写入旧磁盘结果");
+        let artifact_paths = review_artifact_paths(&doc_id, "test.pdf");
+        write_test_review_artifacts(&artifact_paths);
 
         assert!(
-            try_accept_review_run(&state, &doc_id)
+            try_accept_review_run(&state, &doc_id, "test.pdf")
                 .await
                 .expect("重跑应成功接受")
         );
         assert!(!state.review_results.lock().await.contains_key(&doc_id));
         assert!(!state.review_usages.lock().await.contains_key(&doc_id));
         assert!(!state.review_errors.lock().await.contains_key(&doc_id));
-        assert!(!std::path::Path::new(&result_path).exists());
+        assert!(
+            artifact_paths
+                .all()
+                .iter()
+                .all(|path| !std::path::Path::new(path).exists()),
+            "接受重跑后四类 canonical 结果文件必须全部消失"
+        );
 
         let mut snapshot = make_sync_test_snapshot(vec![(
             make_sync_test_finding("R_CONFIRMED"),
@@ -2704,7 +2879,12 @@ mod tests {
             .expect("同步失败应返回失败状态");
         assert_eq!(response.status, "failed");
         assert!(response.result.is_none());
-        assert!(!std::path::Path::new(&result_path).exists());
+        assert!(
+            artifact_paths
+                .all()
+                .iter()
+                .all(|path| !std::path::Path::new(path).exists())
+        );
     }
 
     #[tokio::test]
@@ -2722,20 +2902,64 @@ mod tests {
             .lock()
             .await
             .insert(doc_id.clone(), make_test_review_usage());
-        let result_path = review_result_path(&doc_id);
-        std::fs::create_dir_all(data_path_str("output/findings")).expect("应创建测试输出目录");
-        std::fs::write(&result_path, r#"{"status":"completed"}"#).expect("应写入旧磁盘结果");
+        let artifact_paths = review_artifact_paths(&doc_id, "test.pdf");
+        write_test_review_artifacts(&artifact_paths);
 
         assert!(
-            !try_accept_review_run(&state, &doc_id)
+            !try_accept_review_run(&state, &doc_id, "test.pdf")
                 .await
                 .expect("并发重跑应返回冲突")
         );
 
         assert!(state.review_results.lock().await.contains_key(&doc_id));
         assert!(state.review_usages.lock().await.contains_key(&doc_id));
-        assert!(std::path::Path::new(&result_path).exists());
-        std::fs::remove_file(result_path).expect("应清理测试磁盘结果");
+        assert!(
+            artifact_paths
+                .all()
+                .iter()
+                .all(|path| std::path::Path::new(path).exists()),
+            "并发冲突不得清理任一旧结果文件"
+        );
+        remove_test_review_artifacts(&artifact_paths);
+    }
+
+    #[tokio::test]
+    async fn artifact_cleanup_failure_rolls_back_and_does_not_accept_run() {
+        let doc_id = format!("doc_cleanup_failure_{}", uuid::Uuid::new_v4());
+        let state = make_test_state(&doc_id).await;
+        state
+            .review_results
+            .lock()
+            .await
+            .insert(doc_id.clone(), make_test_review_output());
+        let artifact_paths = review_artifact_paths(&doc_id, "test.pdf");
+        write_test_review_artifacts(&artifact_paths);
+        let fail_path = artifact_paths.routing_summary.clone();
+
+        let error =
+            try_accept_review_run_with(&state, &doc_id, "test.pdf", move |source, target| {
+                if source == std::path::Path::new(&fail_path) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "模拟 Windows 文件占用",
+                    ));
+                }
+                std::fs::rename(source, target)
+            })
+            .await
+            .expect_err("任一文件隔离失败时不得接受任务");
+
+        assert!(error.contains("模拟 Windows 文件占用"));
+        assert!(!state.active_reviews.lock().await.contains(&doc_id));
+        assert!(state.review_results.lock().await.contains_key(&doc_id));
+        assert!(
+            artifact_paths
+                .all()
+                .iter()
+                .all(|path| std::path::Path::new(path).exists()),
+            "失败回滚后四类 canonical 结果文件必须全部恢复"
+        );
+        remove_test_review_artifacts(&artifact_paths);
     }
 
     #[tokio::test]
