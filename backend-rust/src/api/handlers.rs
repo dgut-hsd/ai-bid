@@ -477,14 +477,18 @@ where
     Ok(true)
 }
 
-async fn install_review_event_bus(state: &AppState, doc_id: &str) -> Arc<ReviewEventBus> {
-    let review_events = Arc::new(ReviewEventBus::new(review_event_capacity()));
-    state
-        .review_event_buses
-        .lock()
-        .await
-        .insert(doc_id.to_string(), review_events.clone());
-    review_events
+async fn get_or_create_review_event_bus(state: &AppState, doc_id: &str) -> Arc<ReviewEventBus> {
+    let mut buses = state.review_event_buses.lock().await;
+    buses
+        .entry(doc_id.to_string())
+        .or_insert_with(|| Arc::new(ReviewEventBus::new(review_event_capacity())))
+        .clone()
+}
+
+async fn claim_review_event_bus(state: &AppState, doc_id: &str) -> Arc<ReviewEventBus> {
+    // 新轮 active 已建立，而上一轮终态会在解除 active 前摘除自身总线；
+    // 因此 map 中若已有总线，只可能是本轮 GET 预连接创建的 pending 总线。
+    get_or_create_review_event_bus(state, doc_id).await
 }
 
 async fn remove_review_event_bus_if_current(
@@ -504,15 +508,10 @@ async fn remove_review_event_bus_if_current(
     }
 }
 
-fn schedule_review_event_bus_cleanup(
-    state: AppState,
-    doc_id: String,
-    review_events: Arc<ReviewEventBus>,
-) {
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        remove_review_event_bus_if_current(&state, &doc_id, &review_events).await;
-    });
+async fn finish_review_run(state: &AppState, doc_id: &str, review_events: &Arc<ReviewEventBus>) {
+    // receiver 自身持有 Arc，摘除 map 不会阻止其接收刚发出的终态事件。
+    remove_review_event_bus_if_current(state, doc_id, review_events).await;
+    state.active_reviews.lock().await.remove(doc_id);
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────
@@ -1002,8 +1001,8 @@ pub async fn review_document(
         Err(error) => return Err(server_error_fmt(&error)),
     }
 
-    // 每轮安装独立总线；旧轮延迟清理只能删除自身总线。
-    let review_events = install_review_event_bus(&state, &doc_id).await;
+    // 认领 GET 预连接创建的 pending 总线；若没有预连接则创建本轮总线。
+    let review_events = claim_review_event_bus(&state, &doc_id).await;
 
     println!(
         "[REQ] 审核条款数: {}, 启用 Agent: {:?}",
@@ -1285,13 +1284,8 @@ async fn run_review_pipeline(
                     session_id: doc_id.clone(),
                 });
 
-                // 后处理失败不得进入任何结果写入路径，同时仍需释放任务占用状态。
-                state.active_reviews.lock().await.remove(&doc_id);
-                schedule_review_event_bus_cleanup(
-                    state.clone(),
-                    doc_id.clone(),
-                    review_events.clone(),
-                );
+                // 后处理失败不得进入任何结果写入路径；终态已发送后立即摘除本轮总线。
+                finish_review_run(&state, &doc_id, &review_events).await;
                 return;
             }
 
@@ -1473,12 +1467,8 @@ async fn run_review_pipeline(
         }
     }
 
-    // 终态已写入后立即解除轮次屏障；ReviewEventBus 延迟清理以便客户端接收终态事件。
-    state.active_reviews.lock().await.remove(&doc_id);
-
-    // 延迟清理 ReviewEventBus
-    // （给 SSE 客户端时间接收 Done/PartialDone/Error 事件）
-    schedule_review_event_bus_cleanup(state, doc_id, review_events);
+    // 终态已发送后先摘除本轮总线，再解除轮次屏障，避免下一轮复用旧总线。
+    finish_review_run(&state, &doc_id, &review_events).await;
 }
 
 /// GET /api/v1/review/:doc_id/stream
@@ -1504,14 +1494,8 @@ pub async fn stream_review_events(
 > {
     use axum::response::sse::Event;
 
-    // 创建或获取 ReviewEventBus（如果 POST /review 尚未创建）
-    let review_events = {
-        let mut buses = state.review_event_buses.lock().await;
-        buses
-            .entry(doc_id.clone())
-            .or_insert_with(|| Arc::new(ReviewEventBus::new(review_event_capacity())))
-            .clone()
-    };
+    // POST 前的多个预连接共享同一 pending 总线，随后由审核轮次认领。
+    let review_events = get_or_create_review_event_bus(&state, &doc_id).await;
 
     let mut rx = review_events.subscribe();
 
@@ -2790,11 +2774,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_bus_cleanup_does_not_remove_new_run_bus() {
+    async fn preconnected_bus_is_claimed_and_delivers_review_events() {
+        let doc_id = "doc_bus_preconnect";
+        let state = make_test_state(doc_id).await;
+        let preconnected_bus = get_or_create_review_event_bus(&state, doc_id).await;
+        let mut events = preconnected_bus.subscribe();
+
+        assert!(
+            try_accept_review_run(&state, doc_id, "test.pdf")
+                .await
+                .expect("审核应被接受")
+        );
+        let claimed_bus = claim_review_event_bus(&state, doc_id).await;
+        assert!(Arc::ptr_eq(&preconnected_bus, &claimed_bus));
+
+        claimed_bus.emit(&crate::agents::review_event::ReviewEvent::Error {
+            message: "claimed-event".to_string(),
+            session_id: doc_id.to_string(),
+        });
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("预连接应及时收到审核事件")
+            .expect("认领后总线应保持连接");
+        assert!(event.contains("claimed-event"));
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_separates_next_run_bus_and_stale_cleanup_is_safe() {
         let doc_id = "doc_bus_generation";
         let state = make_test_state(doc_id).await;
-        let run1_bus = install_review_event_bus(&state, doc_id).await;
-        let run2_bus = install_review_event_bus(&state, doc_id).await;
+        let run1_bus = get_or_create_review_event_bus(&state, doc_id).await;
+        state.active_reviews.lock().await.insert(doc_id.to_string());
+        run1_bus.emit(&crate::agents::review_event::ReviewEvent::Error {
+            message: "run1-terminal".to_string(),
+            session_id: doc_id.to_string(),
+        });
+        finish_review_run(&state, doc_id, &run1_bus).await;
+        assert!(!state.active_reviews.lock().await.contains(doc_id));
+        assert!(!state.review_event_buses.lock().await.contains_key(doc_id));
+
+        let run2_bus = get_or_create_review_event_bus(&state, doc_id).await;
         let mut run2_events = run2_bus.subscribe();
 
         assert!(
@@ -2820,6 +2839,38 @@ mod tests {
             .expect("新轮事件应及时到达")
             .expect("新轮总线应保持连接");
         assert!(event.contains("run2-event"));
+    }
+
+    #[tokio::test]
+    async fn multiple_preconnections_share_one_pending_bus() {
+        let doc_id = "doc_bus_multiple_preconnect";
+        let state = make_test_state(doc_id).await;
+        let first = get_or_create_review_event_bus(&state, doc_id).await;
+        let second = get_or_create_review_event_bus(&state, doc_id).await;
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn conflicting_review_does_not_replace_active_bus() {
+        let doc_id = "doc_bus_conflict";
+        let state = make_test_state(doc_id).await;
+        let active_bus = get_or_create_review_event_bus(&state, doc_id).await;
+        state.active_reviews.lock().await.insert(doc_id.to_string());
+
+        assert!(
+            !try_accept_review_run(&state, doc_id, "test.pdf")
+                .await
+                .expect("并发审核应返回冲突")
+        );
+        let current = state
+            .review_event_buses
+            .lock()
+            .await
+            .get(doc_id)
+            .cloned()
+            .expect("active 总线应保留");
+        assert!(Arc::ptr_eq(&active_bus, &current));
     }
 
     #[tokio::test]
