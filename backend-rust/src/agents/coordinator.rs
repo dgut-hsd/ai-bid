@@ -2954,6 +2954,11 @@ impl Coordinator {
                 reps.push((key, f.source_quote.clone(), f.risk_type.clone()));
             }
         }
+        eprintln!(
+            "  [EVIDENCE_VERIFY] 收到 {} 条 findings，去重后 {} 组",
+            findings.len(),
+            reps.len()
+        );
 
         // 2) 逐组独立裁决
         let mut cache: HashMap<String, (String, String)> = HashMap::new();

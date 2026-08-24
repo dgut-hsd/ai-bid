@@ -75,14 +75,32 @@ pub async fn verify_evidence(
             content: format!("【招标文件原文】\n{}\n\n【待核风险类型】\n{}", quote_trunc, risk_type),
         },
     ];
-    let resp = llm.chat(&messages, &[], &ToolChoice::Auto).await.ok()?;
-    let content = resp.content?;
+    let resp = match llm.chat(&messages, &[], &ToolChoice::Auto).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  [EvidenceVerify] llm.chat Err: {:#}", e);
+            return None;
+        }
+    };
+    let content = match resp.content {
+        Some(c) => c,
+        None => {
+            eprintln!("  [EvidenceVerify] content 为 None");
+            return None;
+        }
+    };
     let start = content.find('{')?;
     let end = content.rfind('}')?;
     if end <= start {
         return None;
     }
-    let parsed: serde_json::Value = serde_json::from_str(&content[start..=end]).ok()?;
+    let parsed: serde_json::Value = match serde_json::from_str(&content[start..=end]) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("  [EvidenceVerify] JSON 解析失败: {} | 原文: {}", e, &content[start..end.min(content.len())]);
+            return None;
+        }
+    };
     let verdict = parsed.get("verdict")?.as_str()?.to_string();
     let reason = parsed
         .get("reason")
