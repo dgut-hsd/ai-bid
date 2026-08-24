@@ -189,12 +189,23 @@ export interface ChunkNode {
   tier: RiskTier;
 }
 
-export type FindingState = 'provisional';
+export type FindingState = 'provisional' | 'confirmed' | 'merged' | 'rejected';
 
 export interface RiskNode {
   finding: AuditIssue;
   lawRefs: string[];
   state: FindingState;
+  mergedInto?: string;
+  decisionReason?: string;
+}
+
+export interface FindingTransition {
+  riskId: string;
+  from: FindingState;
+  to: FindingState;
+  reason: string;
+  mergedInto?: string;
+  decidedAt: string;
 }
 
 export interface AgentNode {
@@ -257,6 +268,7 @@ export interface GraphSnapshot {
   contradicts: Record<string, [string, string][]>;
   sameLaw: Record<string, string[]>;
   reviewAttempts: Record<string, ReviewAttempt>;
+  findingTransitions: FindingTransition[];
 }
 
 // ─── 创建审核任务 ───

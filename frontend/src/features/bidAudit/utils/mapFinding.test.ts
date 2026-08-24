@@ -6,6 +6,7 @@ import {
   isBackendFormat,
   ensureAuditIssue,
 } from './mapFinding';
+import type { BackendGraphSnapshot } from './mapFinding';
 
 // ─── 样本数据 ───
 
@@ -245,6 +246,93 @@ describe('mapBackendFindings', () => {
 });
 
 describe('mapBackendGraphSnapshot', () => {
+  it('maps all finding states, decision metadata, and transition history', () => {
+    const makeRisk = (
+      riskId: string,
+      state: 'provisional' | 'confirmed' | 'merged' | 'rejected',
+      metadata: { merged_into?: string; decision_reason?: string } = {},
+    ) => ({
+      finding: { ...completeBackendFinding, risk_id: riskId },
+      law_refs: [],
+      state,
+      ...metadata,
+    });
+    const payload = {
+      chunks: {},
+      risks: {
+        RISK_PROVISIONAL: makeRisk('RISK_PROVISIONAL', 'provisional'),
+        RISK_CONFIRMED: makeRisk('RISK_CONFIRMED', 'confirmed'),
+        RISK_MERGED: makeRisk('RISK_MERGED', 'merged', {
+          merged_into: 'RISK_CONFIRMED',
+          decision_reason: '与保留项重复',
+        }),
+        RISK_REJECTED: makeRisk('RISK_REJECTED', 'rejected', {
+          decision_reason: '已有明确反证',
+        }),
+      },
+      has_risk: {},
+      reviewed_by: {},
+      linked_to: {},
+      cites: {},
+      cited_by: {},
+      agents: {},
+      laws: {},
+      cases: {},
+      contradicts: {},
+      same_law: {},
+      review_attempts: {},
+      finding_transitions: [
+        {
+          risk_id: 'RISK_MERGED',
+          from: 'provisional',
+          to: 'merged',
+          reason: '与保留项重复',
+          merged_into: 'RISK_CONFIRMED',
+          decided_at: '2026-08-22T12:00:00Z',
+        },
+        {
+          risk_id: 'RISK_REJECTED',
+          from: 'provisional',
+          to: 'rejected',
+          reason: '已有明确反证',
+          decided_at: '2026-08-22T12:00:01Z',
+        },
+      ],
+    } satisfies BackendGraphSnapshot;
+
+    const result = mapBackendGraphSnapshot(payload);
+
+    expect(Object.values(result.risks).map((risk) => risk.state)).toEqual([
+      'provisional',
+      'confirmed',
+      'merged',
+      'rejected',
+    ]);
+    expect(result.risks.RISK_MERGED).toMatchObject({
+      mergedInto: 'RISK_CONFIRMED',
+      decisionReason: '与保留项重复',
+    });
+    expect(result.risks.RISK_REJECTED.decisionReason).toBe('已有明确反证');
+    expect(result.findingTransitions).toEqual([
+      {
+        riskId: 'RISK_MERGED',
+        from: 'provisional',
+        to: 'merged',
+        reason: '与保留项重复',
+        mergedInto: 'RISK_CONFIRMED',
+        decidedAt: '2026-08-22T12:00:00Z',
+      },
+      {
+        riskId: 'RISK_REJECTED',
+        from: 'provisional',
+        to: 'rejected',
+        reason: '已有明确反证',
+        mergedInto: undefined,
+        decidedAt: '2026-08-22T12:00:01Z',
+      },
+    ]);
+  });
+
   it('maps Rust snake_case graph and review attempts to frontend camelCase', () => {
     const result = mapBackendGraphSnapshot({
       graph_version: 7,
@@ -362,6 +450,9 @@ describe('mapBackendGraphSnapshot', () => {
     expect(result.graphVersion).toBe(0);
     expect(result.chunkVersions).toEqual({});
     expect(result.risks.RISK_001.state).toBe('provisional');
+    expect(result.risks.RISK_001.mergedInto).toBeUndefined();
+    expect(result.risks.RISK_001.decisionReason).toBeUndefined();
+    expect(result.findingTransitions).toEqual([]);
   });
 });
 

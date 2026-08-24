@@ -18,6 +18,7 @@ import type {
   Severity,
   FindingAddedEvent,
   GraphSnapshot,
+  FindingState,
   ReviewAttemptErrorCode,
   ReviewAttemptOutcome,
   ReviewAttemptStatus,
@@ -80,7 +81,9 @@ interface BackendChunkNode {
 interface BackendRiskNode {
   finding: BackendFinding;
   law_refs: string[];
-  state?: 'provisional';
+  state?: FindingState;
+  merged_into?: string;
+  decision_reason?: string;
 }
 
 type BackendAgentId = string | { Dynamic: string };
@@ -121,6 +124,15 @@ interface BackendReviewAttempt {
   finished_at?: string;
 }
 
+interface BackendFindingTransition {
+  risk_id: string;
+  from: FindingState;
+  to: FindingState;
+  reason: string;
+  merged_into?: string;
+  decided_at: string;
+}
+
 export interface BackendGraphSnapshot {
   graph_version?: number;
   chunk_versions?: Record<string, number>;
@@ -137,6 +149,7 @@ export interface BackendGraphSnapshot {
   contradicts: Record<string, [string, string][]>;
   same_law: Record<string, string[]>;
   review_attempts: Record<string, BackendReviewAttempt>;
+  finding_transitions?: BackendFindingTransition[];
 }
 
 // ─── 映射函数 ───
@@ -278,6 +291,8 @@ export const mapBackendGraphSnapshot = (
     finding: mapBackendFinding(risk.finding),
     lawRefs: risk.law_refs,
     state: risk.state ?? 'provisional',
+    mergedInto: risk.merged_into,
+    decisionReason: risk.decision_reason,
   })),
   hasRisk: raw.has_risk ?? {},
   reviewedBy: mapRecord(raw.reviewed_by, (agentIds) =>
@@ -316,6 +331,14 @@ export const mapBackendGraphSnapshot = (
     errorMessage: attempt.error_message,
     startedAt: attempt.started_at,
     finishedAt: attempt.finished_at,
+  })),
+  findingTransitions: (raw.finding_transitions ?? []).map((transition) => ({
+    riskId: transition.risk_id,
+    from: transition.from,
+    to: transition.to,
+    reason: transition.reason,
+    mergedInto: transition.merged_into,
+    decidedAt: transition.decided_at,
   })),
 });
 
