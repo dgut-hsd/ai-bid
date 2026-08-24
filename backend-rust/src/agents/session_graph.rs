@@ -242,6 +242,35 @@ impl SessionGraph {
         Ok(())
     }
 
+    fn is_terminal_risk(state: &GraphState, risk_id: &str) -> bool {
+        state
+            .risks
+            .get(risk_id)
+            .is_some_and(|node| node.state != FindingState::Provisional)
+    }
+
+    fn validate_finding_clause_refs(
+        state: &GraphState,
+        label: &str,
+        finding: &RiskFinding,
+    ) -> Result<(), String> {
+        for clause_id in &finding.clause_ids {
+            if clause_id.trim().is_empty() {
+                return Err(format!(
+                    "{} {} 的 clause_id 不得为空白",
+                    label, finding.risk_id
+                ));
+            }
+            if !state.chunks.contains_key(clause_id) {
+                return Err(format!(
+                    "{} {} 引用的条款不存在: {}",
+                    label, finding.risk_id, clause_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn upsert_provisional_node_in_state(
         state: &mut GraphState,
         node: &RiskNode,
@@ -531,6 +560,12 @@ impl SessionGraph {
             if finding.risk_id.trim().is_empty() {
                 return Err("最终 finding 的 risk_id 不得为空".to_string());
             }
+            if finding.finding_role == FindingRole::Hypothesis {
+                return Err(format!(
+                    "最终 finding {} 不得为 Hypothesis",
+                    finding.risk_id
+                ));
+            }
             let mut normalized = finding.clone();
             normalized.clause_ids = deduplicate_strings(&finding.clause_ids);
             normalized.legal_basis = deduplicate_strings(&finding.legal_basis);
@@ -575,6 +610,11 @@ impl SessionGraph {
             if !state.risks.contains_key(risk_id) {
                 return Err(format!("最终 finding 在工作图中不存在: {}", risk_id));
             }
+            Self::validate_finding_clause_refs(
+                &state,
+                "最终 finding",
+                &normalized_finals[risk_id],
+            )?;
         }
         for (source, target) in merged {
             if !state.risks.contains_key(source) {
@@ -586,11 +626,21 @@ impl SessionGraph {
             if !confirmed_ids.contains(target) {
                 return Err(format!("merged 目标必须属于最终 findings: {}", target));
             }
+            Self::validate_finding_clause_refs(
+                &state,
+                "merged 源 finding",
+                &state.risks[source].finding,
+            )?;
         }
         for source in rejected.keys() {
             if !state.risks.contains_key(source) {
                 return Err(format!("rejected 源 finding 不存在: {}", source));
             }
+            Self::validate_finding_clause_refs(
+                &state,
+                "rejected 源 finding",
+                &state.risks[source].finding,
+            )?;
         }
 
         // 锁内先验证所有终态和幂等条件，再写任何字段，保证整批失败不留部分状态。
@@ -691,6 +741,7 @@ impl SessionGraph {
         let old_has_risk = state.has_risk.clone();
         let old_same_law = state.same_law.clone();
         let decided_at = chrono::Utc::now().to_rfc3339();
+        let mut new_transitions = Vec::new();
         for (risk_id, finding) in normalized_finals {
             if !changed_ids.contains(&risk_id) {
                 continue;
@@ -705,7 +756,7 @@ impl SessionGraph {
             node.merged_into = None;
             node.decision_reason = None;
             affected.extend(node.finding.clause_ids.iter().cloned());
-            state.finding_transitions.push(FindingTransition {
+            new_transitions.push(FindingTransition {
                 risk_id,
                 from: FindingState::Provisional,
                 to: FindingState::Confirmed,
@@ -726,7 +777,7 @@ impl SessionGraph {
             node.state = FindingState::Merged;
             node.merged_into = Some(target.clone());
             node.decision_reason = Some(reason.clone());
-            state.finding_transitions.push(FindingTransition {
+            new_transitions.push(FindingTransition {
                 risk_id: source.clone(),
                 from: FindingState::Provisional,
                 to: FindingState::Merged,
@@ -746,7 +797,7 @@ impl SessionGraph {
             node.state = FindingState::Rejected;
             node.merged_into = None;
             node.decision_reason = Some(reason.clone());
-            state.finding_transitions.push(FindingTransition {
+            new_transitions.push(FindingTransition {
                 risk_id: source.clone(),
                 from: FindingState::Provisional,
                 to: FindingState::Rejected,
@@ -755,6 +806,10 @@ impl SessionGraph {
                 decided_at: decided_at.clone(),
             });
         }
+        state.finding_transitions.extend(new_transitions);
+        state
+            .finding_transitions
+            .sort_by(|left, right| left.risk_id.cmp(&right.risk_id));
 
         Self::rebuild_risk_indexes(&mut state);
         for chunk_id in old_has_risk.keys().chain(state.has_risk.keys()) {
@@ -866,6 +921,9 @@ impl SessionGraph {
         // 从 RiskFinding.legal_basis 提取法条引用
         risk.law_refs = risk.finding.legal_basis.clone();
         if let Ok(mut state) = self.state.write() {
+            if Self::is_terminal_risk(&state, &risk.finding.risk_id) {
+                return;
+            }
             let chunk_ids = risk.finding.clause_ids.clone();
             state.risks.insert(risk.finding.risk_id.clone(), risk);
             bump_versions(&mut state, chunk_ids);
@@ -875,6 +933,7 @@ impl SessionGraph {
     /// 添加 has_risk 边（chunk → risk）。
     pub fn add_has_risk(&self, chunk_id: &str, risk_id: &str) {
         if let Ok(mut state) = self.state.write()
+            && !Self::is_terminal_risk(&state, risk_id)
             && push_unique(
                 state.has_risk.entry(chunk_id.to_string()).or_default(),
                 risk_id.to_string(),
@@ -1031,6 +1090,9 @@ impl SessionGraph {
     /// 添加 cites 边 + cited_by 反向索引（单条法条引用）。
     pub fn add_cites(&self, risk_id: &str, law_ref: &str) {
         if let Ok(mut state) = self.state.write() {
+            if Self::is_terminal_risk(&state, risk_id) {
+                return;
+            }
             let cites_changed = push_unique(
                 state.cites.entry(risk_id.to_string()).or_default(),
                 law_ref.to_string(),
@@ -1056,6 +1118,9 @@ impl SessionGraph {
         let law_refs = risk.finding.legal_basis.clone();
         risk.law_refs = law_refs.clone();
         if let Ok(mut state) = self.state.write() {
+            if Self::is_terminal_risk(&state, &risk_id) {
+                return;
+            }
             state.risks.insert(risk_id.clone(), risk);
             push_unique(
                 state.has_risk.entry(chunk_id.to_string()).or_default(),
@@ -1076,6 +1141,9 @@ impl SessionGraph {
         let law_refs = risk.finding.legal_basis.clone();
         risk.law_refs = law_refs.clone();
         if let Ok(mut state) = self.state.write() {
+            if Self::is_terminal_risk(&state, &risk_id) {
+                return;
+            }
             state.risks.insert(risk_id.clone(), risk);
             push_unique(
                 state.has_risk.entry(chunk_id.to_string()).or_default(),
@@ -1149,6 +1217,12 @@ impl SessionGraph {
         let risks = risk_ids
             .iter()
             .filter_map(|risk_id| state.risks.get(risk_id))
+            .filter(|risk| {
+                matches!(
+                    risk.state,
+                    FindingState::Provisional | FindingState::Confirmed
+                )
+            })
             .map(|risk| risk.finding.clone())
             .collect();
         let linked_chunks = state.linked_to.get(chunk_id).cloned().unwrap_or_default();
@@ -1625,6 +1699,52 @@ mod tests {
             .expect("应写入 provisional finding");
     }
 
+    fn make_finalized_graph() -> SessionGraph {
+        let graph = SessionGraph::new();
+        add_provisional_risk(&graph, "R_CONFIRMED", "ch_confirmed");
+        add_provisional_risk(&graph, "R_MERGED", "ch_merged");
+        add_provisional_risk(&graph, "R_REJECTED", "ch_rejected");
+        graph
+            .finalize_audit(
+                &[make_test_risk("R_CONFIRMED", "ch_confirmed").finding],
+                &HashMap::from([("R_MERGED".to_string(), "R_CONFIRMED".to_string())]),
+                &HashMap::from([("R_REJECTED".to_string(), "证据不足".to_string())]),
+            )
+            .expect("测试图最终裁决应成功");
+        graph
+    }
+
+    fn assert_terminal_legacy_write_is_noop(write: impl Fn(&SessionGraph, &str)) {
+        let graph = make_finalized_graph();
+        for risk_id in ["R_CONFIRMED", "R_MERGED", "R_REJECTED"] {
+            let before = serde_json::to_value(graph.snapshot()).expect("裁决前快照应可序列化");
+            write(&graph, risk_id);
+            let after = serde_json::to_value(graph.snapshot()).expect("裁决后快照应可序列化");
+            assert_eq!(after, before, "legacy 写入口不得修改终态 finding {risk_id}");
+        }
+    }
+
+    #[test]
+    fn legacy_public_writes_cannot_mutate_terminal_findings() {
+        assert_terminal_legacy_write_is_noop(|graph, risk_id| {
+            graph.add_risk(make_test_risk(risk_id, "ch_overwrite"));
+        });
+        assert_terminal_legacy_write_is_noop(|graph, risk_id| {
+            graph.add_has_risk("ch_extra", risk_id);
+        });
+        assert_terminal_legacy_write_is_noop(|graph, risk_id| {
+            graph.add_cites(risk_id, "《新增法》第9条");
+        });
+        assert_terminal_legacy_write_is_noop(|graph, risk_id| {
+            graph.add_risk_with_edges(make_test_risk(risk_id, "ch_overwrite"), "ch_extra");
+        });
+        assert_terminal_legacy_write_is_noop(|graph, risk_id| {
+            let mut risk = make_test_risk(risk_id, "ch_overwrite");
+            risk.finding.finding_role = FindingRole::Hypothesis;
+            graph.add_hypothesis(risk, "ch_extra");
+        });
+    }
+
     #[test]
     fn finalize_audit_confirms_latest_finding_and_rebuilds_risk_indexes() {
         let graph = SessionGraph::new();
@@ -1830,6 +1950,140 @@ mod tests {
         assert_eq!(after.chunk_versions, before.chunk_versions);
         assert_eq!(after.risks["R_001"].state, FindingState::Provisional);
         assert!(after.finding_transitions.is_empty());
+    }
+
+    #[test]
+    fn finalize_audit_rejects_blank_final_clause_id_atomically() {
+        let graph = SessionGraph::new();
+        add_provisional_risk(&graph, "R_001", "ch_001");
+        let mut final_finding = make_test_risk("R_001", "ch_001").finding;
+        final_finding.clause_ids = vec![" \t ".to_string()];
+        let before = serde_json::to_value(graph.snapshot()).expect("快照应可序列化");
+
+        let error = graph
+            .finalize_audit(&[final_finding], &HashMap::new(), &HashMap::new())
+            .expect_err("最终 finding 的空白 clause_id 必须失败");
+        let after = serde_json::to_value(graph.snapshot()).expect("快照应可序列化");
+
+        assert!(error.contains("clause_id"));
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn finalize_audit_rejects_missing_final_clause_atomically() {
+        let graph = SessionGraph::new();
+        add_provisional_risk(&graph, "R_001", "ch_001");
+        let mut final_finding = make_test_risk("R_001", "ch_001").finding;
+        final_finding.clause_ids = vec!["ch_missing".to_string()];
+        let before = serde_json::to_value(graph.snapshot()).expect("快照应可序列化");
+
+        let error = graph
+            .finalize_audit(&[final_finding], &HashMap::new(), &HashMap::new())
+            .expect_err("最终 finding 引用不存在条款必须失败");
+        let after = serde_json::to_value(graph.snapshot()).expect("快照应可序列化");
+
+        assert!(error.contains("不存在"));
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn finalize_audit_rejects_invalid_clause_references_on_decision_sources() {
+        for (source_id, clause_id, is_merged) in [
+            ("R_MERGED", " \t ", true),
+            ("R_REJECTED", "ch_missing", false),
+        ] {
+            let graph = SessionGraph::new();
+            add_provisional_risk(&graph, "R_TARGET", "ch_target");
+            graph.add_risk_with_edges(make_test_risk(source_id, clause_id), clause_id);
+            let before = serde_json::to_value(graph.snapshot()).expect("快照应可序列化");
+            let merged = is_merged
+                .then(|| HashMap::from([(source_id.to_string(), "R_TARGET".to_string())]))
+                .unwrap_or_default();
+            let rejected = (!is_merged)
+                .then(|| HashMap::from([(source_id.to_string(), "证据不足".to_string())]))
+                .unwrap_or_default();
+
+            let error = graph
+                .finalize_audit(
+                    &[make_test_risk("R_TARGET", "ch_target").finding],
+                    &merged,
+                    &rejected,
+                )
+                .expect_err("裁决源 finding 的非法条款引用必须失败");
+            let after = serde_json::to_value(graph.snapshot()).expect("快照应可序列化");
+
+            assert!(error.contains("clause_id") || error.contains("不存在"));
+            assert_eq!(after, before);
+        }
+    }
+
+    #[test]
+    fn finalize_audit_rejects_hypothesis_final_finding_atomically() {
+        let graph = SessionGraph::new();
+        add_provisional_risk(&graph, "R_001", "ch_001");
+        let mut final_finding = make_test_risk("R_001", "ch_001").finding;
+        final_finding.finding_role = FindingRole::Hypothesis;
+        let before = serde_json::to_value(graph.snapshot()).expect("快照应可序列化");
+
+        let error = graph
+            .finalize_audit(&[final_finding], &HashMap::new(), &HashMap::new())
+            .expect_err("Hypothesis 不得成为 confirmed finding");
+        let after = serde_json::to_value(graph.snapshot()).expect("快照应可序列化");
+
+        assert!(error.contains("Hypothesis"));
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn clause_context_excludes_merged_and_rejected_terminal_history() {
+        let graph = SessionGraph::new();
+        graph.add_chunk(make_test_chunk("ch_shared"));
+        for risk_id in ["R_CONFIRMED", "R_MERGED", "R_REJECTED", "R_PROVISIONAL"] {
+            graph
+                .upsert_provisional_findings(&[make_test_risk(risk_id, "ch_shared").finding])
+                .expect("应写入 provisional finding");
+        }
+        graph
+            .finalize_audit(
+                &[make_test_risk("R_CONFIRMED", "ch_shared").finding],
+                &HashMap::from([("R_MERGED".to_string(), "R_CONFIRMED".to_string())]),
+                &HashMap::from([("R_REJECTED".to_string(), "证据不足".to_string())]),
+            )
+            .expect("最终裁决应成功");
+
+        let mut risk_ids = graph
+            .query_clause_context("ch_shared")
+            .risks
+            .into_iter()
+            .map(|finding| finding.risk_id)
+            .collect::<Vec<_>>();
+        risk_ids.sort();
+
+        assert_eq!(risk_ids, vec!["R_CONFIRMED", "R_PROVISIONAL"]);
+    }
+
+    #[test]
+    fn finalize_audit_records_transitions_in_risk_id_order() {
+        let graph = SessionGraph::new();
+        for risk_id in ["R_Z", "R_A", "R_M"] {
+            add_provisional_risk(&graph, risk_id, &format!("ch_{risk_id}"));
+        }
+
+        graph
+            .finalize_audit(
+                &[make_test_risk("R_Z", "ch_R_Z").finding],
+                &HashMap::from([("R_A".to_string(), "R_Z".to_string())]),
+                &HashMap::from([("R_M".to_string(), "证据不足".to_string())]),
+            )
+            .expect("最终裁决应成功");
+        let transition_ids = graph
+            .snapshot()
+            .finding_transitions
+            .into_iter()
+            .map(|transition| transition.risk_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(transition_ids, vec!["R_A", "R_M", "R_Z"]);
     }
 
     #[test]
