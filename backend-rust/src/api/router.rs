@@ -214,7 +214,11 @@ where
 }
 
 fn is_internal_path(path: &str) -> bool {
-    path == "/api/v1" || path.starts_with("/api/v1/")
+    // 罗盘（实验指标仪表板）是随 server 启动的本地调试工具，浏览器直接访问无法做 HMAC 签名；
+    // 其余 /api/v1/* 仍受内部认证保护（供 Java 后端调用）。
+    let is_api = path == "/api/v1" || path.starts_with("/api/v1/");
+    let is_metrics = path.starts_with("/api/v1/metrics");
+    is_api && !is_metrics
 }
 
 fn required_header(

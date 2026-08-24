@@ -489,6 +489,8 @@ mod tests {
             verification_required: vec![],
             hypothesized_by: vec![],
             verified_by: vec![],
+            evidence_verdict: None,
+            verifier_reason: None,
             page_number: None,
             section_path: None,
             context: None,

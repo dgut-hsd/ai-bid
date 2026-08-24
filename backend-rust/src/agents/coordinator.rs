@@ -35,6 +35,7 @@ use crate::agents::risk_taxonomy;
 use crate::agents::session_graph::SessionGraph;
 use crate::agents::tools::ToolRegistry;
 use crate::agents::trace::TraceLog;
+use crate::agents::evidence_verifier::{evidence_core_key, verify_evidence};
 use crate::agents::types::*;
 use crate::paths::data_path_str;
 use anyhow::Result;
@@ -647,6 +648,25 @@ impl Coordinator {
             collector.record_sub_phase("Debate", debate_duration);
         }
         phase_start = std::time::Instant::now();
+
+        // [6.5] EVIDENCE VERIFY: 证据核验（证伪导向 NLI 三分类）
+        execution_control.record_pipeline_timeout_if_expired();
+        if self.config.enable_evidence_verify && !execution_control.pipeline_expired() {
+            emit(&ReviewEvent::Phase {
+                phase: crate::agents::review_event::PipelinePhase::Triage,
+                phase_index: 6,
+                total_phases: 7,
+                message: "证据核验中（证伪导向 NLI 三分类）...".to_string(),
+            });
+            let ev_timeout = execution_control.pipeline_remaining().unwrap_or_default();
+            if tokio::time::timeout(ev_timeout, self.evidence_verify(&mut merged[..]))
+                .await
+                .is_err()
+            {
+                eprintln!("  [EVIDENCE_VERIFY] 阶段超时，跳过");
+                execution_control.record_pipeline_timeout_if_expired();
+            }
+        }
 
         // [7] TRIAGE: 按 severity + confidence 分流
         emit(&ReviewEvent::Phase {
@@ -2841,6 +2861,8 @@ impl Coordinator {
                     verification_required: Vec::new(),
                     hypothesized_by: Vec::new(),
                     verified_by: Vec::new(),
+                    evidence_verdict: None,
+                    verifier_reason: None,
                     page_number: Some(chunk.page_start + 1),
                     section_path: Some(chunk.section_path.clone()),
                     context: Some(chunk.text_preview.chars().take(500).collect()),
@@ -2899,6 +2921,8 @@ impl Coordinator {
                     verification_required: Vec::new(),
                     hypothesized_by: Vec::new(),
                     verified_by: Vec::new(),
+                    evidence_verdict: None,
+                    verifier_reason: None,
                     page_number: Some(chunk.page_start + 1),
                     section_path: Some(chunk.section_path.clone()),
                     context: Some(chunk.text_preview.chars().take(500).collect()),
@@ -2911,6 +2935,75 @@ impl Coordinator {
             blind_findings.len()
         );
         blind_findings
+    }
+
+    // ── [6.5] EVIDENCE VERIFY: 证据核验（证伪导向 NLI 三分类）──
+    /// 对每条 Verified finding 仅凭 source_quote + risk_type 做独立证据核验，不喂 reason。
+    /// support → 放行；refute/insufficient → 降级 Info（疑似）。
+    /// 同一原文（去重 key）只调用一次 LLM，结果复用。
+    async fn evidence_verify(&self, findings: &mut [RiskFinding]) -> usize {
+        // 1) 去重：同一核心原文只裁决一次
+        let mut reps: Vec<(String, String, String)> = Vec::new(); // (key, quote, risk_type)
+        let mut seen: HashSet<String> = HashSet::new();
+        for f in findings.iter() {
+            if f.no_risk || f.source_quote.trim().is_empty() {
+                continue;
+            }
+            let key = evidence_core_key(&f.source_quote);
+            if seen.insert(key.clone()) {
+                reps.push((key, f.source_quote.clone(), f.risk_type.clone()));
+            }
+        }
+        eprintln!(
+            "  [EVIDENCE_VERIFY] 收到 {} 条 findings，去重后 {} 组",
+            findings.len(),
+            reps.len()
+        );
+
+        // 2) 逐组独立裁决
+        let mut cache: HashMap<String, (String, String)> = HashMap::new();
+        let mut verified = 0usize;
+        for (key, quote, risk_type) in reps {
+            let llm = (self.llm_factory)();
+            if let Some((verdict, reason)) = verify_evidence(llm.as_ref(), &quote, &risk_type).await {
+                verified += 1;
+                cache.insert(key, (verdict, reason));
+            }
+            // 轻量节流，避免触发 LLM 限流
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        // 3) 回写每条 finding：support 放行，其余降级 Info
+        let mut dropped = 0usize;
+        for f in findings.iter_mut() {
+            if f.no_risk || f.source_quote.trim().is_empty() {
+                continue;
+            }
+            let key = evidence_core_key(&f.source_quote);
+            if let Some((verdict, reason)) = cache.get(&key) {
+                f.evidence_verdict = Some(verdict.clone());
+                f.verifier_reason = Some(reason.clone());
+                if verdict == "support" {
+                    f.reason.push_str(&format!(
+                        "\n[EvidenceVerify] ✅ 证据核验通过: {}。",
+                        reason
+                    ));
+                } else {
+                    dropped += 1;
+                    f.severity = RiskSeverity::Info;
+                    f.clear_criticality();
+                    f.reason.push_str(&format!(
+                        "\n[EvidenceVerify] ❓ 证据核验未通过（{}）: {}。已降级为疑似。",
+                        verdict, reason
+                    ));
+                }
+            }
+        }
+        eprintln!(
+            "  [EVIDENCE_VERIFY] 独立裁决 {} 组原文，{} 条降级为疑似",
+            verified, dropped
+        );
+        verified
     }
 
     // ── [7] TRIAGE: 按 severity + confidence 分流 ────────────
@@ -3411,6 +3504,8 @@ mod tests {
             verification_required: Vec::new(),
             hypothesized_by: Vec::new(),
             verified_by: Vec::new(),
+                    evidence_verdict: None,
+                    verifier_reason: None,
             page_number: None,
             section_path: None,
             context: None,
