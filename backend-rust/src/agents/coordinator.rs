@@ -768,11 +768,12 @@ impl Coordinator {
             );
         }
 
+        let (findings, graph_snapshot) = self.finalize_audit_output(&findings, &merge_history)?;
         let high_risk_count = findings
             .iter()
             .filter(|f| f.severity == RiskSeverity::High)
             .count();
-        let graph_snapshot = Some(self.finalize_audit_snapshot(&findings, &merge_history)?);
+        let graph_snapshot = Some(graph_snapshot);
 
         let routing_summary = RoutingSummary {
             total_clauses,
@@ -816,18 +817,42 @@ impl Coordinator {
         })
     }
 
-    /// 将 Coordinator 的最终裁决原子写入图后再生成快照。
-    fn finalize_audit_snapshot(
+    /// 将最终裁决原子写入图，并从 Confirmed 节点重建规范化输出。
+    fn finalize_audit_output(
         &self,
         findings: &[RiskFinding],
         merge_history: &[HashMap<String, String>],
-    ) -> Result<GraphSnapshot> {
+    ) -> Result<(Vec<RiskFinding>, GraphSnapshot)> {
         let merged = resolve_merged_findings(merge_history, findings)?;
         // 当前管线没有可靠的显式 reject 信号；证据不足和 Hypothesis 仅表示尚未证实，继续保持 provisional。
         self.graph
             .finalize_audit(findings, &merged, &HashMap::new())
             .map_err(anyhow::Error::msg)?;
-        Ok(self.graph.snapshot())
+        let snapshot = self.graph.snapshot();
+        let mut normalized = Vec::with_capacity(findings.len());
+        for finding in findings {
+            let node = snapshot
+                .risks
+                .get(&finding.risk_id)
+                .ok_or_else(|| anyhow::anyhow!("最终快照缺少 finding: {}", finding.risk_id))?;
+            if node.state != FindingState::Confirmed {
+                anyhow::bail!("最终 finding 未进入 Confirmed 状态: {}", finding.risk_id);
+            }
+            normalized.push(node.finding.clone());
+        }
+        let confirmed_count = snapshot
+            .risks
+            .values()
+            .filter(|node| node.state == FindingState::Confirmed)
+            .count();
+        if confirmed_count != normalized.len() {
+            anyhow::bail!(
+                "最终输出与 Confirmed 节点数量不一致: output={}, confirmed={}",
+                normalized.len(),
+                confirmed_count
+            );
+        }
+        Ok((normalized, snapshot))
     }
 
     // ── BlindSpot: 后台异步经验沉淀 ──────────────────────────────
@@ -5029,8 +5054,8 @@ mod tests {
             "R_TARGET".to_string(),
         )])];
 
-        let snapshot = coordinator
-            .finalize_audit_snapshot(std::slice::from_ref(&target), &merge_history)
+        let (_, snapshot) = coordinator
+            .finalize_audit_output(std::slice::from_ref(&target), &merge_history)
             .expect("最终化应成功");
 
         let confirmed_ids = snapshot
@@ -5062,10 +5087,53 @@ mod tests {
         let finding = make_test_finding("R_MISSING", "ch_missing", "FactCheckAgent");
 
         let error = coordinator
-            .finalize_audit_snapshot(&[finding], &[])
+            .finalize_audit_output(&[finding], &[])
             .expect_err("最终 finding 不在工作图中时必须失败");
 
         assert!(error.to_string().contains("最终 finding 在工作图中不存在"));
+    }
+
+    #[test]
+    fn finalize_audit_output_rebuilds_normalized_findings_in_original_order() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let clauses = vec![
+            make_test_clause("ch_first", "第一条款"),
+            make_test_clause("ch_second", "第二条款"),
+        ];
+        coordinator.preload_chunks(&clauses);
+        let mut first = make_test_finding("R_FIRST", "ch_first", "FactCheckAgent");
+        first.clause_ids = vec!["ch_first".to_string(), "ch_first".to_string()];
+        first.legal_basis = vec!["《测试法》第1条".to_string(), "《测试法》第1条".to_string()];
+        let second = make_test_finding("R_SECOND", "ch_second", "SemanticRiskAgent");
+        coordinator
+            .graph
+            .upsert_provisional_findings(&[first.clone(), second.clone()])
+            .expect("测试 finding 应写入工作图");
+
+        let (normalized, snapshot) = coordinator
+            .finalize_audit_output(&[second, first], &[])
+            .expect("最终化应返回规范化结果");
+
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|finding| finding.risk_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["R_SECOND", "R_FIRST"],
+            "规范化后必须保持 Triage 输出顺序"
+        );
+        assert_eq!(normalized[1].clause_ids, vec!["ch_first"]);
+        assert_eq!(normalized[1].legal_basis, vec!["《测试法》第1条"]);
+        for finding in &normalized {
+            let node = &snapshot.risks[&finding.risk_id];
+            assert_eq!(node.state, FindingState::Confirmed);
+            assert_eq!(
+                serde_json::to_value(finding).expect("finding 应可序列化"),
+                serde_json::to_value(&node.finding).expect("节点 finding 应可序列化"),
+                "API finding 的全部业务字段必须与 Confirmed RiskNode 一致"
+            );
+        }
     }
 
     #[tokio::test]
