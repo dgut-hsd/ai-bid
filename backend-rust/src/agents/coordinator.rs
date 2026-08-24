@@ -98,12 +98,21 @@ fn sort_blind_spot_candidate_ids(snapshot: &GraphSnapshot, candidate_ids: &mut [
     });
 }
 
-type DynamicAgentReplace = dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync;
+type DynamicAgentRename = dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync;
+
+struct DynamicAgentReplaceError {
+    error: std::io::Error,
+    recovery_pending: bool,
+}
+
+type DynamicAgentReplace =
+    dyn Fn(&Path, &Path) -> std::result::Result<(), DynamicAgentReplaceError> + Send + Sync;
 
 struct DynamicAgentStore {
     path: PathBuf,
     transaction_lock: std::sync::Mutex<()>,
     replace: Arc<DynamicAgentReplace>,
+    recovery_rename: Arc<DynamicAgentRename>,
 }
 
 impl DynamicAgentStore {
@@ -115,14 +124,44 @@ impl DynamicAgentStore {
     }
 
     fn new(path: impl Into<PathBuf>) -> Self {
-        Self::with_replacer(path, Arc::new(replace_dynamic_agent_file))
-    }
-
-    fn with_replacer(path: impl Into<PathBuf>, replace: Arc<DynamicAgentReplace>) -> Self {
+        let rename: Arc<DynamicAgentRename> =
+            Arc::new(|source, target| std::fs::rename(source, target));
         Self {
             path: path.into(),
             transaction_lock: std::sync::Mutex::new(()),
-            replace,
+            replace: default_dynamic_agent_replacer(rename.clone()),
+            recovery_rename: rename,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_replacer(
+        path: impl Into<PathBuf>,
+        replace: Arc<dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            transaction_lock: std::sync::Mutex::new(()),
+            replace: Arc::new(move |source, target| {
+                replace(source, target).map_err(|error| DynamicAgentReplaceError {
+                    error,
+                    recovery_pending: false,
+                })
+            }),
+            recovery_rename: Arc::new(|source, target| std::fs::rename(source, target)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_rename_operations(path: impl Into<PathBuf>, rename: Arc<DynamicAgentRename>) -> Self {
+        let replace_rename = rename.clone();
+        Self {
+            path: path.into(),
+            transaction_lock: std::sync::Mutex::new(()),
+            replace: Arc::new(move |source, target| {
+                replace_dynamic_agent_file_with_backup(source, target, &*replace_rename)
+            }),
+            recovery_rename: rename,
         }
     }
 
@@ -164,14 +203,57 @@ impl DynamicAgentStore {
     }
 
     fn read_manifest_unlocked(&self) -> Result<Option<DynamicAgentManifest>> {
-        if !self.path.exists() {
+        let Some(read_path) = self.recover_manifest_path_unlocked()? else {
             return Ok(None);
-        }
-        let json = std::fs::read_to_string(&self.path)?;
+        };
+        let json = std::fs::read_to_string(read_path)?;
         Ok(Some(serde_json::from_str(&json)?))
     }
 
+    fn recover_manifest_path_unlocked(&self) -> Result<Option<PathBuf>> {
+        let backups = dynamic_agent_backup_candidates(&self.path)?;
+        if backups.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "发现多个动态 Agent 恢复备份，拒绝随机选择: {}",
+                backups
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let backup = backups.first();
+        if self.path.exists() {
+            if let Some(backup) = backup {
+                if let Err(error) = std::fs::remove_file(backup) {
+                    eprintln!("  [DYNAMIC] 清理已完成恢复备份失败: {}", error);
+                } else {
+                    cleanup_dynamic_agent_temps(&self.path);
+                }
+            }
+            return Ok(Some(self.path.clone()));
+        }
+        let Some(backup) = backup else {
+            return Ok(None);
+        };
+        match (self.recovery_rename)(backup, &self.path) {
+            Ok(()) => {
+                cleanup_dynamic_agent_temps(&self.path);
+                Ok(Some(self.path.clone()))
+            }
+            Err(error) => {
+                eprintln!("  [DYNAMIC] 恢复 canonical 失败，暂从备份读取: {}", error);
+                Ok(Some(backup.clone()))
+            }
+        }
+    }
+
     fn persist_manifest_unlocked(&self, manifest: &DynamicAgentManifest) -> Result<()> {
+        if !self.path.exists() && !dynamic_agent_backup_candidates(&self.path)?.is_empty() {
+            return Err(anyhow::anyhow!(
+                "动态 Agent canonical 尚待从备份恢复，拒绝覆盖恢复状态"
+            ));
+        }
         let parent = self
             .path
             .parent()
@@ -200,38 +282,129 @@ impl DynamicAgentStore {
         }
 
         if let Err(error) = (self.replace)(&temp_path, &self.path) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(error.into());
+            if !error.recovery_pending {
+                let _ = std::fs::remove_file(&temp_path);
+            }
+            return Err(anyhow::anyhow!(error.error));
         }
         Ok(())
     }
 }
 
 #[cfg(not(windows))]
-fn replace_dynamic_agent_file(source: &Path, target: &Path) -> std::io::Result<()> {
-    std::fs::rename(source, target)
+fn default_dynamic_agent_replacer(rename: Arc<DynamicAgentRename>) -> Arc<DynamicAgentReplace> {
+    Arc::new(move |source, target| {
+        rename(source, target).map_err(|error| DynamicAgentReplaceError {
+            error,
+            recovery_pending: false,
+        })
+    })
 }
 
 #[cfg(windows)]
-fn replace_dynamic_agent_file(source: &Path, target: &Path) -> std::io::Result<()> {
-    if !target.exists() {
-        return std::fs::rename(source, target);
+fn default_dynamic_agent_replacer(rename: Arc<DynamicAgentRename>) -> Arc<DynamicAgentReplace> {
+    Arc::new(move |source, target| replace_dynamic_agent_file_with_backup(source, target, &*rename))
+}
+
+fn dynamic_agent_backup_path(target: &Path) -> Result<PathBuf> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("动态 Agent 路径缺少父目录"))?;
+    let file_name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("dynamic_agents.json");
+    Ok(parent.join(format!(".{}.backup", file_name)))
+}
+
+fn dynamic_agent_backup_candidates(target: &Path) -> Result<Vec<PathBuf>> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("动态 Agent 路径缺少父目录"))?;
+    if !parent.exists() {
+        return Ok(Vec::new());
     }
-    let parent = target.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "动态 Agent 路径缺少父目录",
-        )
+    let deterministic = dynamic_agent_backup_path(target)?;
+    let mut backups = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if path == deterministic || name.starts_with(".dynamic_agents.backup-") {
+            backups.push(path);
+        }
+    }
+    backups.sort();
+    Ok(backups)
+}
+
+fn cleanup_dynamic_agent_temps(target: &Path) {
+    let Some(parent) = target.parent() else {
+        return;
+    };
+    let file_name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("dynamic_agents.json");
+    let prefix = format!(".{}.tmp-", file_name);
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_temp = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.starts_with(&prefix));
+        if is_temp && let Err(error) = std::fs::remove_file(&path) {
+            eprintln!("  [DYNAMIC] 清理恢复临时文件失败: {}", error);
+        }
+    }
+}
+
+fn replace_dynamic_agent_file_with_backup(
+    source: &Path,
+    target: &Path,
+    rename: &DynamicAgentRename,
+) -> std::result::Result<(), DynamicAgentReplaceError> {
+    if !target.exists() {
+        return rename(source, target).map_err(|error| DynamicAgentReplaceError {
+            error,
+            recovery_pending: false,
+        });
+    }
+    let backup = dynamic_agent_backup_path(target).map_err(|error| DynamicAgentReplaceError {
+        error: std::io::Error::other(error.to_string()),
+        recovery_pending: false,
     })?;
-    let backup = parent.join(format!(".dynamic_agents.backup-{}", uuid::Uuid::new_v4()));
-    std::fs::rename(target, &backup)?;
-    if let Err(replace_error) = std::fs::rename(source, target) {
-        return match std::fs::rename(&backup, target) {
-            Ok(()) => Err(replace_error),
-            Err(rollback_error) => Err(std::io::Error::new(
-                rollback_error.kind(),
-                format!("替换失败: {}；回滚失败: {}", replace_error, rollback_error),
-            )),
+    if backup.exists() {
+        return Err(DynamicAgentReplaceError {
+            error: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("动态 Agent 恢复备份已存在: {}", backup.display()),
+            ),
+            recovery_pending: true,
+        });
+    }
+    rename(target, &backup).map_err(|error| DynamicAgentReplaceError {
+        error,
+        recovery_pending: false,
+    })?;
+    if let Err(replace_error) = rename(source, target) {
+        return match rename(&backup, target) {
+            Ok(()) => Err(DynamicAgentReplaceError {
+                error: replace_error,
+                recovery_pending: false,
+            }),
+            Err(rollback_error) => Err(DynamicAgentReplaceError {
+                error: std::io::Error::new(
+                    rollback_error.kind(),
+                    format!("替换失败: {}；回滚失败: {}", replace_error, rollback_error),
+                ),
+                recovery_pending: true,
+            }),
         };
     }
     if let Err(error) = std::fs::remove_file(&backup) {
@@ -5641,6 +5814,109 @@ mod tests {
         );
         std::fs::remove_dir_all(path.parent().expect("测试路径应有父目录"))
             .expect("应清理隔离目录");
+    }
+
+    #[test]
+    fn rollback_failure_remains_readable_and_next_load_recovers_canonical() {
+        let path = isolated_dynamic_agent_path("dynamic_rollback_recovery");
+        std::fs::create_dir_all(path.parent().expect("测试路径应有父目录"))
+            .expect("应创建隔离目录");
+        let original = DynamicAgentManifest {
+            version: 1,
+            agents: vec![DynamicAgentDefinition {
+                id: "Dynamic_Original".into(),
+                display_name: "原清单".into(),
+                system_prompt: "保留原清单".into(),
+                default_max_turns: 8,
+                complexity: AgentComplexity::Medium,
+                section_keywords: vec!["原清单".into()],
+                tool_names: vec![],
+                created_at: "2026-01-01T00:00:00Z".into(),
+                created_by: "test".into(),
+                reason: "test".into(),
+                active: false,
+            }],
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&original).unwrap())
+            .expect("应写入 canonical 原内容");
+        let rename_calls = Arc::new(AtomicUsize::new(0));
+        let rename = Arc::new({
+            let rename_calls = rename_calls.clone();
+            move |source: &Path, target: &Path| {
+                let call = rename_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if matches!(call, 2..=4) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("模拟第 {} 次 rename 失败", call),
+                    ));
+                }
+                std::fs::rename(source, target)
+            }
+        });
+        let store = Arc::new(DynamicAgentStore::with_rename_operations(
+            path.clone(),
+            rename,
+        ));
+        let mut coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        coordinator.dynamic_agent_store = store.clone();
+        let finding = make_suggested_agent_finding("R_RECOVERY", "Recovery", "恢复类");
+
+        coordinator
+            .register_dynamic_agents(&[finding])
+            .expect_err("替换和首次回滚应失败");
+        assert!(!path.exists(), "双重失败后 canonical 暂时缺失");
+        let first_load = store
+            .read_manifest()
+            .expect("恢复 rename 失败时仍应从 backup 读取")
+            .expect("backup 中应有原清单");
+        assert_eq!(first_load.agents[0].id, "Dynamic_Original");
+        assert!(!path.exists(), "首次恢复失败应保留可重试状态");
+
+        let second_load = store
+            .read_manifest()
+            .expect("下一次恢复应成功")
+            .expect("恢复后应读到原清单");
+        assert_eq!(second_load.agents[0].id, "Dynamic_Original");
+        assert!(path.exists(), "canonical 应恢复");
+        let retry_finding = make_suggested_agent_finding("R_RECOVERY_RETRY", "Recovery", "恢复类");
+        assert_eq!(
+            coordinator
+                .register_dynamic_agents(&[retry_finding])
+                .expect("恢复后 append 应可安全重试"),
+            1
+        );
+        let recovered: DynamicAgentManifest =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("重试后 canonical 应可读"))
+                .expect("重试后 canonical JSON 应合法");
+        assert_eq!(recovered.agents.len(), 2);
+        assert_eq!(
+            std::fs::read_dir(path.parent().expect("测试路径应有父目录"))
+                .expect("应读取隔离目录")
+                .count(),
+            1,
+            "恢复成功后 backup/temp 应清理"
+        );
+        std::fs::remove_dir_all(path.parent().expect("测试路径应有父目录"))
+            .expect("应清理隔离目录");
+    }
+
+    #[test]
+    fn multiple_recovery_backups_are_rejected_deterministically() {
+        let path = isolated_dynamic_agent_path("dynamic_multiple_backups");
+        let parent = path.parent().expect("测试路径应有父目录").to_path_buf();
+        std::fs::create_dir_all(&parent).expect("应创建隔离目录");
+        let deterministic = dynamic_agent_backup_path(&path).expect("应生成确定性备份路径");
+        let legacy = parent.join(".dynamic_agents.backup-legacy");
+        std::fs::write(&deterministic, br#"{"version":1,"agents":[]}"#).expect("应写入确定性备份");
+        std::fs::write(&legacy, br#"{"version":1,"agents":[]}"#).expect("应写入遗留备份");
+        let store = DynamicAgentStore::new(path);
+
+        let error = store.read_manifest().expect_err("多个备份必须拒绝随机选择");
+
+        assert!(error.to_string().contains("发现多个动态 Agent 恢复备份"));
+        assert!(error.to_string().contains("拒绝随机选择"));
+        std::fs::remove_dir_all(parent).expect("应清理隔离目录");
     }
 
     #[test]
