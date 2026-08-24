@@ -40,7 +40,7 @@ use crate::agents::trace::TraceLog;
 use crate::agents::types::*;
 use crate::paths::data_path_str;
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
@@ -205,6 +205,51 @@ fn extract_clause_keywords(text: &str) -> String {
 /// MERGE 阶段的去重结果。
 struct MergeResult {
     retained: Vec<RiskFinding>,
+    merged: HashMap<String, String>,
+}
+
+/// 将多轮去重关系解析到最终 finding，未抵达最终集合的链保持 provisional。
+fn resolve_merged_findings(
+    merge_history: &[HashMap<String, String>],
+    final_findings: &[RiskFinding],
+) -> Result<HashMap<String, String>> {
+    let final_ids = final_findings
+        .iter()
+        .map(|finding| finding.risk_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut links = BTreeMap::new();
+    for round in merge_history {
+        let mut entries = round.iter().collect::<Vec<_>>();
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (source, target) in entries {
+            if let Some(existing) = links.insert(source.clone(), target.clone())
+                && existing != *target
+            {
+                anyhow::bail!(
+                    "同一 finding 存在冲突的合并目标: {} -> {} / {}",
+                    source,
+                    existing,
+                    target
+                );
+            }
+        }
+    }
+
+    let mut resolved = HashMap::new();
+    for source in links.keys() {
+        let mut current = source.as_str();
+        let mut visited = HashSet::new();
+        while let Some(target) = links.get(current) {
+            if !visited.insert(current.to_string()) {
+                anyhow::bail!("合并关系存在循环，涉及 finding: {}", current);
+            }
+            current = target;
+        }
+        if final_ids.contains(current) {
+            resolved.insert(source.clone(), current.to_string());
+        }
+    }
+    Ok(resolved)
 }
 
 /// 多 Agent 审查协调器。
@@ -533,6 +578,7 @@ impl Coordinator {
             message: format!("去重合并中 ({} 条原始发现)...", all_findings.len()),
         });
         let merge_result = self.merge_findings_v3(all_findings, &emit);
+        let mut merge_history = vec![merge_result.merged];
         let mut merged = merge_result.retained;
 
         // [4b] LINK: 跨 Agent 同类型风险关联推导
@@ -684,7 +730,9 @@ impl Coordinator {
         }
         // Debate/LegalVerify 都可能回写 severity 或 Critical。最终出口再次执行
         // 统一分类、证据准入和跨 Agent 去重，禁止下游阶段绕过政策。
-        merged = self.merge_findings_v3(merged, &emit).retained;
+        let final_merge_result = self.merge_findings_v3(merged, &emit);
+        merge_history.push(final_merge_result.merged);
+        merged = final_merge_result.retained;
 
         // ── 指标：Debate 阶段耗时 ──
         let debate_duration = phase_start.elapsed().as_millis() as u64;
@@ -724,7 +772,7 @@ impl Coordinator {
             .iter()
             .filter(|f| f.severity == RiskSeverity::High)
             .count();
-        let graph_snapshot = Some(self.graph.snapshot());
+        let graph_snapshot = Some(self.finalize_audit_snapshot(&findings, &merge_history)?);
 
         let routing_summary = RoutingSummary {
             total_clauses,
@@ -766,6 +814,20 @@ impl Coordinator {
             graph_snapshot,
             execution_summary,
         })
+    }
+
+    /// 将 Coordinator 的最终裁决原子写入图后再生成快照。
+    fn finalize_audit_snapshot(
+        &self,
+        findings: &[RiskFinding],
+        merge_history: &[HashMap<String, String>],
+    ) -> Result<GraphSnapshot> {
+        let merged = resolve_merged_findings(merge_history, findings)?;
+        // 当前管线没有可靠的显式 reject 信号；证据不足和 Hypothesis 仅表示尚未证实，继续保持 provisional。
+        self.graph
+            .finalize_audit(findings, &merged, &HashMap::new())
+            .map_err(anyhow::Error::msg)?;
+        Ok(self.graph.snapshot())
     }
 
     // ── BlindSpot: 后台异步经验沉淀 ──────────────────────────────
@@ -1716,6 +1778,7 @@ impl Coordinator {
         emit: &dyn Fn(&ReviewEvent),
     ) -> MergeResult {
         let total = findings.len();
+        let mut merged_findings = HashMap::new();
         // 简单去重：按稳定分类|证据|clause_ids|agent 组合去重。
         // 同一 chunk 中的不同类别不得仅因文字相似被合并。
         let mut seen: HashMap<String, RiskFinding> = HashMap::new();
@@ -1735,6 +1798,7 @@ impl Coordinator {
                         reason: "去重合并（保留置信度更高的）".to_string(),
                         merged_into: Some(f.risk_id.clone()),
                     });
+                    merged_findings.insert(existing.risk_id.clone(), f.risk_id.clone());
                     seen.insert(key, f);
                 } else {
                     // 当前 finding 被合并掉了
@@ -1743,6 +1807,7 @@ impl Coordinator {
                         reason: "去重合并（保留置信度更高的）".to_string(),
                         merged_into: Some(existing.risk_id.clone()),
                     });
+                    merged_findings.insert(f.risk_id.clone(), existing.risk_id.clone());
                 }
             } else {
                 seen.insert(key, f);
@@ -1759,7 +1824,10 @@ impl Coordinator {
             removed_count,
             risk_count
         );
-        MergeResult { retained: merged }
+        MergeResult {
+            retained: merged,
+            merged: merged_findings,
+        }
     }
 
     // ── [4b] LINK: 跨 Agent 同类型风险 linked_to 推导 ──────────
@@ -1836,6 +1904,7 @@ impl Coordinator {
         emit: &dyn Fn(&ReviewEvent),
     ) -> MergeResult {
         let total = findings.len();
+        let mut merged_findings = HashMap::new();
         let mut normalized = Vec::with_capacity(total);
         for mut finding in findings {
             risk_taxonomy::normalize_finding(&mut finding);
@@ -1901,6 +1970,7 @@ impl Coordinator {
                         ),
                         merged_into: Some(existing.risk_id.clone()),
                     });
+                    merged_findings.insert(vf.risk_id.clone(), existing.risk_id.clone());
                     merged = true;
                     break;
                 }
@@ -1948,6 +2018,7 @@ impl Coordinator {
                         reason: format!("同类别证据相似度合并 (sim={:.2})", sim),
                         merged_into: Some(existing.risk_id.clone()),
                     });
+                    merged_findings.insert(f.risk_id.clone(), existing.risk_id.clone());
                     merged = true;
                     break;
                 }
@@ -1967,7 +2038,10 @@ impl Coordinator {
             hypotheses.len(),
             risk_count
         );
-        MergeResult { retained }
+        MergeResult {
+            retained,
+            merged: merged_findings,
+        }
     }
 
     // ── [5] LEGAL VERIFY: 分组批量 + 分层法条验证 ──────────────────
@@ -4860,6 +4934,173 @@ mod tests {
             2,
             "同一chunk中的不同风险类别不得因理由或证据文本相似而合并"
         );
+    }
+
+    #[test]
+    fn merge_findings_v3_records_removed_source_to_retained_target() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let mut retained = make_test_finding("R_RETAINED", "ch_001", "FactCheckAgent");
+        retained.confidence = 0.9;
+        retained.category_code = "LOCAL_REGISTRATION".to_string();
+        retained.risk_type = "地域注册限制".to_string();
+        retained.source_quote = "投标人须在本地注册并提供本地服务机构证明".to_string();
+        let mut removed = make_test_finding("R_REMOVED", "ch_001", "SemanticRiskAgent");
+        removed.confidence = 0.8;
+        removed.category_code = "LOCAL_REGISTRATION".to_string();
+        removed.risk_type = "地域注册限制".to_string();
+        removed.source_quote = "投标人须在本地注册并提供本地服务机构证明".to_string();
+
+        let result = coordinator.merge_findings_v3(vec![retained, removed], &|_| {});
+
+        assert_eq!(result.retained.len(), 1);
+        assert_eq!(result.retained[0].risk_id, "R_RETAINED");
+        assert_eq!(
+            result.merged,
+            HashMap::from([("R_REMOVED".to_string(), "R_RETAINED".to_string())])
+        );
+    }
+
+    #[test]
+    fn resolve_merged_findings_follows_two_round_chain_to_final_target() {
+        let final_findings = vec![make_test_finding("R_C", "ch_001", "FactCheckAgent")];
+        let history = vec![
+            HashMap::from([("R_A".to_string(), "R_B".to_string())]),
+            HashMap::from([("R_B".to_string(), "R_C".to_string())]),
+        ];
+
+        let resolved =
+            resolve_merged_findings(&history, &final_findings).expect("合并链应解析成功");
+
+        assert_eq!(
+            resolved,
+            HashMap::from([
+                ("R_A".to_string(), "R_C".to_string()),
+                ("R_B".to_string(), "R_C".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn resolve_merged_findings_omits_chain_without_final_target() {
+        let history = vec![HashMap::from([(
+            "R_PROVISIONAL".to_string(),
+            "R_NOT_FINAL".to_string(),
+        )])];
+
+        let resolved =
+            resolve_merged_findings(&history, &[]).expect("未进入最终集合的链应保持 provisional");
+
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn resolve_merged_findings_rejects_cycle() {
+        let history = vec![HashMap::from([
+            ("R_A".to_string(), "R_B".to_string()),
+            ("R_B".to_string(), "R_A".to_string()),
+        ])];
+
+        let error = resolve_merged_findings(&history, &[]).expect_err("合并链循环必须报错");
+
+        assert!(error.to_string().contains("合并关系存在循环"));
+    }
+
+    #[test]
+    fn finalize_audit_snapshot_aligns_final_fields_and_merged_target() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let clauses = vec![
+            make_test_clause("ch_target", "目标条款"),
+            make_test_clause("ch_source", "来源条款"),
+        ];
+        coordinator.preload_chunks(&clauses);
+        let mut target = make_test_finding("R_TARGET", "ch_target", "FactCheckAgent");
+        target.severity = RiskSeverity::Medium;
+        target.reason = "最终裁决理由".to_string();
+        target.legal_basis = vec!["《最终法》第2条".to_string()];
+        let source = make_test_finding("R_SOURCE", "ch_source", "SemanticRiskAgent");
+        coordinator
+            .graph
+            .upsert_provisional_findings(&[target.clone(), source])
+            .expect("测试 finding 应写入工作图");
+        let merge_history = vec![HashMap::from([(
+            "R_SOURCE".to_string(),
+            "R_TARGET".to_string(),
+        )])];
+
+        let snapshot = coordinator
+            .finalize_audit_snapshot(std::slice::from_ref(&target), &merge_history)
+            .expect("最终化应成功");
+
+        let confirmed_ids = snapshot
+            .risks
+            .iter()
+            .filter(|(_, node)| node.state == FindingState::Confirmed)
+            .map(|(risk_id, _)| risk_id.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(confirmed_ids, HashSet::from(["R_TARGET".to_string()]));
+        let target_node = &snapshot.risks["R_TARGET"];
+        assert_eq!(target_node.finding.severity, target.severity);
+        assert_eq!(target_node.finding.reason, target.reason);
+        assert_eq!(target_node.finding.legal_basis, target.legal_basis);
+        assert_eq!(target_node.finding.clause_ids, target.clause_ids);
+        let source_node = &snapshot.risks["R_SOURCE"];
+        assert_eq!(source_node.state, FindingState::Merged);
+        assert_eq!(source_node.merged_into.as_deref(), Some("R_TARGET"));
+        assert!(snapshot.finding_transitions.iter().any(|transition| {
+            transition.risk_id == "R_SOURCE"
+                && transition.to == FindingState::Merged
+                && transition.merged_into.as_deref() == Some("R_TARGET")
+        }));
+    }
+
+    #[test]
+    fn finalize_audit_snapshot_propagates_missing_graph_finding() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let finding = make_test_finding("R_MISSING", "ch_missing", "FactCheckAgent");
+
+        let error = coordinator
+            .finalize_audit_snapshot(&[finding], &[])
+            .expect_err("最终 finding 不在工作图中时必须失败");
+
+        assert!(error.to_string().contains("最终 finding 在工作图中不存在"));
+    }
+
+    #[tokio::test]
+    async fn review_returns_only_confirmed_findings_with_matching_snapshot_fields() {
+        let mut config = CoordinatorConfig::default();
+        config.enabled_agents = vec![AgentId::FactCheck];
+        config.enable_legal_verify = false;
+        let coordinator =
+            make_runtime_coordinator(config, Arc::new(|| Box::new(ConditionalSlowFindingLlm)));
+
+        let output = coordinator
+            .review(&[make_test_clause("ch_fast", "封面格式要求")])
+            .await
+            .expect("真实审核路径应完成最终化");
+        let snapshot = output.graph_snapshot.expect("审核结果必须包含最终快照");
+        let output_ids = output
+            .findings
+            .iter()
+            .map(|finding| finding.risk_id.clone())
+            .collect::<HashSet<_>>();
+        let confirmed_ids = snapshot
+            .risks
+            .iter()
+            .filter(|(_, node)| node.state == FindingState::Confirmed)
+            .map(|(risk_id, _)| risk_id.clone())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(output_ids, confirmed_ids);
+        for finding in output.findings {
+            let node = &snapshot.risks[&finding.risk_id];
+            assert_eq!(node.finding.severity, finding.severity);
+            assert_eq!(node.finding.reason, finding.reason);
+            assert_eq!(node.finding.legal_basis, finding.legal_basis);
+            assert_eq!(node.finding.clause_ids, finding.clause_ids);
+        }
     }
 
     // ── [4b] LINK 测试 ───────────────────────────────────────
