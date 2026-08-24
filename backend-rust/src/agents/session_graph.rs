@@ -534,6 +534,12 @@ impl SessionGraph {
             let mut normalized = finding.clone();
             normalized.clause_ids = deduplicate_strings(&finding.clause_ids);
             normalized.legal_basis = deduplicate_strings(&finding.legal_basis);
+            if normalized.clause_ids.is_empty() {
+                return Err(format!(
+                    "最终 finding {} 的 clause_ids 不得为空",
+                    finding.risk_id
+                ));
+            }
             if normalized_finals
                 .insert(finding.risk_id.clone(), normalized)
                 .is_some()
@@ -553,6 +559,11 @@ impl SessionGraph {
             || !merged_ids.is_disjoint(&rejected_ids)
         {
             return Err("confirmed、merged、rejected 三个集合必须互斥".to_string());
+        }
+        for (source, reason) in rejected {
+            if reason.trim().is_empty() {
+                return Err(format!("rejected finding {} 的裁决原因不得为空", source));
+            }
         }
 
         let mut state = self
@@ -618,6 +629,43 @@ impl SessionGraph {
                         && node.merged_into.is_none() => {}
                 _ => return Err(format!("finding {} 已处于冲突终态", source)),
             }
+        }
+
+        let existing_confirmed = state
+            .risks
+            .iter()
+            .filter(|(_, node)| node.state == FindingState::Confirmed)
+            .map(|(risk_id, _)| risk_id.clone())
+            .collect::<HashSet<_>>();
+        let existing_merged = state
+            .risks
+            .iter()
+            .filter(|(_, node)| node.state == FindingState::Merged)
+            .filter_map(|(risk_id, node)| {
+                node.merged_into
+                    .as_ref()
+                    .map(|target| (risk_id.clone(), target.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        let existing_rejected = state
+            .risks
+            .iter()
+            .filter(|(_, node)| node.state == FindingState::Rejected)
+            .filter_map(|(risk_id, node)| {
+                node.decision_reason
+                    .as_ref()
+                    .map(|reason| (risk_id.clone(), reason.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        let has_existing_terminal = !existing_confirmed.is_empty()
+            || !existing_merged.is_empty()
+            || !existing_rejected.is_empty();
+        if has_existing_terminal
+            && (existing_confirmed != confirmed_ids
+                || existing_merged != *merged
+                || existing_rejected != *rejected)
+        {
+            return Err("最终裁决重试必须完整包含所有已有终态 finding".to_string());
         }
 
         let mut changed_ids = HashSet::new();
@@ -1762,6 +1810,80 @@ mod tests {
         let after_conflict = graph.snapshot();
         assert_eq!(after_conflict.graph_version, before.graph_version);
         assert!(after_conflict.finding_transitions.is_empty());
+    }
+
+    #[test]
+    fn finalize_audit_rejects_final_finding_without_clause_ids_atomically() {
+        let graph = SessionGraph::new();
+        add_provisional_risk(&graph, "R_001", "ch_001");
+        let mut final_finding = make_test_risk("R_001", "ch_001").finding;
+        final_finding.clause_ids.clear();
+        let before = graph.snapshot();
+
+        let error = graph
+            .finalize_audit(&[final_finding], &HashMap::new(), &HashMap::new())
+            .expect_err("最终 finding 缺少 clause_ids 必须失败");
+        let after = graph.snapshot();
+
+        assert!(error.contains("clause_ids"));
+        assert_eq!(after.graph_version, before.graph_version);
+        assert_eq!(after.chunk_versions, before.chunk_versions);
+        assert_eq!(after.risks["R_001"].state, FindingState::Provisional);
+        assert!(after.finding_transitions.is_empty());
+    }
+
+    #[test]
+    fn finalize_audit_rejects_blank_rejection_reason_atomically() {
+        let graph = SessionGraph::new();
+        add_provisional_risk(&graph, "R_001", "ch_001");
+        let before = graph.snapshot();
+
+        let error = graph
+            .finalize_audit(
+                &[],
+                &HashMap::new(),
+                &HashMap::from([("R_001".to_string(), " \t ".to_string())]),
+            )
+            .expect_err("空白 rejected reason 必须失败");
+        let after = graph.snapshot();
+
+        assert!(error.contains("原因"));
+        assert_eq!(after.graph_version, before.graph_version);
+        assert_eq!(after.chunk_versions, before.chunk_versions);
+        assert_eq!(after.risks["R_001"].state, FindingState::Provisional);
+        assert!(after.finding_transitions.is_empty());
+    }
+
+    #[test]
+    fn finalize_audit_rejects_retry_that_omits_existing_terminal_findings() {
+        let graph = SessionGraph::new();
+        add_provisional_risk(&graph, "R_001", "ch_001");
+        add_provisional_risk(&graph, "R_002", "ch_002");
+        let final_r1 = make_test_risk("R_001", "ch_001").finding;
+        let final_r2 = make_test_risk("R_002", "ch_002").finding;
+        graph
+            .finalize_audit(
+                &[final_r1.clone(), final_r2],
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .expect("首次完整裁决应成功");
+        let before = graph.snapshot();
+
+        let error = graph
+            .finalize_audit(&[final_r1], &HashMap::new(), &HashMap::new())
+            .expect_err("重试遗漏已有 confirmed finding 必须失败");
+        let after = graph.snapshot();
+
+        assert!(error.contains("完整"));
+        assert_eq!(after.graph_version, before.graph_version);
+        assert_eq!(after.chunk_versions, before.chunk_versions);
+        assert_eq!(
+            after.finding_transitions.len(),
+            before.finding_transitions.len()
+        );
+        assert_eq!(after.risks["R_001"].state, FindingState::Confirmed);
+        assert_eq!(after.risks["R_002"].state, FindingState::Confirmed);
     }
 
     #[test]
