@@ -249,6 +249,12 @@ impl SessionGraph {
             .is_some_and(|node| node.state != FindingState::Provisional)
     }
 
+    fn is_valid_legacy_risk_input(risk: &RiskNode) -> bool {
+        risk.state == FindingState::Provisional
+            && risk.merged_into.is_none()
+            && risk.decision_reason.is_none()
+    }
+
     fn validate_finding_clause_refs(
         state: &GraphState,
         label: &str,
@@ -921,7 +927,9 @@ impl SessionGraph {
         // 从 RiskFinding.legal_basis 提取法条引用
         risk.law_refs = risk.finding.legal_basis.clone();
         if let Ok(mut state) = self.state.write() {
-            if Self::is_terminal_risk(&state, &risk.finding.risk_id) {
+            if !Self::is_valid_legacy_risk_input(&risk)
+                || Self::is_terminal_risk(&state, &risk.finding.risk_id)
+            {
                 return;
             }
             let chunk_ids = risk.finding.clause_ids.clone();
@@ -1118,7 +1126,8 @@ impl SessionGraph {
         let law_refs = risk.finding.legal_basis.clone();
         risk.law_refs = law_refs.clone();
         if let Ok(mut state) = self.state.write() {
-            if Self::is_terminal_risk(&state, &risk_id) {
+            if !Self::is_valid_legacy_risk_input(&risk) || Self::is_terminal_risk(&state, &risk_id)
+            {
                 return;
             }
             state.risks.insert(risk_id.clone(), risk);
@@ -1141,7 +1150,8 @@ impl SessionGraph {
         let law_refs = risk.finding.legal_basis.clone();
         risk.law_refs = law_refs.clone();
         if let Ok(mut state) = self.state.write() {
-            if Self::is_terminal_risk(&state, &risk_id) {
+            if !Self::is_valid_legacy_risk_input(&risk) || Self::is_terminal_risk(&state, &risk_id)
+            {
                 return;
             }
             state.risks.insert(risk_id.clone(), risk);
@@ -1741,6 +1751,68 @@ mod tests {
         assert_terminal_legacy_write_is_noop(|graph, risk_id| {
             let mut risk = make_test_risk(risk_id, "ch_overwrite");
             risk.finding.finding_role = FindingRole::Hypothesis;
+            graph.add_hypothesis(risk, "ch_extra");
+        });
+    }
+
+    fn assert_invalid_legacy_risk_node_is_noop(write: impl Fn(&SessionGraph, RiskNode)) {
+        for existing_provisional in [false, true] {
+            for invalid_node in [
+                {
+                    let mut risk = make_test_risk("R_TEST", "ch_extra");
+                    risk.state = FindingState::Confirmed;
+                    risk
+                },
+                {
+                    let mut risk = make_test_risk("R_TEST", "ch_extra");
+                    risk.state = FindingState::Merged;
+                    risk
+                },
+                {
+                    let mut risk = make_test_risk("R_TEST", "ch_extra");
+                    risk.state = FindingState::Rejected;
+                    risk
+                },
+                {
+                    let mut risk = make_test_risk("R_TEST", "ch_extra");
+                    risk.merged_into = Some("R_TARGET".to_string());
+                    risk
+                },
+                {
+                    let mut risk = make_test_risk("R_TEST", "ch_extra");
+                    risk.decision_reason = Some("伪造裁决".to_string());
+                    risk
+                },
+            ] {
+                let graph = SessionGraph::new();
+                graph.add_chunk(make_test_chunk("ch_extra"));
+                let mut invalid_node = invalid_node;
+                if existing_provisional {
+                    add_provisional_risk(&graph, "R_EXISTING", "ch_existing");
+                    invalid_node.finding.risk_id = "R_EXISTING".to_string();
+                } else {
+                    invalid_node.finding.risk_id = "R_NEW".to_string();
+                }
+                let before = serde_json::to_value(graph.snapshot()).expect("快照应可序列化");
+
+                write(&graph, invalid_node);
+                let after = serde_json::to_value(graph.snapshot()).expect("快照应可序列化");
+
+                assert_eq!(
+                    after, before,
+                    "兼容入口不得接收携带终态或裁决元数据的 RiskNode"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_risk_node_writes_reject_forged_terminal_state_and_decision_metadata() {
+        assert_invalid_legacy_risk_node_is_noop(|graph, risk| graph.add_risk(risk));
+        assert_invalid_legacy_risk_node_is_noop(|graph, risk| {
+            graph.add_risk_with_edges(risk, "ch_extra");
+        });
+        assert_invalid_legacy_risk_node_is_noop(|graph, risk| {
             graph.add_hypothesis(risk, "ch_extra");
         });
     }
