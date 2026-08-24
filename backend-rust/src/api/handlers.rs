@@ -510,8 +510,40 @@ async fn remove_review_event_bus_if_current(
 
 async fn finish_review_run(state: &AppState, doc_id: &str, review_events: &Arc<ReviewEventBus>) {
     // receiver 自身持有 Arc，摘除 map 不会阻止其接收刚发出的终态事件。
-    remove_review_event_bus_if_current(state, doc_id, review_events).await;
-    state.active_reviews.lock().await.remove(doc_id);
+    // 只有本轮 bus 仍是 map 当前值时才释放 active，旧 supervisor 不得误清新轮。
+    if remove_review_event_bus_if_current(state, doc_id, review_events).await {
+        state.active_reviews.lock().await.remove(doc_id);
+    }
+}
+
+fn spawn_review_pipeline_supervisor<F>(
+    state: AppState,
+    doc_id: String,
+    review_events: Arc<ReviewEventBus>,
+    pipeline: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let pipeline_result = tokio::spawn(pipeline).await;
+        if pipeline_result.is_err() {
+            let message = "后台审核任务异常终止，请重试".to_string();
+            eprintln!("[ERROR] 后台审核任务异常终止: doc_id={}", doc_id);
+            state
+                .review_errors
+                .lock()
+                .await
+                .insert(doc_id.clone(), message.clone());
+            review_events.emit(&crate::agents::review_event::ReviewEvent::Error {
+                message,
+                session_id: doc_id.clone(),
+            });
+        }
+
+        // supervisor 是唯一的轮次清理所有者，避免正常路径与 panic 路径双重清理。
+        finish_review_run(&state, &doc_id, &review_events).await;
+    })
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────
@@ -985,6 +1017,20 @@ pub async fn review_document(
         })
         .collect();
 
+    // 所有同步准备必须在接受新轮次前完成，失败时保留上一轮内存和磁盘结果。
+    let chunk_map = doc.chunk_map.clone();
+    let review_chunk_map = doc.review_chunk_map.clone();
+    let doc_index = doc.doc_index.clone();
+    let chunk_order = doc.chunk_order.clone();
+    let redaction_vault = doc.redaction_vault.clone();
+    let dashscope_search = state.dashscope_search.clone();
+    let search_backend = state.search_backend.clone();
+    let embed_client_for_tools = state
+        .embed_client
+        .lock()
+        .map_err(|_| server_error_fmt("审核准备失败：嵌入客户端状态不可用"))?
+        .clone();
+
     // 参数校验完成后再原子接受新轮次；并发冲突不得清理上一轮结果。
     match try_accept_review_run(&state, &doc_id, &doc.filename).await {
         Ok(true) => {}
@@ -1010,40 +1056,23 @@ pub async fn review_document(
         req.enabled_agents
     );
 
-    // 提取后台任务所需数据（脱离 doc 引用）
-    let chunk_map = doc.chunk_map.clone();
-    let review_chunk_map = doc.review_chunk_map.clone();
-    let doc_index = doc.doc_index.clone();
-    let chunk_order = doc.chunk_order.clone();
-    let redaction_vault = doc.redaction_vault.clone();
-    let dashscope_search = state.dashscope_search.clone();
-    let search_backend = state.search_backend.clone();
-    let embed_client_for_tools = {
-        let ec = state.embed_client.lock().unwrap();
-        ec.clone()
-    };
-
     // 后台执行管线
-    let state_for_task = state.clone();
-    let doc_id_for_task = doc_id.clone();
-    tokio::spawn(async move {
-        run_review_pipeline(
-            state_for_task,
-            doc_id_for_task,
-            review_clauses,
-            enabled_agents,
-            chunk_map,
-            review_chunk_map,
-            doc_index,
-            chunk_order,
-            redaction_vault,
-            dashscope_search,
-            search_backend,
-            embed_client_for_tools,
-            review_events,
-        )
-        .await;
-    });
+    let pipeline = run_review_pipeline(
+        state.clone(),
+        doc_id.clone(),
+        review_clauses,
+        enabled_agents,
+        chunk_map,
+        review_chunk_map,
+        doc_index,
+        chunk_order,
+        redaction_vault,
+        dashscope_search,
+        search_backend,
+        embed_client_for_tools,
+        review_events.clone(),
+    );
+    spawn_review_pipeline_supervisor(state, doc_id.clone(), review_events, pipeline);
 
     Ok((
         StatusCode::ACCEPTED,
@@ -1284,8 +1313,7 @@ async fn run_review_pipeline(
                     session_id: doc_id.clone(),
                 });
 
-                // 后处理失败不得进入任何结果写入路径；终态已发送后立即摘除本轮总线。
-                finish_review_run(&state, &doc_id, &review_events).await;
+                // 后处理失败不得进入任何结果写入路径；轮次资源由 supervisor 统一收口。
                 return;
             }
 
@@ -1466,9 +1494,6 @@ async fn run_review_pipeline(
             });
         }
     }
-
-    // 终态已发送后先摘除本轮总线，再解除轮次屏障，避免下一轮复用旧总线。
-    finish_review_run(&state, &doc_id, &review_events).await;
 }
 
 /// GET /api/v1/review/:doc_id/stream
@@ -2815,10 +2840,12 @@ mod tests {
 
         let run2_bus = get_or_create_review_event_bus(&state, doc_id).await;
         let mut run2_events = run2_bus.subscribe();
+        state.active_reviews.lock().await.insert(doc_id.to_string());
 
+        finish_review_run(&state, doc_id, &run1_bus).await;
         assert!(
-            !remove_review_event_bus_if_current(&state, doc_id, &run1_bus).await,
-            "旧轮清理不得删除新轮总线"
+            state.active_reviews.lock().await.contains(doc_id),
+            "旧轮重复收口不得解除新轮 active"
         );
         assert!(Arc::ptr_eq(
             state
@@ -2839,6 +2866,7 @@ mod tests {
             .expect("新轮事件应及时到达")
             .expect("新轮总线应保持连接");
         assert!(event.contains("run2-event"));
+        finish_review_run(&state, doc_id, &run2_bus).await;
     }
 
     #[tokio::test]
@@ -2871,6 +2899,95 @@ mod tests {
             .cloned()
             .expect("active 总线应保留");
         assert!(Arc::ptr_eq(&active_bus, &current));
+    }
+
+    #[tokio::test]
+    async fn panicking_review_is_supervised_and_always_releases_current_run() {
+        let doc_id = "doc_supervised_panic";
+        let state = make_test_state(doc_id).await;
+        let preconnected_bus = get_or_create_review_event_bus(&state, doc_id).await;
+        let mut events = preconnected_bus.subscribe();
+        assert!(
+            try_accept_review_run(&state, doc_id, "test.pdf")
+                .await
+                .expect("首轮审核应被接受")
+        );
+        let claimed_bus = claim_review_event_bus(&state, doc_id).await;
+
+        let supervisor = spawn_review_pipeline_supervisor(
+            state.clone(),
+            doc_id.to_string(),
+            claimed_bus.clone(),
+            async { panic!("测试注入的后台 panic") },
+        );
+        supervisor.await.expect("supervisor 自身不应 panic");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("panic 后应及时发送 Error")
+            .expect("原预连接 receiver 应收到 Error");
+        assert!(event.contains("后台审核任务异常终止"));
+        assert_eq!(
+            state.review_errors.lock().await.get(doc_id),
+            Some(&"后台审核任务异常终止，请重试".to_string())
+        );
+        assert!(!state.active_reviews.lock().await.contains(doc_id));
+        assert!(!state.review_event_buses.lock().await.contains_key(doc_id));
+        assert!(
+            try_accept_review_run(&state, doc_id, "test.pdf")
+                .await
+                .expect("panic 收口后后续审核应可接受")
+        );
+        state.active_reviews.lock().await.remove(doc_id);
+    }
+
+    #[tokio::test]
+    async fn poisoned_prepare_lock_preserves_previous_run_and_does_not_reserve_active() {
+        let doc_id = format!("doc_prepare_failure_{}", uuid::Uuid::new_v4());
+        let state = make_test_state(&doc_id).await;
+        state
+            .review_results
+            .lock()
+            .await
+            .insert(doc_id.clone(), make_test_review_output());
+        state
+            .review_usages
+            .lock()
+            .await
+            .insert(doc_id.clone(), make_test_review_usage());
+        let artifact_paths = review_artifact_paths(&doc_id, "test.pdf");
+        write_test_review_artifacts(&artifact_paths);
+        let embed_client = state.embed_client.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = embed_client.lock().expect("测试锁初始应可获取");
+            panic!("测试注入锁中毒");
+        })
+        .join();
+
+        let response = review_document(
+            State(state.clone()),
+            Path(doc_id.clone()),
+            Json(ReviewRequest {
+                chunk_ids: Vec::new(),
+                max_clauses: None,
+                enabled_agents: None,
+            }),
+        )
+        .await;
+
+        let (_, Json(error)) = response.expect_err("准备失败应返回明确错误");
+        assert_eq!(error.detail, "审核准备失败：嵌入客户端状态不可用");
+        assert!(!state.active_reviews.lock().await.contains(&doc_id));
+        assert!(state.review_results.lock().await.contains_key(&doc_id));
+        assert!(state.review_usages.lock().await.contains_key(&doc_id));
+        assert!(
+            artifact_paths
+                .all()
+                .iter()
+                .all(|path| std::path::Path::new(path).exists()),
+            "准备失败不得隔离上一轮磁盘结果"
+        );
+        remove_test_review_artifacts(&artifact_paths);
     }
 
     #[tokio::test]
