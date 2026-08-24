@@ -58,7 +58,7 @@ use crate::agents::tools::{
 use crate::agents::trace::TraceLog;
 use crate::agents::types::{
     AgentId, ChatAgentConfig, ChatResponse, ChatStreamEvent, CoordinatorConfig, CoordinatorOutput,
-    FindingState, GraphSnapshot, ReviewClause, RiskFinding, TextSelection,
+    GraphSnapshot, ReviewClause, RiskFinding, TextSelection,
 };
 use crate::domain::chunk::{Chunk, ChunkingConfig};
 use crate::domain::raw_document::RawDocument;
@@ -338,60 +338,36 @@ fn sync_confirmed_findings(
     findings: &[RiskFinding],
     snapshot: &mut GraphSnapshot,
 ) -> Result<(), String> {
-    let mut replacements = HashMap::with_capacity(findings.len());
-    for finding in findings {
-        if replacements
-            .insert(finding.risk_id.clone(), finding.clone())
-            .is_some()
-        {
-            return Err(format!(
-                "最终 findings 包含重复 risk_id: {}",
-                finding.risk_id
-            ));
-        }
-    }
+    SessionGraph::sync_snapshot_confirmed_findings(snapshot, findings)
+}
 
-    for risk_id in replacements.keys() {
-        let node = snapshot
-            .risks
-            .get(risk_id)
-            .ok_or_else(|| format!("最终快照缺少 risk_id: {}", risk_id))?;
-        if node.state != FindingState::Confirmed {
-            return Err(format!("仅允许同步 Confirmed 风险节点: {}", risk_id));
-        }
-    }
+fn review_result_path(doc_id: &str) -> String {
+    format!(
+        "{}/{}_result.json",
+        data_path_str("output/findings"),
+        doc_id
+    )
+}
 
-    let confirmed_ids = snapshot
-        .risks
-        .iter()
-        .filter(|(_, node)| node.state == FindingState::Confirmed)
-        .map(|(risk_id, _)| risk_id.clone())
-        .collect::<HashSet<_>>();
-    let output_ids = replacements.keys().cloned().collect::<HashSet<_>>();
-    if confirmed_ids != output_ids {
-        let mut missing_output = confirmed_ids
-            .difference(&output_ids)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut missing_node = output_ids
-            .difference(&confirmed_ids)
-            .cloned()
-            .collect::<Vec<_>>();
-        missing_output.sort();
-        missing_node.sort();
-        return Err(format!(
-            "最终 findings 与 Confirmed 节点不一致: 缺少输出={:?}, 缺少 Confirmed 节点={:?}",
-            missing_output, missing_node
-        ));
+/// 原子接受新的文档审核轮次；冲突时不清理上一轮结果。
+async fn try_accept_review_run(state: &AppState, doc_id: &str) -> Result<bool, String> {
+    let mut active = state.active_reviews.lock().await;
+    if active.contains(doc_id) {
+        return Ok(false);
     }
-    for (risk_id, finding) in replacements {
-        snapshot
-            .risks
-            .get_mut(&risk_id)
-            .expect("完整校验后 Confirmed 节点必须存在")
-            .finding = finding;
+    active.insert(doc_id.to_string());
+
+    let result_path = review_result_path(doc_id);
+    if let Err(error) = std::fs::remove_file(&result_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        active.remove(doc_id);
+        return Err(format!("清理上一轮磁盘审核结果失败: {}", error));
     }
-    Ok(())
+    state.review_results.lock().await.remove(doc_id);
+    state.review_usages.lock().await.remove(doc_id);
+    state.review_errors.lock().await.remove(doc_id);
+    Ok(true)
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────
@@ -865,10 +841,10 @@ pub async fn review_document(
         })
         .collect();
 
-    // 参数校验完成后再原子占用审核锁，非法请求不得污染任务状态。
-    {
-        let mut active = state.active_reviews.lock().await;
-        if active.contains(&doc_id) {
+    // 参数校验完成后再原子接受新轮次；并发冲突不得清理上一轮结果。
+    match try_accept_review_run(&state, &doc_id).await {
+        Ok(true) => {}
+        Ok(false) => {
             return Ok((
                 StatusCode::CONFLICT,
                 Json(ReviewAccepted {
@@ -878,7 +854,7 @@ pub async fn review_document(
                 }),
             ));
         }
-        active.insert(doc_id.clone());
+        Err(error) => return Err(server_error_fmt(&error)),
     }
 
     // 创建或获取 ReviewEventBus（SSE 客户端可能已提前连接）。
@@ -1171,17 +1147,13 @@ async fn run_review_pipeline(
                 });
 
                 // 后处理失败不得进入任何结果写入路径，同时仍需释放任务占用状态。
+                state.active_reviews.lock().await.remove(&doc_id);
                 let cleanup_doc_id = doc_id.clone();
                 let cleanup_state = state.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     cleanup_state
                         .review_event_buses
-                        .lock()
-                        .await
-                        .remove(&cleanup_doc_id);
-                    cleanup_state
-                        .active_reviews
                         .lock()
                         .await
                         .remove(&cleanup_doc_id);
@@ -1314,7 +1286,7 @@ async fn run_review_pipeline(
             {
                 let dir = data_path_str("output/findings");
                 let _ = std::fs::create_dir_all(&dir);
-                let result_path = format!("{}/{}_result.json", dir, doc_id);
+                let result_path = review_result_path(&doc_id);
                 let persisted = ReviewResultResponse {
                     status: result_status.clone(),
                     result: Some(ReviewResponse {
@@ -1373,7 +1345,10 @@ async fn run_review_pipeline(
         }
     }
 
-    // 延迟清理 ReviewEventBus 和 active_reviews
+    // 终态已写入后立即解除轮次屏障；ReviewEventBus 延迟清理以便客户端接收终态事件。
+    state.active_reviews.lock().await.remove(&doc_id);
+
+    // 延迟清理 ReviewEventBus
     // （给 SSE 客户端时间接收 Done/PartialDone/Error 事件）
     let cleanup_doc_id = doc_id.clone();
     let cleanup_state = state.clone();
@@ -1381,8 +1356,6 @@ async fn run_review_pipeline(
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         let mut buses = cleanup_state.review_event_buses.lock().await;
         buses.remove(&cleanup_doc_id);
-        let mut active = cleanup_state.active_reviews.lock().await;
-        active.remove(&cleanup_doc_id);
     });
 }
 
@@ -1500,7 +1473,17 @@ pub async fn get_review_result(
     State(state): State<AppState>,
     Path(doc_id): Path<String>,
 ) -> Result<Json<ReviewResultResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // 1. 检查内存中已完成的结果（不移除，允许多次查询）
+    // 1. 新轮次占用期间不得返回上一轮成功结果。
+    if state.active_reviews.lock().await.contains(&doc_id) {
+        return Ok(Json(ReviewResultResponse {
+            status: "pending".to_string(),
+            result: None,
+            usage: None,
+            error: None,
+        }));
+    }
+
+    // 2. 检查内存中已完成的结果（不移除，允许多次查询）
     {
         let results = state.review_results.lock().await;
         if let Some(output) = results.get(&doc_id) {
@@ -1520,7 +1503,7 @@ pub async fn get_review_result(
         }
     }
 
-    // 2. 检查失败信息
+    // 3. 检查失败信息
     {
         let errors = state.review_errors.lock().await;
         if let Some(msg) = errors.get(&doc_id) {
@@ -1533,7 +1516,7 @@ pub async fn get_review_result(
         }
     }
 
-    // 3. 检查是否仍在进行中
+    // 4. 检查 SSE 通道是否仍在延迟清理期
     {
         let buses = state.review_event_buses.lock().await;
         if buses.contains_key(&doc_id) {
@@ -1546,10 +1529,9 @@ pub async fn get_review_result(
         }
     }
 
-    // 4. 磁盘 fallback — 重启后内存为空，从 JSON 文件恢复
+    // 5. 磁盘 fallback — 重启后内存为空，从 JSON 文件恢复
     {
-        let dir = data_path_str("output/findings");
-        let result_path = format!("{}/{}_result.json", dir, doc_id);
+        let result_path = review_result_path(&doc_id);
         if let Ok(json) = std::fs::read_to_string(&result_path)
             && let Ok(result) = serde_json::from_str::<ReviewResultResponse>(&json)
         {
@@ -2392,7 +2374,8 @@ pub async fn move_metric_experiment_group(
 mod tests {
     use super::*;
     use crate::agents::types::{
-        FindingRole, FindingState, GraphSnapshot, RiskFinding, RiskNode, RiskSeverity, RiskTier,
+        FindingRole, FindingState, GraphSnapshot, LawNode, RiskFinding, RiskNode, RiskSeverity,
+        RiskTier,
     };
     use crate::domain::chunk::ChunkType;
 
@@ -2460,6 +2443,41 @@ mod tests {
             (rejected, FindingState::Rejected),
             (provisional, FindingState::Provisional),
         ]);
+        snapshot.cites.insert(
+            "R_CONFIRMED".to_string(),
+            vec!["[LAW_REDACTED]".to_string(), "《独立富化法》".to_string()],
+        );
+        snapshot.cited_by.insert(
+            "[LAW_REDACTED]".to_string(),
+            vec!["R_CONFIRMED".to_string()],
+        );
+        snapshot.laws.insert(
+            "[LAW_REDACTED]".to_string(),
+            LawNode {
+                law_id: "[LAW_REDACTED]".to_string(),
+                article_no: "[LAW_REDACTED]".to_string(),
+                title: String::new(),
+            },
+        );
+        snapshot.laws.insert(
+            "《独立富化法》".to_string(),
+            LawNode {
+                law_id: "《独立富化法》".to_string(),
+                article_no: "第9条".to_string(),
+                title: "独立维护的法规元数据".to_string(),
+            },
+        );
+        snapshot.cited_by.insert(
+            "《独立富化法》".to_string(),
+            vec!["R_CONFIRMED".to_string()],
+        );
+        let confirmed_node = snapshot
+            .risks
+            .get_mut("R_CONFIRMED")
+            .expect("Confirmed 节点应存在");
+        confirmed_node.finding.legal_basis =
+            vec!["[LAW_REDACTED]".to_string(), "《独立富化法》".to_string()];
+        confirmed_node.law_refs = confirmed_node.finding.legal_basis.clone();
         let unchanged = ["R_MERGED", "R_REJECTED", "R_PROVISIONAL"]
             .into_iter()
             .map(|risk_id| {
@@ -2477,6 +2495,7 @@ mod tests {
         restored.page_number = Some(3);
         restored.section_path = Some(vec!["第一章".to_string(), "资格条件".to_string()]);
         restored.context = Some("本地原始上下文".to_string());
+        restored.legal_basis = vec!["《恢复法》第2条".to_string()];
 
         sync_confirmed_findings(&[restored.clone()], &mut snapshot).expect("完整映射应同步成功");
 
@@ -2484,6 +2503,21 @@ mod tests {
             serde_json::to_value(&snapshot.risks["R_CONFIRMED"].finding)
                 .expect("节点 finding 应可序列化"),
             serde_json::to_value(&restored).expect("输出 finding 应可序列化")
+        );
+        assert_eq!(
+            snapshot.risks["R_CONFIRMED"].law_refs,
+            vec!["《恢复法》第2条"]
+        );
+        assert_eq!(snapshot.cites["R_CONFIRMED"], vec!["《恢复法》第2条"]);
+        assert_eq!(snapshot.cited_by["《恢复法》第2条"], vec!["R_CONFIRMED"]);
+        assert!(snapshot.laws.contains_key("《恢复法》第2条"));
+        assert!(!snapshot.cites["R_CONFIRMED"].contains(&"[LAW_REDACTED]".to_string()));
+        assert!(!snapshot.cited_by.contains_key("[LAW_REDACTED]"));
+        assert!(!snapshot.laws.contains_key("[LAW_REDACTED]"));
+        assert!(!snapshot.cited_by.contains_key("《独立富化法》"));
+        assert_eq!(
+            snapshot.laws["《独立富化法》"].title,
+            "独立维护的法规元数据"
         );
         for (risk_id, expected) in unchanged {
             assert_eq!(
@@ -2592,6 +2626,116 @@ mod tests {
             .await
             .insert(doc_id.to_string(), make_test_document(doc_id));
         state
+    }
+
+    fn make_test_review_output() -> CoordinatorOutput {
+        CoordinatorOutput {
+            findings: Vec::new(),
+            routing_summary: crate::agents::types::RoutingSummary {
+                total_clauses: 1,
+                agent_clause_counts: HashMap::new(),
+                high_risk_count: 0,
+                legal_verify_count: 0,
+                blind_spot_findings: 0,
+            },
+            graph_snapshot: None,
+            execution_summary: crate::agents::types::ExecutionSummary::default(),
+        }
+    }
+
+    fn make_test_review_usage() -> ReviewUsage {
+        ReviewUsage {
+            llm_calls: 1,
+            tokens_input: 10,
+            tokens_output: 5,
+            cost_cny: 0.01,
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_rerun_clears_old_success_before_sync_failure() {
+        let doc_id = format!("doc_rerun_{}", uuid::Uuid::new_v4());
+        let state = make_test_state(&doc_id).await;
+        state
+            .review_results
+            .lock()
+            .await
+            .insert(doc_id.clone(), make_test_review_output());
+        state
+            .review_usages
+            .lock()
+            .await
+            .insert(doc_id.clone(), make_test_review_usage());
+        state
+            .review_errors
+            .lock()
+            .await
+            .insert(doc_id.clone(), "旧错误".to_string());
+        let result_path = review_result_path(&doc_id);
+        std::fs::create_dir_all(data_path_str("output/findings")).expect("应创建测试输出目录");
+        std::fs::write(&result_path, r#"{"status":"completed"}"#).expect("应写入旧磁盘结果");
+
+        assert!(
+            try_accept_review_run(&state, &doc_id)
+                .await
+                .expect("重跑应成功接受")
+        );
+        assert!(!state.review_results.lock().await.contains_key(&doc_id));
+        assert!(!state.review_usages.lock().await.contains_key(&doc_id));
+        assert!(!state.review_errors.lock().await.contains_key(&doc_id));
+        assert!(!std::path::Path::new(&result_path).exists());
+
+        let mut snapshot = make_sync_test_snapshot(vec![(
+            make_sync_test_finding("R_CONFIRMED"),
+            FindingState::Confirmed,
+        )]);
+        let sync_error =
+            sync_confirmed_findings(&[make_sync_test_finding("R_MISSING")], &mut snapshot)
+                .expect_err("模拟同步失败");
+        state
+            .review_errors
+            .lock()
+            .await
+            .insert(doc_id.clone(), sync_error);
+        state.active_reviews.lock().await.remove(&doc_id);
+
+        let Json(response) = get_review_result(State(state), Path(doc_id.clone()))
+            .await
+            .expect("同步失败应返回失败状态");
+        assert_eq!(response.status, "failed");
+        assert!(response.result.is_none());
+        assert!(!std::path::Path::new(&result_path).exists());
+    }
+
+    #[tokio::test]
+    async fn rejected_concurrent_rerun_preserves_old_success() {
+        let doc_id = format!("doc_conflict_{}", uuid::Uuid::new_v4());
+        let state = make_test_state(&doc_id).await;
+        state.active_reviews.lock().await.insert(doc_id.clone());
+        state
+            .review_results
+            .lock()
+            .await
+            .insert(doc_id.clone(), make_test_review_output());
+        state
+            .review_usages
+            .lock()
+            .await
+            .insert(doc_id.clone(), make_test_review_usage());
+        let result_path = review_result_path(&doc_id);
+        std::fs::create_dir_all(data_path_str("output/findings")).expect("应创建测试输出目录");
+        std::fs::write(&result_path, r#"{"status":"completed"}"#).expect("应写入旧磁盘结果");
+
+        assert!(
+            !try_accept_review_run(&state, &doc_id)
+                .await
+                .expect("并发重跑应返回冲突")
+        );
+
+        assert!(state.review_results.lock().await.contains_key(&doc_id));
+        assert!(state.review_usages.lock().await.contains_key(&doc_id));
+        assert!(std::path::Path::new(&result_path).exists());
+        std::fs::remove_file(result_path).expect("应清理测试磁盘结果");
     }
 
     #[tokio::test]

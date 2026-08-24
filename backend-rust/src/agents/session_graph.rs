@@ -344,59 +344,71 @@ impl SessionGraph {
 
     /// 按当前 RiskNode 全量重建风险派生索引，避免最终字段覆盖后残留旧边。
     fn rebuild_risk_indexes(state: &mut GraphState) {
-        let previous_risk_laws = state.cited_by.keys().cloned().collect::<Vec<_>>();
+        Self::rebuild_risk_indexes_parts(
+            &state.risks,
+            &mut state.has_risk,
+            &mut state.cites,
+            &mut state.cited_by,
+            &mut state.same_law,
+            &mut state.laws,
+        );
+    }
+
+    fn rebuild_risk_indexes_parts(
+        risks: &HashMap<String, RiskNode>,
+        has_risk: &mut HashMap<String, Vec<String>>,
+        cites: &mut HashMap<String, Vec<String>>,
+        cited_by: &mut HashMap<String, Vec<String>>,
+        same_law: &mut HashMap<String, Vec<String>>,
+        laws: &mut HashMap<String, LawNode>,
+    ) {
+        let previous_risk_laws = cited_by.keys().cloned().collect::<Vec<_>>();
         for law_ref in previous_risk_laws {
-            let is_risk_placeholder = state.laws.get(&law_ref).is_some_and(|law| {
+            let is_risk_placeholder = laws.get(&law_ref).is_some_and(|law| {
                 law.law_id == law_ref && law.article_no == law_ref && law.title.is_empty()
             });
             if is_risk_placeholder {
-                state.laws.remove(&law_ref);
+                laws.remove(&law_ref);
             }
         }
-        state.has_risk.clear();
-        state.cites.clear();
-        state.cited_by.clear();
-        state.same_law.clear();
+        has_risk.clear();
+        cites.clear();
+        cited_by.clear();
+        same_law.clear();
 
-        let mut risk_ids = state.risks.keys().cloned().collect::<Vec<_>>();
+        let mut risk_ids = risks.keys().cloned().collect::<Vec<_>>();
         risk_ids.sort();
         for risk_id in risk_ids {
-            let Some(node) = state.risks.get(&risk_id).cloned() else {
+            let Some(node) = risks.get(&risk_id).cloned() else {
                 continue;
             };
             for chunk_id in &node.finding.clause_ids {
                 push_unique(
-                    state.has_risk.entry(chunk_id.clone()).or_default(),
+                    has_risk.entry(chunk_id.clone()).or_default(),
                     risk_id.clone(),
                 );
             }
             for law_ref in &node.law_refs {
-                push_unique(
-                    state.cites.entry(risk_id.clone()).or_default(),
-                    law_ref.clone(),
-                );
+                push_unique(cites.entry(risk_id.clone()).or_default(), law_ref.clone());
                 if node.finding.finding_role != FindingRole::Hypothesis {
                     push_unique(
-                        state.cited_by.entry(law_ref.clone()).or_default(),
+                        cited_by.entry(law_ref.clone()).or_default(),
                         risk_id.clone(),
                     );
-                    state
-                        .laws
-                        .entry(law_ref.clone())
-                        .or_insert_with(|| LawNode {
-                            law_id: law_ref.clone(),
-                            article_no: law_ref.clone(),
-                            title: String::new(),
-                        });
+                    laws.entry(law_ref.clone()).or_insert_with(|| LawNode {
+                        law_id: law_ref.clone(),
+                        article_no: law_ref.clone(),
+                        title: String::new(),
+                    });
                 }
             }
         }
 
-        let cited_risks = state.cited_by.values().cloned().collect::<Vec<_>>();
+        let cited_risks = cited_by.values().cloned().collect::<Vec<_>>();
         for risk_ids in cited_risks {
             let mut chunks = risk_ids
                 .iter()
-                .filter_map(|risk_id| state.risks.get(risk_id))
+                .filter_map(|risk_id| risks.get(risk_id))
                 .flat_map(|node| node.finding.clause_ids.iter().cloned())
                 .collect::<Vec<_>>();
             chunks.sort();
@@ -405,23 +417,23 @@ impl SessionGraph {
                 for other_chunk_id in &chunks {
                     if chunk_id != other_chunk_id {
                         push_unique(
-                            state.same_law.entry(chunk_id.clone()).or_default(),
+                            same_law.entry(chunk_id.clone()).or_default(),
                             other_chunk_id.clone(),
                         );
                     }
                 }
             }
         }
-        for values in state.has_risk.values_mut() {
+        for values in has_risk.values_mut() {
             values.sort();
         }
-        for values in state.cites.values_mut() {
+        for values in cites.values_mut() {
             values.sort();
         }
-        for values in state.cited_by.values_mut() {
+        for values in cited_by.values_mut() {
             values.sort();
         }
-        for values in state.same_law.values_mut() {
+        for values in same_law.values_mut() {
             values.sort();
         }
     }
@@ -546,6 +558,77 @@ impl SessionGraph {
         let affected = deduplicate_strings(&affected);
         let graph_version = bump_versions(&mut state, affected.clone());
         Ok(Self::build_graph_commit(&state, graph_version, &affected))
+    }
+
+    /// 原子同步快照中的 Confirmed findings，并复用在线图规则重建全部风险派生索引。
+    pub fn sync_snapshot_confirmed_findings(
+        snapshot: &mut GraphSnapshot,
+        findings: &[RiskFinding],
+    ) -> Result<(), String> {
+        let mut replacements = HashMap::with_capacity(findings.len());
+        for finding in findings {
+            if replacements
+                .insert(finding.risk_id.clone(), finding.clone())
+                .is_some()
+            {
+                return Err(format!(
+                    "最终 findings 包含重复 risk_id: {}",
+                    finding.risk_id
+                ));
+            }
+        }
+        for risk_id in replacements.keys() {
+            let node = snapshot
+                .risks
+                .get(risk_id)
+                .ok_or_else(|| format!("最终快照缺少 risk_id: {}", risk_id))?;
+            if node.state != FindingState::Confirmed {
+                return Err(format!("仅允许同步 Confirmed 风险节点: {}", risk_id));
+            }
+        }
+        let confirmed_ids = snapshot
+            .risks
+            .iter()
+            .filter(|(_, node)| node.state == FindingState::Confirmed)
+            .map(|(risk_id, _)| risk_id.clone())
+            .collect::<HashSet<_>>();
+        let output_ids = replacements.keys().cloned().collect::<HashSet<_>>();
+        if confirmed_ids != output_ids {
+            let mut missing_output = confirmed_ids
+                .difference(&output_ids)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut missing_node = output_ids
+                .difference(&confirmed_ids)
+                .cloned()
+                .collect::<Vec<_>>();
+            missing_output.sort();
+            missing_node.sort();
+            return Err(format!(
+                "最终 findings 与 Confirmed 节点不一致: 缺少输出={:?}, 缺少 Confirmed 节点={:?}",
+                missing_output, missing_node
+            ));
+        }
+
+        let mut updated = snapshot.clone();
+        for (risk_id, finding) in replacements {
+            let node = updated
+                .risks
+                .get_mut(&risk_id)
+                .expect("完整校验后 Confirmed 节点必须存在");
+            node.finding = finding;
+            node.law_refs = node.finding.legal_basis.clone();
+        }
+        Self::rebuild_risk_indexes_parts(
+            &updated.risks,
+            &mut updated.has_risk,
+            &mut updated.cites,
+            &mut updated.cited_by,
+            &mut updated.same_law,
+            &mut updated.laws,
+        );
+        *snapshot = updated;
+        Ok(())
     }
 
     /// 原子完成最终审计裁决，并记录 provisional 到终态的转换历史。
