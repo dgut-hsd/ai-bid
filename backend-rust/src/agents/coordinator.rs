@@ -41,6 +41,8 @@ use crate::agents::types::*;
 use crate::paths::data_path_str;
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
@@ -94,6 +96,148 @@ fn sort_blind_spot_candidate_ids(snapshot: &GraphSnapshot, candidate_ids: &mut [
             (None, None) => left.cmp(right),
         }
     });
+}
+
+type DynamicAgentReplace = dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync;
+
+struct DynamicAgentStore {
+    path: PathBuf,
+    transaction_lock: std::sync::Mutex<()>,
+    replace: Arc<DynamicAgentReplace>,
+}
+
+impl DynamicAgentStore {
+    fn global() -> Arc<Self> {
+        static STORE: std::sync::OnceLock<Arc<DynamicAgentStore>> = std::sync::OnceLock::new();
+        STORE
+            .get_or_init(|| Arc::new(Self::new(data_path_str("agents/dynamic_agents.json"))))
+            .clone()
+    }
+
+    fn new(path: impl Into<PathBuf>) -> Self {
+        Self::with_replacer(path, Arc::new(replace_dynamic_agent_file))
+    }
+
+    fn with_replacer(path: impl Into<PathBuf>, replace: Arc<DynamicAgentReplace>) -> Self {
+        Self {
+            path: path.into(),
+            transaction_lock: std::sync::Mutex::new(()),
+            replace,
+        }
+    }
+
+    fn read_manifest(&self) -> Result<Option<DynamicAgentManifest>> {
+        let _guard = self
+            .transaction_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("动态 Agent 清单锁已中毒"))?;
+        self.read_manifest_unlocked()
+    }
+
+    fn append(&self, definitions: &[DynamicAgentDefinition]) -> Result<usize> {
+        if definitions.is_empty() {
+            return Ok(0);
+        }
+        let _guard = self
+            .transaction_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("动态 Agent 清单锁已中毒"))?;
+        let mut manifest = self
+            .read_manifest_unlocked()?
+            .unwrap_or(DynamicAgentManifest {
+                version: 1,
+                agents: Vec::new(),
+            });
+
+        for definition in definitions {
+            manifest.agents.retain(|agent| agent.id != definition.id);
+            manifest.agents.push(definition.clone());
+        }
+        while manifest.agents.len() > 20 {
+            manifest
+                .agents
+                .sort_by(|left, right| left.created_at.cmp(&right.created_at));
+            manifest.agents.remove(0);
+        }
+        self.persist_manifest_unlocked(&manifest)?;
+        Ok(definitions.len())
+    }
+
+    fn read_manifest_unlocked(&self) -> Result<Option<DynamicAgentManifest>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let json = std::fs::read_to_string(&self.path)?;
+        Ok(Some(serde_json::from_str(&json)?))
+    }
+
+    fn persist_manifest_unlocked(&self, manifest: &DynamicAgentManifest) -> Result<()> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("动态 Agent 清单路径缺少父目录"))?;
+        std::fs::create_dir_all(parent)?;
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("dynamic_agents.json");
+        let temp_path = parent.join(format!(".{}.tmp-{}", file_name, uuid::Uuid::new_v4()));
+        let json = serde_json::to_vec_pretty(manifest)?;
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            file.write_all(&json)?;
+            file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error.into());
+        }
+
+        if let Err(error) = (self.replace)(&temp_path, &self.path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_dynamic_agent_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, target)
+}
+
+#[cfg(windows)]
+fn replace_dynamic_agent_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    if !target.exists() {
+        return std::fs::rename(source, target);
+    }
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "动态 Agent 路径缺少父目录",
+        )
+    })?;
+    let backup = parent.join(format!(".dynamic_agents.backup-{}", uuid::Uuid::new_v4()));
+    std::fs::rename(target, &backup)?;
+    if let Err(replace_error) = std::fs::rename(source, target) {
+        return match std::fs::rename(&backup, target) {
+            Ok(()) => Err(replace_error),
+            Err(rollback_error) => Err(std::io::Error::new(
+                rollback_error.kind(),
+                format!("替换失败: {}；回滚失败: {}", replace_error, rollback_error),
+            )),
+        };
+    }
+    if let Err(error) = std::fs::remove_file(&backup) {
+        eprintln!("  [DYNAMIC] 清理替换备份失败: {}", error);
+    }
+    Ok(())
 }
 
 struct AgentTaskOutput {
@@ -284,7 +428,9 @@ pub struct Coordinator {
     pub shared_search_cache: Arc<Mutex<HashMap<(String, String), serde_json::Value>>>,
     global_execution_limiter: Arc<GlobalExecutionLimiter>,
     /// 同一 Coordinator 的 BlindSpot 后台扫描必须完整串行，避免 attempt 集合互相污染。
-    blind_spot_run_lock: Mutex<()>,
+    blind_spot_scan_lock: Mutex<()>,
+    /// 跨 Coordinator 共享的动态 Agent 清单存储，内部事务锁覆盖完整读改写。
+    dynamic_agent_store: Arc<DynamicAgentStore>,
 }
 
 impl Coordinator {
@@ -322,7 +468,8 @@ impl Coordinator {
             metrics: None,
             shared_search_cache,
             global_execution_limiter: Arc::new(GlobalExecutionLimiter::from_env()),
-            blind_spot_run_lock: Mutex::new(()),
+            blind_spot_scan_lock: Mutex::new(()),
+            dynamic_agent_store: DynamicAgentStore::global(),
         };
 
         // 启动时加载已有动态 Agent
@@ -870,7 +1017,7 @@ impl Coordinator {
     /// ★ BlindSpot 的发现**不会**追加到本次审核结果中——
     ///   它的价值在于为**下一次**审核积累经验（自动生成新的检测维度）。
     pub async fn run_blind_spot(&self) {
-        let _run_guard = self.blind_spot_run_lock.lock().await;
+        let _run_guard = self.blind_spot_scan_lock.lock().await;
         eprintln!(
             "\n┌──────────────────────────────────────────────────────────────┐\n\
                │  BlindSpot: 后台盲点扫描 + 经验沉淀（异步，不阻塞主结果）    │\n\
@@ -909,16 +1056,19 @@ impl Coordinator {
         );
 
         // 提取 suggested_agent → 写入 dynamic_agents.json
-        let registered = self.register_dynamic_agents(&blind_spot_findings);
-        if registered > 0 {
-            eprintln!(
-                "  [BLINDSPOT] 经验沉淀: {} 个新 Agent 定义已写入 dynamic_agents.json（下次审查自动启用）",
-                registered
-            );
-        } else {
-            eprintln!(
-                "  [BLINDSPOT] 本次无新的 Agent 建议（盲区已被现有 Agent 覆盖或无需新增检测维度）"
-            );
+        match self.register_dynamic_agents(&blind_spot_findings) {
+            Ok(registered) if registered > 0 => {
+                eprintln!(
+                    "  [BLINDSPOT] 经验沉淀: {} 个新 Agent 定义已写入 dynamic_agents.json（下次审查自动启用）",
+                    registered
+                );
+            }
+            Ok(_) => {
+                eprintln!(
+                    "  [BLINDSPOT] 本次无新的 Agent 建议（盲区已被现有 Agent 覆盖或无需新增检测维度）"
+                );
+            }
+            Err(error) => eprintln!("  [BLINDSPOT] 持久化动态 Agent 失败: {}", error),
         }
     }
 
@@ -3300,12 +3450,9 @@ impl Coordinator {
 
     /// 启动时从 agents/dynamic_agents.json 加载活跃的动态 Agent。
     pub fn load_dynamic_agents(&mut self) -> Result<usize> {
-        let path = data_path_str("agents/dynamic_agents.json");
-        if !std::path::Path::new(&path).exists() {
+        let Some(manifest) = self.dynamic_agent_store.read_manifest()? else {
             return Ok(0);
-        }
-        let json = std::fs::read_to_string(path)?;
-        let manifest: DynamicAgentManifest = serde_json::from_str(&json)?;
+        };
 
         let mut loaded = 0;
         for def in &manifest.agents {
@@ -3334,8 +3481,8 @@ impl Coordinator {
     }
 
     /// 扫描 findings 中的 suggested_agent，写入 dynamic_agents.json。
-    fn register_dynamic_agents(&self, findings: &[RiskFinding]) -> usize {
-        let mut registered = 0;
+    fn register_dynamic_agents(&self, findings: &[RiskFinding]) -> Result<usize> {
+        let mut definitions = Vec::new();
         for f in findings {
             if let Some(suggested) = &f.suggested_agent {
                 if suggested.agent_prompt.is_empty() || suggested.section_keywords.is_empty() {
@@ -3360,15 +3507,17 @@ impl Coordinator {
                     reason: suggested.reason.clone(),
                     active: false,
                 };
-                self.append_dynamic_agent_to_file(&def);
-                eprintln!(
-                    "  [DYNAMIC] 新 Agent 建议已写入: {} (active=false, 需人工审批)",
-                    def.id
-                );
-                registered += 1;
+                definitions.push(def);
             }
         }
-        registered
+        let registered = self.dynamic_agent_store.append(&definitions)?;
+        for definition in &definitions {
+            eprintln!(
+                "  [DYNAMIC] 新 Agent 建议已写入: {} (active=false, 需人工审批)",
+                definition.id
+            );
+        }
+        Ok(registered)
     }
 
     /// 去重检查：section_keywords Jaccard 重叠度 > 0.5 视为重复。
@@ -3389,46 +3538,6 @@ impl Coordinator {
             }
         }
         false
-    }
-
-    /// 将新 Agent 追加写入 dynamic_agents.json（上限 20 个，超出淘汰最旧）。
-    fn append_dynamic_agent_to_file(&self, def: &DynamicAgentDefinition) {
-        let path = data_path_str("agents/dynamic_agents.json");
-        let mut manifest: DynamicAgentManifest = if std::path::Path::new(&path).exists() {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(DynamicAgentManifest {
-                    version: 1,
-                    agents: vec![],
-                })
-        } else {
-            DynamicAgentManifest {
-                version: 1,
-                agents: vec![],
-            }
-        };
-
-        // 去重：同名覆盖
-        manifest.agents.retain(|a| a.id != def.id);
-        manifest.agents.push(def.clone());
-
-        // 上限 20，淘汰最旧
-        if manifest.agents.len() > 20 {
-            manifest
-                .agents
-                .sort_by(|a, b| a.created_at.cmp(&b.created_at));
-            manifest.agents.remove(0); // 移除最旧
-        }
-
-        // 确保目录存在
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        if let Ok(json) = serde_json::to_string_pretty(&manifest) {
-            let _ = std::fs::write(&path, json);
-        }
     }
 
     /// 将中文 Agent 名称转为合法的 ID（去除非 ASCII，snake_case）。
@@ -3839,7 +3948,8 @@ mod tests {
             global_execution_limiter: Arc::new(GlobalExecutionLimiter::new(
                 crate::agents::execution_control::ExecutionLimits::default(),
             )),
-            blind_spot_run_lock: Mutex::new(()),
+            blind_spot_scan_lock: Mutex::new(()),
+            dynamic_agent_store: DynamicAgentStore::global(),
         }
     }
 
@@ -5432,10 +5542,113 @@ mod tests {
 
     // ── 动态 Agent: suggest_agent 注册 ───────────────────────
 
+    fn make_suggested_agent_finding(risk_id: &str, agent_name: &str, keyword: &str) -> RiskFinding {
+        RiskFinding {
+            suggested_agent: Some(SuggestedAgent {
+                agent_name: agent_name.to_string(),
+                agent_prompt: format!("你是{}Agent", agent_name),
+                section_keywords: vec![keyword.to_string()],
+                reason: format!("补充{}检测", agent_name),
+            }),
+            ..make_test_finding(risk_id, "ch_dynamic", "BlindSpotAgent")
+        }
+    }
+
+    fn isolated_dynamic_agent_path(test_name: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!("ai_bid_{}_{}", test_name, uuid::Uuid::new_v4()))
+            .join("dynamic_agents.json")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn independent_coordinators_preserve_concurrent_dynamic_agent_updates() {
+        let path = isolated_dynamic_agent_path("dynamic_concurrent");
+        let store = Arc::new(DynamicAgentStore::new(path.clone()));
+        let mut first =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let mut second =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        first.dynamic_agent_store = store.clone();
+        second.dynamic_agent_store = store;
+        let first_finding = make_suggested_agent_finding("R_FIRST", "First", "第一类");
+        let second_finding = make_suggested_agent_finding("R_SECOND", "Second", "第二类");
+
+        let first_task =
+            tokio::task::spawn_blocking(move || first.register_dynamic_agents(&[first_finding]));
+        let second_task =
+            tokio::task::spawn_blocking(move || second.register_dynamic_agents(&[second_finding]));
+        assert_eq!(
+            first_task
+                .await
+                .expect("首个任务不应 panic")
+                .expect("首项应写入"),
+            1
+        );
+        assert_eq!(
+            second_task
+                .await
+                .expect("第二个任务不应 panic")
+                .expect("第二项应写入"),
+            1
+        );
+
+        let json = std::fs::read_to_string(&path).expect("并发写入后文件应存在");
+        let manifest: DynamicAgentManifest =
+            serde_json::from_str(&json).expect("最终 JSON 应可解析");
+        let ids: HashSet<&str> = manifest
+            .agents
+            .iter()
+            .map(|agent| agent.id.as_str())
+            .collect();
+        assert_eq!(ids, HashSet::from(["Dynamic_First", "Dynamic_Second"]));
+        std::fs::remove_dir_all(path.parent().expect("测试路径应有父目录"))
+            .expect("应清理隔离目录");
+    }
+
+    #[test]
+    fn replacement_failure_preserves_canonical_dynamic_agent_manifest() {
+        let path = isolated_dynamic_agent_path("dynamic_replace_failure");
+        std::fs::create_dir_all(path.parent().expect("测试路径应有父目录"))
+            .expect("应创建隔离目录");
+        let original = br#"{"version":1,"agents":[]}"#;
+        std::fs::write(&path, original).expect("应写入 canonical 原内容");
+        let store = Arc::new(DynamicAgentStore::with_replacer(
+            path.clone(),
+            Arc::new(|_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "模拟替换失败",
+                ))
+            }),
+        ));
+        let mut coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        coordinator.dynamic_agent_store = store;
+        let finding = make_suggested_agent_finding("R_FAIL", "Failure", "失败类");
+
+        let error = coordinator
+            .register_dynamic_agents(&[finding])
+            .expect_err("替换失败必须上报");
+
+        assert!(error.to_string().contains("模拟替换失败"));
+        assert_eq!(std::fs::read(&path).expect("canonical 应保留"), original);
+        assert_eq!(
+            std::fs::read_dir(path.parent().expect("测试路径应有父目录"))
+                .expect("应读取隔离目录")
+                .count(),
+            1,
+            "失败后不得遗留临时文件"
+        );
+        std::fs::remove_dir_all(path.parent().expect("测试路径应有父目录"))
+            .expect("应清理隔离目录");
+    }
+
     #[test]
     fn test_register_dynamic_agents_from_findings() {
-        let coordinator =
+        let mut coordinator =
             make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let original_path = isolated_dynamic_agent_path("dynamic_register");
+        coordinator.dynamic_agent_store = Arc::new(DynamicAgentStore::new(original_path.clone()));
 
         let finding = RiskFinding {
             suggested_agent: Some(SuggestedAgent {
@@ -5447,16 +5660,9 @@ mod tests {
             ..make_test_finding("R_001", "ch_001", "BlindSpotAgent")
         };
 
-        // 注意: register_dynamic_agents 会写入 agents/dynamic_agents.json
-        // 测试环境下我们先 backup 原文件，测试完恢复
-        let backup_path = data_path_str("agents/dynamic_agents.json.bak");
-        let original_path = data_path_str("agents/dynamic_agents.json");
-        let original_exists = std::path::Path::new(&original_path).exists();
-        if original_exists {
-            std::fs::rename(&original_path, &backup_path).ok();
-        }
-
-        let registered = coordinator.register_dynamic_agents(&[finding]);
+        let registered = coordinator
+            .register_dynamic_agents(&[finding])
+            .expect("动态 Agent 应写入");
         assert_eq!(registered, 1, "应注册 1 个动态 Agent");
 
         // 验证文件被写入
@@ -5469,10 +5675,8 @@ mod tests {
         assert_eq!(manifest.agents[0].tool_names.len(), 4);
 
         // 清理恢复
-        std::fs::remove_file(&original_path).ok();
-        if original_exists {
-            std::fs::rename(&backup_path, &original_path).ok();
-        }
+        std::fs::remove_dir_all(original_path.parent().expect("测试路径应有父目录"))
+            .expect("应清理隔离目录");
     }
 
     #[test]
@@ -5482,7 +5686,9 @@ mod tests {
 
         // 没有 suggested_agent 的 finding
         let finding = make_test_finding("R_001", "ch_001", "FactCheckAgent");
-        let registered = coordinator.register_dynamic_agents(&[finding]);
+        let registered = coordinator
+            .register_dynamic_agents(&[finding])
+            .expect("无建议时不应失败");
         assert_eq!(registered, 0);
     }
 
@@ -5501,7 +5707,9 @@ mod tests {
             ..make_test_finding("R_001", "ch_001", "BlindSpotAgent")
         };
 
-        let registered = coordinator.register_dynamic_agents(&[finding]);
+        let registered = coordinator
+            .register_dynamic_agents(&[finding])
+            .expect("空 prompt 跳过时不应失败");
         assert_eq!(registered, 0, "空 prompt 应被跳过");
     }
 
@@ -5511,12 +5719,8 @@ mod tests {
     fn test_load_dynamic_agents_file_not_exists() {
         let mut coordinator =
             make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
-
-        // 确保文件不存在（测试环境应该没有）
-        if std::path::Path::new(&data_path_str("agents/dynamic_agents.json")).exists() {
-            // 跳过此测试以免影响已存在的文件
-            return;
-        }
+        let path = isolated_dynamic_agent_path("dynamic_missing");
+        coordinator.dynamic_agent_store = Arc::new(DynamicAgentStore::new(path));
 
         let loaded = coordinator.load_dynamic_agents().expect("不应报错");
         assert_eq!(loaded, 0);
@@ -5542,26 +5746,22 @@ mod tests {
             }],
         };
 
-        let backup_path = data_path_str("agents/dynamic_agents.json.bak");
-        let original_path = data_path_str("agents/dynamic_agents.json");
-        let original_exists = std::path::Path::new(&original_path).exists();
-        if original_exists {
-            std::fs::rename(&original_path, &backup_path).ok();
-        }
+        let original_path = isolated_dynamic_agent_path("dynamic_inactive");
+        std::fs::create_dir_all(original_path.parent().expect("测试路径应有父目录"))
+            .expect("应创建隔离目录");
 
         let json = serde_json::to_string_pretty(&manifest).unwrap();
         std::fs::write(&original_path, &json).unwrap();
 
         let mut coordinator =
             make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        coordinator.dynamic_agent_store = Arc::new(DynamicAgentStore::new(original_path.clone()));
         let loaded = coordinator.load_dynamic_agents().expect("不应报错");
         assert_eq!(loaded, 0, "active=false 的 Agent 不应被加载");
 
         // 清理恢复
-        std::fs::remove_file(&original_path).ok();
-        if original_exists {
-            std::fs::rename(&backup_path, &original_path).ok();
-        }
+        std::fs::remove_dir_all(original_path.parent().expect("测试路径应有父目录"))
+            .expect("应清理隔离目录");
     }
 
     // ── is_frontmatter_section ────────────────────────────────
