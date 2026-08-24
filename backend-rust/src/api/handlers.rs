@@ -58,7 +58,7 @@ use crate::agents::tools::{
 use crate::agents::trace::TraceLog;
 use crate::agents::types::{
     AgentId, ChatAgentConfig, ChatResponse, ChatStreamEvent, CoordinatorConfig, CoordinatorOutput,
-    ReviewClause, TextSelection,
+    FindingState, GraphSnapshot, ReviewClause, RiskFinding, TextSelection,
 };
 use crate::domain::chunk::{Chunk, ChunkingConfig};
 use crate::domain::raw_document::RawDocument;
@@ -331,6 +331,67 @@ fn restore_chat_response(response: &mut ChatResponse, vault: &RedactionVault) {
         .iter()
         .map(|text| vault.restore(text))
         .collect();
+}
+
+/// 将本地恢复和定位补全后的最终 findings 原子同步到 Confirmed 风险节点。
+fn sync_confirmed_findings(
+    findings: &[RiskFinding],
+    snapshot: &mut GraphSnapshot,
+) -> Result<(), String> {
+    let mut replacements = HashMap::with_capacity(findings.len());
+    for finding in findings {
+        if replacements
+            .insert(finding.risk_id.clone(), finding.clone())
+            .is_some()
+        {
+            return Err(format!(
+                "最终 findings 包含重复 risk_id: {}",
+                finding.risk_id
+            ));
+        }
+    }
+
+    for risk_id in replacements.keys() {
+        let node = snapshot
+            .risks
+            .get(risk_id)
+            .ok_or_else(|| format!("最终快照缺少 risk_id: {}", risk_id))?;
+        if node.state != FindingState::Confirmed {
+            return Err(format!("仅允许同步 Confirmed 风险节点: {}", risk_id));
+        }
+    }
+
+    let confirmed_ids = snapshot
+        .risks
+        .iter()
+        .filter(|(_, node)| node.state == FindingState::Confirmed)
+        .map(|(risk_id, _)| risk_id.clone())
+        .collect::<HashSet<_>>();
+    let output_ids = replacements.keys().cloned().collect::<HashSet<_>>();
+    if confirmed_ids != output_ids {
+        let mut missing_output = confirmed_ids
+            .difference(&output_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut missing_node = output_ids
+            .difference(&confirmed_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        missing_output.sort();
+        missing_node.sort();
+        return Err(format!(
+            "最终 findings 与 Confirmed 节点不一致: 缺少输出={:?}, 缺少 Confirmed 节点={:?}",
+            missing_output, missing_node
+        ));
+    }
+    for (risk_id, finding) in replacements {
+        snapshot
+            .risks
+            .get_mut(&risk_id)
+            .expect("完整校验后 Confirmed 节点必须存在")
+            .finding = finding;
+    }
+    Ok(())
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────
@@ -1035,12 +1096,6 @@ async fn run_review_pipeline(
                 duration_secs
             );
 
-            // ★ BlindSpot: 后台异步执行（不阻塞 HTTP 响应）
-            let coord_bg = coordinator.clone();
-            tokio::spawn(async move {
-                coord_bg.run_blind_spot().await;
-            });
-
             // 模型只接触脱敏文本。结果回到本地后恢复原文展示，再填充原始定位。
             for finding in &mut output.findings {
                 finding.source_quote = redaction_vault.restore(&finding.source_quote);
@@ -1094,6 +1149,52 @@ async fn run_review_pipeline(
                     );
                 }
             }
+            let sync_result = output
+                .graph_snapshot
+                .as_mut()
+                .ok_or_else(|| "最终审核结果缺少 graph_snapshot".to_string())
+                .and_then(|snapshot| sync_confirmed_findings(&output.findings, snapshot));
+            if let Err(error) = sync_result {
+                let message = format!("审核结果与审计快照同步失败: {}", error);
+                eprintln!(
+                    "[ERROR] async review post-process failed: doc_id={}, {}",
+                    doc_id, message
+                );
+                state
+                    .review_errors
+                    .lock()
+                    .await
+                    .insert(doc_id.clone(), message.clone());
+                review_events.emit(&crate::agents::review_event::ReviewEvent::Error {
+                    message,
+                    session_id: doc_id.clone(),
+                });
+
+                // 后处理失败不得进入任何结果写入路径，同时仍需释放任务占用状态。
+                let cleanup_doc_id = doc_id.clone();
+                let cleanup_state = state.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    cleanup_state
+                        .review_event_buses
+                        .lock()
+                        .await
+                        .remove(&cleanup_doc_id);
+                    cleanup_state
+                        .active_reviews
+                        .lock()
+                        .await
+                        .remove(&cleanup_doc_id);
+                });
+                return;
+            }
+
+            // ★ BlindSpot: 后台异步执行（不阻塞 HTTP 响应）
+            let coord_bg = coordinator.clone();
+            tokio::spawn(async move {
+                coord_bg.run_blind_spot().await;
+            });
+
             let findings_with_blocks = output
                 .findings
                 .iter()
@@ -2290,7 +2391,145 @@ pub async fn move_metric_experiment_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::types::{
+        FindingRole, FindingState, GraphSnapshot, RiskFinding, RiskNode, RiskSeverity, RiskTier,
+    };
     use crate::domain::chunk::ChunkType;
+
+    fn make_sync_test_finding(risk_id: &str) -> RiskFinding {
+        RiskFinding {
+            risk_id: risk_id.to_string(),
+            clause_ids: vec!["ch_001".to_string()],
+            block_ids: Vec::new(),
+            agent: "FactCheckAgent".to_string(),
+            no_risk: false,
+            severity: RiskSeverity::High,
+            is_critical: false,
+            critical_reason: String::new(),
+            risk_type: "测试风险".to_string(),
+            category_code: "TEST_RISK".to_string(),
+            source_quote: "脱敏原文".to_string(),
+            legal_basis: vec!["《测试法》第1条".to_string()],
+            case_refs: Vec::new(),
+            reason: "脱敏理由".to_string(),
+            suggestion: "脱敏建议".to_string(),
+            confidence: 0.8,
+            initial_tier: RiskTier::Medium,
+            final_tier: RiskTier::High,
+            tier_escalated: true,
+            truncated: false,
+            suggested_agent: None,
+            citations: Vec::new(),
+            finding_role: FindingRole::Verified,
+            knowledge_source: "search_verified".to_string(),
+            verification_required: Vec::new(),
+            hypothesized_by: Vec::new(),
+            verified_by: vec!["FactCheckAgent".to_string()],
+            page_number: None,
+            section_path: None,
+            context: None,
+        }
+    }
+
+    fn make_sync_test_snapshot(nodes: Vec<(RiskFinding, FindingState)>) -> GraphSnapshot {
+        let mut snapshot = GraphSnapshot::default();
+        for (finding, state) in nodes {
+            snapshot.risks.insert(
+                finding.risk_id.clone(),
+                RiskNode {
+                    law_refs: finding.legal_basis.clone(),
+                    finding,
+                    state,
+                    merged_into: None,
+                    decision_reason: None,
+                },
+            );
+        }
+        snapshot
+    }
+
+    #[test]
+    fn sync_confirmed_findings_replaces_full_finding_and_preserves_other_states() {
+        let confirmed = make_sync_test_finding("R_CONFIRMED");
+        let merged = make_sync_test_finding("R_MERGED");
+        let rejected = make_sync_test_finding("R_REJECTED");
+        let provisional = make_sync_test_finding("R_PROVISIONAL");
+        let mut snapshot = make_sync_test_snapshot(vec![
+            (confirmed.clone(), FindingState::Confirmed),
+            (merged, FindingState::Merged),
+            (rejected, FindingState::Rejected),
+            (provisional, FindingState::Provisional),
+        ]);
+        let unchanged = ["R_MERGED", "R_REJECTED", "R_PROVISIONAL"]
+            .into_iter()
+            .map(|risk_id| {
+                (
+                    risk_id.to_string(),
+                    serde_json::to_value(&snapshot.risks[risk_id]).expect("节点应可序列化"),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut restored = confirmed;
+        restored.source_quote = "恢复后的原文".to_string();
+        restored.reason = "恢复后的理由".to_string();
+        restored.suggestion = "恢复后的建议".to_string();
+        restored.block_ids = vec!["block_001".to_string()];
+        restored.page_number = Some(3);
+        restored.section_path = Some(vec!["第一章".to_string(), "资格条件".to_string()]);
+        restored.context = Some("本地原始上下文".to_string());
+
+        sync_confirmed_findings(&[restored.clone()], &mut snapshot).expect("完整映射应同步成功");
+
+        assert_eq!(
+            serde_json::to_value(&snapshot.risks["R_CONFIRMED"].finding)
+                .expect("节点 finding 应可序列化"),
+            serde_json::to_value(&restored).expect("输出 finding 应可序列化")
+        );
+        for (risk_id, expected) in unchanged {
+            assert_eq!(
+                serde_json::to_value(&snapshot.risks[&risk_id]).expect("节点应可序列化"),
+                expected,
+                "非 Confirmed 节点不得被修改: {risk_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_confirmed_findings_validation_failures_are_atomic() {
+        let confirmed = make_sync_test_finding("R_CONFIRMED");
+        let merged = make_sync_test_finding("R_MERGED");
+        let base = make_sync_test_snapshot(vec![
+            (confirmed.clone(), FindingState::Confirmed),
+            (merged.clone(), FindingState::Merged),
+        ]);
+        let cases = vec![
+            (
+                vec![make_sync_test_finding("R_MISSING")],
+                "缺失映射",
+                "缺少 risk_id",
+            ),
+            (vec![confirmed.clone(), confirmed], "重复映射", "重复"),
+            (vec![merged], "非 Confirmed 映射", "仅允许同步 Confirmed"),
+        ];
+
+        for (findings, label, expected_error) in cases {
+            let mut snapshot = base.clone();
+            let before = serde_json::to_value(&snapshot).expect("快照应可序列化");
+
+            let error =
+                sync_confirmed_findings(&findings, &mut snapshot).expect_err("非法映射必须失败");
+
+            assert!(
+                error.contains(expected_error),
+                "{label} 应返回明确错误，实际: {error}"
+            );
+            assert_eq!(
+                serde_json::to_value(&snapshot).expect("快照应可序列化"),
+                before,
+                "{label} 失败时不得部分修改快照"
+            );
+        }
+    }
 
     fn make_test_chunk() -> Chunk {
         Chunk {
