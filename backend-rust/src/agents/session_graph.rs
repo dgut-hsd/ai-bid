@@ -674,6 +674,8 @@ mod tests {
                 verification_required: Vec::new(),
                 hypothesized_by: Vec::new(),
                 verified_by: Vec::new(),
+                evidence_verdict: None,
+                verifier_reason: None,
                 page_number: None,
                 section_path: None,
                 context: None,

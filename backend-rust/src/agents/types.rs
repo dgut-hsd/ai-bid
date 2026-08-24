@@ -1736,6 +1736,8 @@ mod tests {
             verification_required: vec!["《政府采购法》".into()],
             hypothesized_by: vec!["ScoutAgent".into()],
             verified_by: vec!["SemanticRiskAgent".into()],
+            evidence_verdict: None,
+            verifier_reason: None,
             page_number: Some(0),
             section_path: Some(vec!["测试章节".into()]),
             context: Some("须采用XX品牌 测试上下文".into()),
