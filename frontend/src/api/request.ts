@@ -174,17 +174,4 @@ request.interceptors.response.use(
   }
 );
 
-/**
- * 从后端错误响应包络（{ data: { error_code } }）中提取业务错误码。
- * 响应拦截器里直接读 error.response?.data?.error_code；此函数供测试与
- * 需要单独判断 error_code 的调用方复用。
- */
-export function extractErrorCode(error: unknown): string | undefined {
-  if (typeof error !== 'object' || error === null) return undefined;
-  const data = (error as { data?: unknown }).data;
-  if (typeof data !== 'object' || data === null) return undefined;
-  const code = (data as { error_code?: unknown }).error_code;
-  return typeof code === 'string' ? code : undefined;
-}
-
 export default request;
