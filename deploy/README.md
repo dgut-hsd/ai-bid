@@ -64,8 +64,10 @@ ai-bid/
 ```bash
 # 1. 克隆仓库（放在你规划的应用目录，例如 /srv/apps/）
 mkdir -p /srv/apps && cd /srv/apps
-git clone https://github.com/<你的账号>/<你的仓库>.git
-cd <仓库根目录>/deploy
+git clone https://github.com/dgut-hsd/ai-bid.git
+cd ai-bid
+git checkout main        # 确保在 main 分支（部署用这个分支）
+cd deploy
 
 # 2. 生成环境变量并填写密钥
 cp .env.example .env
@@ -93,7 +95,7 @@ docker compose logs -f backend-rust   # 看 AI 引擎是否就绪
 ### 更新（push main 后服务器自动/手动更新）
 
 ```bash
-cd /srv/apps/<仓库>/deploy
+cd /srv/apps/ai-bid/deploy
 ./update.sh          # 检查并更新
 ./update.sh --force  # 强制更新（清除回滚保持）
 ```
@@ -120,7 +122,7 @@ rm .rollback-hold        # 或直接
 # 用 cron 每 2 分钟检查一次 main 是否有新提交
 crontab -e
 # 加一行（路径改成你的实际路径）：
-*/2 * * * * cd /srv/apps/<仓库>/deploy && ./update.sh >> /tmp/ai-bid-update.log 2>&1
+*/2 * * * * cd /srv/apps/ai-bid/deploy && ./update.sh >> /tmp/ai-bid-update.log 2>&1
 ```
 
 也可以换 systemd timer，但 cron 最简单。push 后最多 2 分钟服务器自动完成构建和上线。
