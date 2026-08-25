@@ -3,7 +3,7 @@ import { useSelector } from 'react-redux';
 import { useNavigate } from 'react-router-dom';
 
 import { IssueTypePieChart } from './components/IssueTypePieChart';
-import { WeeklyAuditBarChart } from './components/WeeklyAuditBarChart';
+import { MonthlyIssueBarChart } from './components/MonthlyIssueBarChart';
 import { DashboardTable } from './components/DashboardTable';
 
 import { DashboardStatCard } from '@/components/StatCard/DashboardStatCard';
@@ -68,10 +68,10 @@ export const DashboardPage: React.FC = () => {
    } = useQuery(dashboardOptions.issueDistribution(currentTenantId));
    
    const {
-      data: auditCount,
-      isLoading: isAuditCountLoading,
-      isError: isAuditCountError,
-   } = useQuery(dashboardOptions.auditCount(currentTenantId));
+      data: dailyIssues,
+      isLoading: isDailyIssuesLoading,
+      isError: isDailyIssuesError,
+   } = useQuery(dashboardOptions.dailyIssues(currentTenantId));
 
    const stats: Record<string, number> = useMemo(() => {
       const pending =
@@ -235,12 +235,12 @@ export const DashboardPage: React.FC = () => {
                   <IssueTypePieChart data={issueDistribution} />
                )}
 
-               {isAuditCountLoading ? (
+               {isDailyIssuesLoading ? (
                   <Spin />
-               ) : isAuditCountError ? (
-                  <Result status='warning' title='审核统计加载失败' />
+               ) : isDailyIssuesError ? (
+                  <Result status='warning' title='问题统计加载失败' />
                ) : (
-                  <WeeklyAuditBarChart data={auditCount} />
+                  <MonthlyIssueBarChart data={dailyIssues} />
                )}
             </div>
          </div>

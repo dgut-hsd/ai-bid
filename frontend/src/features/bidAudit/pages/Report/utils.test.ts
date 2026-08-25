@@ -187,7 +187,7 @@ describe('parseReportSections', () => {
     // Markdown 原文包含 "**投标单位**", 所以搜索纯文本关键内容
     expect(sections['基本信息']).toContain('智网科技股份有限公司');
     expect(sections['审核结论']).toContain('本项目标书整体结构完整');
-    expect(sections['问题汇总']).toContain('预算合规性');
+    expect(sections['问题汇总']).toContain('品牌指定');
     expect(sections['详细列表']).toContain('硬件报价超标');
     expect(sections['审核说明']).toContain('本报告由系统 AI 自动生成');
   });

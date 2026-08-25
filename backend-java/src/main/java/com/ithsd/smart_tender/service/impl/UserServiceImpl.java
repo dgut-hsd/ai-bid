@@ -6,6 +6,7 @@ import com.ithsd.smart_tender.model.dto.UserLoginDTO;
 import com.ithsd.smart_tender.model.dto.UserRegisterDTO;
 import com.ithsd.smart_tender.model.entity.User;
 import com.ithsd.smart_tender.service.UserService;
+import com.ithsd.smart_tender.service.TenantSessionStore;
 import com.ithsd.smart_tender.common.BizException;
 import com.ithsd.smart_tender.common.util.MD5Util;
 import lombok.RequiredArgsConstructor;
@@ -17,11 +18,12 @@ import java.time.LocalDateTime;
 public class UserServiceImpl implements UserService {
 
     private final UserMapper userMapper;
+    private final TenantSessionStore tenantSessionStore;
 
     @Override
     public User login(UserLoginDTO userLoginDTO) {
         LambdaQueryWrapper<User> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(User::getPhone, userLoginDTO.getPhone());
+        wrapper.eq(User::getUsername, userLoginDTO.getUsername());
         User user = userMapper.selectOne(wrapper);
         
         if (user == null) {
@@ -71,5 +73,21 @@ public class UserServiceImpl implements UserService {
                 .updateTime(LocalDateTime.now())
                 .build();
         userMapper.insert(user);
+    }
+
+    @Override
+    public void changePassword(Long userId, String oldPassword, String newPassword) {
+        User user = userMapper.selectById(userId);
+        if (user == null) {
+            throw new BizException(404, "用户不存在");
+        }
+        if (!user.getPassword().equals(MD5Util.encrypt(oldPassword))) {
+            throw new BizException(400, "原密码错误");
+        }
+        user.setPassword(MD5Util.encrypt(newPassword));
+        user.setUpdateTime(LocalDateTime.now());
+        userMapper.updateById(user);
+        // 使旧会话失效，改密后需重新登录
+        tenantSessionStore.deleteByUserId(userId);
     }
 }

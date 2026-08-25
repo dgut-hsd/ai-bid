@@ -2,7 +2,7 @@ import type { FormInstance } from 'antd';
 import type { AuthSession, ApiResponse } from '@/features/tenant/types';
 
 export interface LoginParams {
-   /** The backend accepts this contract field and maps it to its legacy phone field. */
+   /** 登录账号，对应 sys_user.username。 */
    username: string;
    password: string;
 }
@@ -19,7 +19,7 @@ export interface RegisterParams {
 }
 
 export interface LoginFormValues {
-   phone: string;
+   username: string;
    password: string;
    remember?: boolean;
 }

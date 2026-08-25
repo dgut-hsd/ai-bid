@@ -3,24 +3,31 @@ package com.ithsd.smart_tender.service.impl;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.ithsd.smart_tender.common.TenantAuthException;
+import com.ithsd.smart_tender.common.TenantContext;
 import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.mapper.KnowledgeFileMapper;
+import com.ithsd.smart_tender.model.dto.rust.RustKnowledgeIngestResponse;
 import com.ithsd.smart_tender.model.entity.KnowledgeFile;
 import com.ithsd.smart_tender.model.result.PageResult;
 import com.ithsd.smart_tender.service.KnowledgeFileService;
 import com.ithsd.smart_tender.service.TenantAuthorizationService;
+import com.ithsd.smart_tender.service.engine.rust.RustApiClient;
 
 import com.ithsd.smart_tender.service.StoragePathService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.web.multipart.MultipartFile;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import java.io.File;
 import java.io.IOException;
+import java.util.concurrent.Executor;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.LocalDate;
@@ -48,6 +55,13 @@ public class KnowledgeFileServiceImpl extends ServiceImpl<KnowledgeFileMapper, K
 
     @Autowired
     private TenantAuthorizationService authorization;
+
+    @Autowired
+    private RustApiClient rustApiClient;
+
+    @Autowired
+    @Qualifier("auditTaskExecutor")
+    private Executor auditTaskExecutor;
 
     @Override
     public KnowledgeFile getVisibleById(Long fileId) {
@@ -128,6 +142,9 @@ public class KnowledgeFileServiceImpl extends ServiceImpl<KnowledgeFileMapper, K
                 savedFile.delete();
                 throw new RuntimeException("文件重命名失败");
             }
+
+            // ★ 事务提交后异步触发 Rust 向量化入库（不阻塞上传响应；失败降级不影响文件上传）
+            scheduleIngestAfterCommit(knowledgeFile, finalFile, originalFilename, category, applicableScope, fileName);
 
         } catch (Exception e) {
             // 数据库保存失败，删除已上传的临时文件
@@ -306,6 +323,8 @@ public class KnowledgeFileServiceImpl extends ServiceImpl<KnowledgeFileMapper, K
         }
         knowledgeFile.setStatus(2); // 2表示已删除
         requireScopedUpdate(knowledgeFile, currentContext().tenantId());
+        // 联动清理 Qdrant 向量（方法内部失败仅告警，不阻断删除）
+        rustApiClient.deleteKnowledgeDocument(knowledgeFile.getRustDocumentId());
     }
     
     @Override
@@ -416,6 +435,70 @@ public class KnowledgeFileServiceImpl extends ServiceImpl<KnowledgeFileMapper, K
         update.setStatus(status);
         update.setUpdateTime(LocalDateTime.now());
         requireScopedUpdate(update, currentContext().tenantId(), fileId);
+    }
+
+    /**
+     * 注册事务提交后的异步向量化入库：文件已落盘/入库 MySQL，随后交给 Rust ingest
+     * （解析 → 切分 → 嵌入 → 写 Qdrant），成功后回填 chunk_count 与 rust_document_id。
+     */
+    private void scheduleIngestAfterCommit(KnowledgeFile knowledgeFile, File finalFile,
+                                           String originalFilename, String category,
+                                           String applicableScope, String documentName) {
+        final Long fileId = knowledgeFile.getId();
+        if (fileId == null) {
+            log.warn("知识库文件缺少主键，跳过向量化入库: file={}", originalFilename);
+            return;
+        }
+        final Path ingestPath = finalFile.toPath();
+        final String normCategory = normalizeCategory(category);
+        // 在请求线程内捕获租户上下文（签名需要），由线程池在事务提交后执行
+        final Runnable ingestTask = TenantContext.wrap(() ->
+                asyncIngestAndPersist(fileId, ingestPath, originalFilename, normCategory, applicableScope, documentName));
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                auditTaskExecutor.execute(ingestTask);
+            }
+        });
+    }
+
+    /**
+     * 调用 Rust ingest 完成向量化入库，并把 chunk_count / document_id 回填到 knowledge_file。
+     * 失败仅告警（文件已上传成功，检索暂不可用，可后续重试）。
+     */
+    private void asyncIngestAndPersist(Long fileId, Path filePath, String filename,
+                                       String category, String applicableScope, String documentName) {
+        try {
+            RustKnowledgeIngestResponse resp = rustApiClient.ingestKnowledge(
+                    filePath, filename, category, applicableScope, documentName);
+            KnowledgeFile update = new KnowledgeFile();
+            update.setId(fileId);
+            update.setChunkCount(resp.getChunkCount());
+            update.setRustDocumentId(resp.getDocumentId());
+            this.updateById(update);
+            log.info("知识库向量化入库成功: fileId={}, chunks={}, rustDocId={}",
+                    fileId, resp.getChunkCount(), resp.getDocumentId());
+        } catch (Exception e) {
+            log.warn("知识库向量化入库失败（文件已上传，检索暂不可用，可稍后重试）: fileId={}, file={}, {}",
+                    fileId, filename, e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 类别归一化：中文类别 → Qdrant payload 英文值，与 Rust search_knowledge_base 工具的
+     * map_category 对齐，保证入库与检索的过滤条件一致。
+     */
+    private String normalizeCategory(String category) {
+        if (category == null || category.isBlank()) {
+            return "regulation";
+        }
+        return switch (category.trim()) {
+            case "法规", "法律", "law" -> "regulation";
+            case "案例", "判例", "case" -> "case";
+            case "负面清单", "negative_list", "黑名单" -> "negative_list";
+            case "范本", "模板", "template" -> "template";
+            default -> category.trim();
+        };
     }
 
     private TenantRequestContext currentContext() {

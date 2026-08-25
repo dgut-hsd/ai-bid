@@ -78,7 +78,7 @@ impl BudgetLimits {
             tool_calls: (effective_tasks.saturating_mul(10)).clamp(60, 1_000),
             web_search_calls: (source_clauses.saturating_mul(2)).clamp(10, 120),
             total_tokens: (effective_tasks as u64)
-                .saturating_mul(20_000)
+                .saturating_mul(28_000)
                 .clamp(100_000, 2_000_000),
         }
     }

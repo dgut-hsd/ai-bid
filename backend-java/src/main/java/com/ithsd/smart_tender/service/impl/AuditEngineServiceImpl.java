@@ -146,9 +146,10 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             log.warn("recover: Rust result unavailable, taskId={}, {}", taskId, e.getMessage());
             return false;
         }
-        if (result != null && result.isCompleted() && result.getResult() != null) {
-            log.info("recover: completed Rust result found, taskId={}, docId={}",
-                    taskId, rustDocId);
+        if (result != null && result.getResult() != null
+                && (result.isCompleted() || result.isPartialFailed())) {
+            log.info("recover: {} Rust result found, taskId={}, docId={}",
+                    result.isPartialFailed() ? "partial_failed" : "completed", taskId, rustDocId);
             completeTaskFromReview(task, result.getResult());
             return true;
         }
@@ -271,6 +272,16 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                         case "done" -> {
                             log.info("Rust SSE done received: docId={}", rustDocId);
                             // 标记所有 running session 为 completed
+                            try {
+                                traceService.markSessionsCompleted(taskId);
+                            } catch (Exception e) {
+                                log.warn("Trace markSessionsCompleted failed: taskId={}", taskId, e);
+                            }
+                            reviewDoneSignal.complete(null);
+                        }
+                        case "partial_done" -> {
+                            log.warn("Rust SSE partial_done received: docId={} (部分 clause 失败，结果仍可落库)", rustDocId);
+                            // 部分完成同样视为审核结束，最终结果通过 GET /result 获取（status=partial_failed）
                             try {
                                 traceService.markSessionsCompleted(taskId);
                             } catch (Exception e) {
@@ -580,6 +591,12 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             try {
                 RustReviewResultResponse result = rustApiClient.getReviewResult(rustDocId);
                 if (result != null && result.isCompleted()) {
+                    return result.getResult();
+                }
+                if (result != null && result.isPartialFailed() && result.getResult() != null) {
+                    log.warn("Rust review partial_failed (部分 clause 失败，落库已有 findings): docId={}, findings={}",
+                            rustDocId,
+                            result.getResult().getFindings() != null ? result.getResult().getFindings().size() : 0);
                     return result.getResult();
                 }
                 if (result != null && result.isFailed()) {

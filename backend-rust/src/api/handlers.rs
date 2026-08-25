@@ -1620,6 +1620,8 @@ pub async fn chat_with_document(
             doc.doc_index.clone(),
             ec.clone(),
         )));
+        // 本地知识库检索（对话也能引用已入库的法规/案例原文）
+        chat_tools.register(Box::new(SearchKnowledgeBaseTool::new(ec.clone())));
     }
     chat_tools.register(Box::new(ReadSectionTool::new(
         doc.review_chunk_map.clone(),
@@ -1736,6 +1738,8 @@ pub async fn chat_with_document_stream(
                 doc.doc_index.clone(),
                 ec.clone(),
             )));
+            // 本地知识库检索（对话也能引用已入库的法规/案例原文）
+            chat_tools.register(Box::new(SearchKnowledgeBaseTool::new(ec.clone())));
         }
         chat_tools.register(Box::new(ReadSectionTool::new(
             doc.review_chunk_map.clone(),

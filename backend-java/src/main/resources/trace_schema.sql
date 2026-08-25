@@ -1,5 +1,8 @@
 -- ═══════════════════════════════════════════════════════
--- 审查追溯表 — 设计文档 §10.1.4 (PostgreSQL → MySQL 8.0 适配)
+-- ⚠️ DEPRECATED — 本文件已由 Flyway 接管（db/migration/V7__add_trace_schema.sql）。
+-- 禁止再挂到 spring.sql.init.schema-locations：本文件以 DROP TABLE 开头，
+-- 配合 sql.init.mode=always 会导致每次应用重启清空 trace_* 追溯数据。
+-- 原始说明：审查追溯表 — 设计文档 §10.1.4 (PostgreSQL → MySQL 8.0 适配)
 -- ═══════════════════════════════════════════════════════
 
 -- 追溯会话表 —— 一次 "Agent 审查一条 clause" 对应一行

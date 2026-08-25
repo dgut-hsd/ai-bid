@@ -1,0 +1,167 @@
+# ── ai-bid 全栈编排 ──
+# 一个项目一套独立网络 + 独立命名卷，多项目（A/B/C）互不干扰。
+# 用法：cd deploy && cp .env.example .env（改好密钥）&& docker compose up -d --build
+
+name: ai-bid
+
+services:
+  # ───────────────────────── 前端 ─────────────────────────
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: aib-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend-java
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    networks: [default]
+
+  # ───────────────────────── Java 业务后端 ─────────────────────────
+  backend-java:
+    build:
+      context: ../backend-java
+      dockerfile: Dockerfile
+    container_name: aib-backend-java
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend-rust:
+        condition: service_started
+    environment:
+      # MySQL（覆盖 application.yml 的 localhost 连接）
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-smart_tender_system}?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8&useSSL=false&allowPublicKeyRetrieval=true&socketTimeout=30000&connectTimeout=5000"
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER:-root}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_ROOT_PASSWORD:-1234}
+      # Redis（覆盖 localhost）
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      SPRING_DATA_REDIS_DATABASE: "10"
+      # Rust 引擎（覆盖 127.0.0.1 → 容器服务名）
+      RUST_API_BASE_URL: http://backend-rust:3001
+      RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
+      # JWT 密钥
+      ST_JWT_SECRET: ${ST_JWT_SECRET:-local-test-only-jwt-secret-change-me}
+      # 文件存储（覆盖 prod profile 里硬编码的 /opt 路径）
+      FILE_STORAGE_PATH: /data/uploads
+      PREVIEW_CACHE_PATH: /data/preview-cache
+    volumes:
+      - app_data:/data
+    networks: [default]
+
+  # ───────────────────────── Rust 审核引擎 ─────────────────────────
+  backend-rust:
+    build:
+      context: ../backend-rust
+      dockerfile: Dockerfile
+    container_name: aib-backend-rust
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_started
+      neo4j:
+        condition: service_started
+    environment:
+      # 必须监听 0.0.0.0，否则 Java 容器访问不到（默认是 127.0.0.1）
+      AIBID_RUST_BIND: 0.0.0.0:3001
+      AIBID_DATA_DIR: /data
+      # LLM
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      DASHSCOPE_MODEL: ${DASHSCOPE_MODEL:-qwen-turbo}
+      AIBID_LLM_PROTOCOL: ${AIBID_LLM_PROTOCOL:-dashscope}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      # 搜索 / 嵌入
+      AIBID_SEARCH_BACKEND: ${AIBID_SEARCH_BACKEND:-dashscope}
+      EMBED_ENGINE: ${EMBED_ENGINE:-remote}
+      # Multi-Agent
+      AIBID_AGENT: ${AIBID_AGENT:-1}
+      AIBID_COORDINATOR: ${AIBID_COORDINATOR:-1}
+      # Java ↔ Rust 内部签名密钥（必须与 Java 一致）
+      RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
+      # 向量库 / 图库
+      QDRANT_URL: http://qdrant:6334
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-b1234567}
+    volumes:
+      - rust_data:/data
+    networks: [default]
+
+  # ───────────────────────── MySQL ─────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: aib-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-1234}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-smart_tender_system}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [default]
+
+  # ───────────────────────── Redis ─────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: aib-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [default]
+
+  # ───────────────────────── Qdrant 向量库（Rust 依赖） ─────────────────────────
+  qdrant:
+    image: qdrant/qdrant:v1.17.0
+    container_name: aib-qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks: [default]
+
+  # ───────────────────────── Neo4j 图库（Rust 依赖） ─────────────────────────
+  neo4j:
+    image: neo4j:5.21
+    container_name: aib-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-b1234567}
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks: [default]
+
+# ───────────────────────── 命名卷 ─────────────────────────
+volumes:
+  mysql_data:
+  redis_data:
+  qdrant_data:
+  neo4j_data:
+  neo4j_logs:
+  app_data:
+  rust_data:

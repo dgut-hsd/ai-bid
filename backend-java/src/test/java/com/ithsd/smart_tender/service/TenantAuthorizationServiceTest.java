@@ -19,16 +19,12 @@ class TenantAuthorizationServiceTest {
     }
 
     @Test
-    void ownerAndAdminCanReadMembersButViewerCannotChangeMembership() {
+    void ownerCanManageMembersButMemberCannot() {
         TenantContext.set(new TenantRequestContext(1001L, 2001L, "OWNER", 1L, "owner-request"));
         assertThatCode(() -> authorization.requireTenant(2001L, "tenant.members.role.write"))
                 .doesNotThrowAnyException();
 
-        TenantContext.set(new TenantRequestContext(1002L, 2001L, "ADMIN", 1L, "admin-request"));
-        assertThatCode(() -> authorization.requireTenant(2001L, "tenant.members.role.write"))
-                .doesNotThrowAnyException();
-
-        TenantContext.set(new TenantRequestContext(1003L, 2001L, "VIEWER", 1L, "viewer-request"));
+        TenantContext.set(new TenantRequestContext(1002L, 2001L, "MEMBER", 1L, "member-request"));
         assertThatThrownBy(() -> authorization.requireTenant(2001L, "tenant.members.role.write"))
                 .isInstanceOfSatisfying(TenantAuthException.class, ex -> {
                     org.assertj.core.api.Assertions.assertThat(ex.getStatus()).isEqualTo(403);

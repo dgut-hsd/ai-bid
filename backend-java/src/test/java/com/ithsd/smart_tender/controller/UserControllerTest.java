@@ -21,10 +21,10 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 class UserControllerTest {
 
-    private final UserService userService = mock(UserService.class);
     private final TenantAuthService tenantAuthService = mock(TenantAuthService.class);
+    private final UserService userService = mock(UserService.class);
     private final MockMvc mvc = MockMvcBuilders
-            .standaloneSetup(new UserController(userService, tenantAuthService))
+            .standaloneSetup(new UserController(tenantAuthService, userService))
             .setControllerAdvice(new GlobalExceptionHandler())
             .build();
 

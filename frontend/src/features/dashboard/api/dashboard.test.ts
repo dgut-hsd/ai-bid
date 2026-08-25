@@ -5,13 +5,13 @@ describe('dashboard query options', () => {
   it('disables all tenant-scoped dashboard queries without a current tenant', () => {
     expect(dashboardOptions.list(null).enabled).toBe(false);
     expect(dashboardOptions.issueDistribution(null).enabled).toBe(false);
-    expect(dashboardOptions.auditCount(null).enabled).toBe(false);
+    expect(dashboardOptions.dailyIssues(null).enabled).toBe(false);
   });
 
   it('enables all tenant-scoped dashboard queries for the current tenant', () => {
     expect(dashboardOptions.list('20001').enabled).toBe(true);
     expect(dashboardOptions.issueDistribution('20001').enabled).toBe(true);
-    expect(dashboardOptions.auditCount('20001').enabled).toBe(true);
+    expect(dashboardOptions.dailyIssues('20001').enabled).toBe(true);
   });
 
   it('scopes dashboard cache keys by tenant', () => {
@@ -23,8 +23,8 @@ describe('dashboard query options', () => {
       'issueDistribution',
       '20002',
     ]);
-    expect(dashboardOptions.auditCount('20002').queryKey).toEqual([
-      'auditCount',
+    expect(dashboardOptions.dailyIssues('20002').queryKey).toEqual([
+      'dailyIssues',
       '20002',
     ]);
   });

@@ -362,8 +362,14 @@ pub fn sectionize(raw: &RawDocument) -> SectionizeOutput {
                 .find(|l| !l.is_empty() && !is_page_noise(l))
         {
             let char_count = first_line.chars().count();
-            // 仅接受短文本（≤ 30 字符），避免将长段落误判为标题
-            if (2..=30).contains(&char_count) {
+            // 仅接受短文本（≤ 30 字符），避免将长段落误判为标题；
+            // 排除以句末标点结尾的行——它们是完整句子（正文短句）而非真实
+            // 无编号标题（如"付款方式""验收要求"）。否则降级路径
+            // （blocks_from_text）把中文正文短行误标为 Heading 后，
+            // 会在此进一步被误识别为 plain_heading，产生重复 chunk。
+            if (2..=30).contains(&char_count)
+                && !first_line.ends_with(['。', '！', '？', '；'])
+            {
                 candidates.push(HeadingCandidate {
                     level: 5, // 最低层，挂到最近的上级 section 下
                     title: first_line.to_string(),

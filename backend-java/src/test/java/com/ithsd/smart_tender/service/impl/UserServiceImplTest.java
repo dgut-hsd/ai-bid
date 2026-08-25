@@ -39,7 +39,7 @@ class UserServiceImplTest {
             String encryptedPassword = "encryptedHash";
 
             UserLoginDTO dto = new UserLoginDTO();
-            dto.setPhone(phone);
+            dto.setUsername(phone);
             dto.setPassword(rawPassword);
 
             User mockUser = User.builder()
@@ -77,7 +77,7 @@ class UserServiceImplTest {
     void login_UserNotFound_ShouldThrowWhenPhoneDoesNotExist() {
         // Arrange
         UserLoginDTO dto = new UserLoginDTO();
-        dto.setPhone("nonexistentPhone");
+        dto.setUsername("nonexistentPhone");
         dto.setPassword("anyPassword");
 
         when(userMapper.selectOne(any(LambdaQueryWrapper.class))).thenReturn(null);
@@ -95,7 +95,7 @@ class UserServiceImplTest {
         try (MockedStatic<MD5Util> md5 = mockStatic(MD5Util.class)) {
             // Arrange
             UserLoginDTO dto = new UserLoginDTO();
-            dto.setPhone("13800138000");
+            dto.setUsername("13800138000");
             dto.setPassword("wrongPassword");
 
             User mockUser = User.builder()
@@ -126,7 +126,7 @@ class UserServiceImplTest {
             String encryptedPassword = "encryptedHash";
 
             UserLoginDTO dto = new UserLoginDTO();
-            dto.setPhone("13800138000");
+            dto.setUsername("13800138000");
             dto.setPassword(rawPassword);
 
             User mockUser = User.builder()

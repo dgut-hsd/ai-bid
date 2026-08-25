@@ -323,13 +323,8 @@ public class ReportServiceImpl implements ReportService {
         }
     }
 
+    // category 列存的是 Rust 引擎的 risk_type（如"地域歧视"/"品牌指定"/"程序违规"），直接展示即可
     private String getCategoryText(String category) {
-        if (category == null) return "其他";
-        return switch (category) {
-            case "budget" -> "预算合规性";
-            case "demand" -> "需求合规性";
-            case "legal" -> "政策合法性";
-            default -> category;
-        };
+        return (category == null || category.isBlank()) ? "其他" : category;
     }
 }

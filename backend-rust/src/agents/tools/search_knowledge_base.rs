@@ -98,6 +98,7 @@ impl AgentTool for SearchKnowledgeBaseTool {
     async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value> {
         let parsed: SearchKnowledgeBaseArgs = serde_json::from_value(args)?;
         let question = parsed.question.clone();
+        let question_for_log = question.clone();
         let embed = self.embed.clone();
 
         // 同步嵌入调用移出 Tokio worker，避免阻塞 reactor
@@ -109,6 +110,8 @@ impl AgentTool for SearchKnowledgeBaseTool {
         let vec = query_embeddings.into_iter().next().unwrap_or_default();
 
         let store = QdrantStore::from_env().context("Qdrant 连接失败")?;
+        let category_arg = parsed.category.clone();
+        let scope_arg = parsed.applicable_scope.clone();
         let cat = map_category(&parsed.category);
         let scope = if parsed.applicable_scope.is_empty() {
             None
@@ -116,7 +119,33 @@ impl AgentTool for SearchKnowledgeBaseTool {
             Some(parsed.applicable_scope)
         };
         // Agent 工具在单租户审核会话内使用，不传 tenant 过滤
-        let results = store.search(vec, 5, cat, scope, None).await?;
+        let results = store.search(vec.clone(), 5, cat.clone(), scope.clone(), None).await?;
+        // 过滤召回为空时回退到无过滤检索：LLM 推断的 category/scope 可能与
+        // 入库值不一致（如推断 applicable_scope=procurement，而数据均为 general），
+        // 此时宁可多召回也不应返回空，避免「条文明明在库中却检索不到」。
+        let results = if results.is_empty() && (cat.is_some() || scope.is_some()) {
+            eprintln!(
+                "[search_knowledge_base] 过滤召回为空(category={:?}, scope={:?})，回退到无过滤检索",
+                cat, scope
+            );
+            store.search(vec, 10, None, None, None).await?
+        } else {
+            results
+        };
+
+        // 诊断日志：记录工具实参 + 实际召回，便于定位「条文序号查询召回为空」
+        eprintln!(
+            "[search_knowledge_base] question={:?} category={:?} scope={:?} => {} hits",
+            question_for_log, category_arg, scope_arg, results.len()
+        );
+        for (score, payload) in &results {
+            eprintln!(
+                "  - {:.4} {:?} | {:?}",
+                score,
+                payload.document_name,
+                payload.section_path
+            );
+        }
 
         let hits: Vec<serde_json::Value> = results
             .into_iter()
