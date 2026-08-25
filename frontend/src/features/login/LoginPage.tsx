@@ -32,15 +32,25 @@ export function LoginPage() {
 
             message.success('登录成功');
 
+            const locationState = location.state;
             const from =
-               (location.state as any)?.from?.pathname || '/dashboard';
+               typeof locationState === 'object' &&
+               locationState !== null &&
+               'from' in locationState &&
+               typeof locationState.from === 'object' &&
+               locationState.from !== null &&
+               'pathname' in locationState.from &&
+               typeof locationState.from.pathname === 'string'
+                  ? locationState.from.pathname
+                  : '/dashboard';
             navigate(from, { replace: true });
          } else {
             message.error(response.msg || '登录失败');
             loginForm.setFieldValue('password', '');
          }
-      } catch (error) {
+      } catch (error: unknown) {
          console.error('Login error: ', error);
+         message.error('登录失败，请检查账号和密码');
          loginForm.setFieldValue('password', '');
       }
    };

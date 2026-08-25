@@ -5,11 +5,9 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.ithsd.smart_tender.mapper.AuditTaskMapper;
 import com.ithsd.smart_tender.mapper.TraceEventBlockMapper;
 import com.ithsd.smart_tender.mapper.TraceEventMapper;
 import com.ithsd.smart_tender.mapper.TraceSessionMapper;
-import com.ithsd.smart_tender.model.entity.AuditTask;
 import com.ithsd.smart_tender.model.entity.TraceEventBlock;
 import com.ithsd.smart_tender.model.entity.TraceEventEntity;
 import com.ithsd.smart_tender.model.entity.TraceSession;
@@ -18,6 +16,7 @@ import com.ithsd.smart_tender.model.vo.TraceEventVO;
 import com.ithsd.smart_tender.model.vo.TraceSessionDetailVO;
 import com.ithsd.smart_tender.model.vo.TraceSessionVO;
 import com.ithsd.smart_tender.service.TraceService;
+import com.ithsd.smart_tender.service.impl.TenantScope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -43,18 +42,15 @@ public class TraceServiceImpl implements TraceService {
     private final TraceSessionMapper sessionMapper;
     private final TraceEventMapper eventMapper;
     private final TraceEventBlockMapper blockMapper;
-    private final AuditTaskMapper auditTaskMapper;
     private final ObjectMapper jsonMapper = new ObjectMapper();
 
     public TraceServiceImpl(
             TraceSessionMapper sessionMapper,
             TraceEventMapper eventMapper,
-            TraceEventBlockMapper blockMapper,
-            AuditTaskMapper auditTaskMapper) {
+            TraceEventBlockMapper blockMapper) {
         this.sessionMapper = sessionMapper;
         this.eventMapper = eventMapper;
         this.blockMapper = blockMapper;
-        this.auditTaskMapper = auditTaskMapper;
     }
 
     // ── 摄入 ──────────────────────────────────────────────────
@@ -62,17 +58,19 @@ public class TraceServiceImpl implements TraceService {
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void ingestTraceEvent(String taskId, String docId, TraceEventVO vo) {
+        Long tenantId = TenantScope.requiredTenantId();
         if (vo.getAgentName() == null || vo.getClauseId() == null) {
             // 没有 clause 关联的 trace 事件（如全局 turn_start）暂不建立 session
             return;
         }
 
         // 1. 查找或创建 session
-        TraceSession session = findOrCreateSession(taskId, docId, vo);
+        TraceSession session = findOrCreateSession(taskId, docId, vo, tenantId);
 
         // 2. 插入 trace_event
         String eventId = UUID.randomUUID().toString();
         TraceEventEntity event = new TraceEventEntity();
+        event.setTenantId(tenantId);
         event.setEventId(eventId);
         event.setSessionId(session.getId());
         event.setAgentName(vo.getAgentName());
@@ -103,7 +101,9 @@ public class TraceServiceImpl implements TraceService {
         if ("agent_bus_send".equals(vo.getEventType())) {
             session.setTotalToolCalls(session.getTotalToolCalls() + 1);
         }
-        sessionMapper.updateById(session);
+        sessionMapper.update(session, new LambdaQueryWrapper<TraceSession>()
+                .eq(TraceSession::getId, session.getId())
+                .eq(TraceSession::getTenantId, tenantId));
 
         // 4. 写入 block_ids 关联（预留：当前 Rust SSE 不携带 block_ids）
         // 未来从 payload.block_ids 或 vo 扩展字段提取后写入 trace_event_blocks
@@ -114,15 +114,19 @@ public class TraceServiceImpl implements TraceService {
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void markSessionsCompleted(String taskId) {
+        Long tenantId = TenantScope.requiredTenantId();
         List<TraceSession> running = sessionMapper.selectList(
                 new LambdaQueryWrapper<TraceSession>()
                         .eq(TraceSession::getTaskId, taskId)
+                        .eq(TraceSession::getTenantId, tenantId)
                         .eq(TraceSession::getStatus, "running"));
         LocalDateTime now = LocalDateTime.now();
         for (TraceSession s : running) {
             s.setStatus("completed");
             s.setFinishedAt(now);
-            sessionMapper.updateById(s);
+            sessionMapper.update(s, new LambdaQueryWrapper<TraceSession>()
+                    .eq(TraceSession::getId, s.getId())
+                    .eq(TraceSession::getTenantId, tenantId));
         }
         log.info("Trace sessions completed: taskId={}, count={}", taskId, running.size());
     }
@@ -133,17 +137,10 @@ public class TraceServiceImpl implements TraceService {
     @Transactional(readOnly = true)
     public PageResult listByTaskId(String taskId, String agent, String severity,
                                                     int page, int size) {
-        // 验证审核任务属于当前租户
         Long tenantId = TenantScope.requiredTenantId();
-        AuditTask task = auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
-                .eq(AuditTask::getTaskId, taskId)
-                .eq(AuditTask::getTenantId, tenantId));
-        if (task == null) {
-            return new PageResult(0L, List.of());
-        }
-
         LambdaQueryWrapper<TraceSession> q = new LambdaQueryWrapper<TraceSession>()
-                .eq(TraceSession::getTaskId, taskId);
+                .eq(TraceSession::getTaskId, taskId)
+                .eq(TraceSession::getTenantId, tenantId);
         if (agent != null && !agent.isBlank()) {
             q.eq(TraceSession::getAgentName, agent);
         }
@@ -163,25 +160,18 @@ public class TraceServiceImpl implements TraceService {
     @Override
     @Transactional(readOnly = true)
     public TraceSessionDetailVO getSessionDetail(String sessionId) {
-        TraceSession session = sessionMapper.selectById(sessionId);
+        Long tenantId = TenantScope.requiredTenantId();
+        TraceSession session = sessionMapper.selectOne(new LambdaQueryWrapper<TraceSession>()
+                .eq(TraceSession::getId, sessionId)
+                .eq(TraceSession::getTenantId, tenantId));
         if (session == null) {
             return null;
-        }
-
-        // 验证 session 关联的审核任务属于当前租户
-        Long tenantId = TenantScope.requiredTenantId();
-        if (session.getTaskId() != null) {
-            AuditTask task = auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
-                    .eq(AuditTask::getTaskId, session.getTaskId())
-                    .eq(AuditTask::getTenantId, tenantId));
-            if (task == null) {
-                return null;
-            }
         }
 
         List<TraceEventEntity> entities = eventMapper.selectList(
                 new LambdaQueryWrapper<TraceEventEntity>()
                         .eq(TraceEventEntity::getSessionId, sessionId)
+                        .eq(TraceEventEntity::getTenantId, tenantId)
                         .orderByAsc(TraceEventEntity::getTurn)
                         .orderByAsc(TraceEventEntity::getId));
 
@@ -210,10 +200,11 @@ public class TraceServiceImpl implements TraceService {
     // ── 内部辅助 ──────────────────────────────────────────────
 
     /** 按 (task_id, agent_name, clause_id) 查 session，不存在则创建。 */
-    private TraceSession findOrCreateSession(String taskId, String docId, TraceEventVO vo) {
+    private TraceSession findOrCreateSession(String taskId, String docId, TraceEventVO vo, Long tenantId) {
         List<TraceSession> existing = sessionMapper.selectList(
                 new LambdaQueryWrapper<TraceSession>()
                         .eq(TraceSession::getTaskId, taskId)
+                        .eq(TraceSession::getTenantId, tenantId)
                         .eq(TraceSession::getAgentName, vo.getAgentName())
                         .eq(TraceSession::getClauseId, vo.getClauseId())
                         .last("LIMIT 1"));
@@ -223,6 +214,7 @@ public class TraceServiceImpl implements TraceService {
 
         TraceSession session = new TraceSession();
         session.setId(UUID.randomUUID().toString());
+        session.setTenantId(tenantId);
         session.setTaskId(taskId);
         session.setDocId(docId);
         session.setAgentName(vo.getAgentName());

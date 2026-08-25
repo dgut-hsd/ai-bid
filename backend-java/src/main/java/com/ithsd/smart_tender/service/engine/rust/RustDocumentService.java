@@ -1,11 +1,12 @@
 package com.ithsd.smart_tender.service.engine.rust;
 
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ithsd.smart_tender.common.BizException;
 import com.ithsd.smart_tender.mapper.TenderMapper;
 import com.ithsd.smart_tender.model.entity.Tender;
 import com.ithsd.smart_tender.model.dto.rust.RustProcessResponse;
 import com.ithsd.smart_tender.service.StoragePathService;
+import com.ithsd.smart_tender.service.impl.TenantScope;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -54,20 +55,19 @@ public class RustDocumentService {
      * <p>自动恢复：若 Rust 侧返回 404（服务重启、内存清空），
      * 清除缓存并重新上传。</p>
      *
-     * @param bidId    Java 侧 Tender 主键
-     * @param tenantId 租户 ID（由调用方显式传入，同时用于租户隔离验证）
+     * @param bidId Java 侧 Tender 主键
      * @return Rust document_id（UUID）
      * @throws BizException 上传失败或文件不存在
      */
     @Transactional
-    public String ensureUploaded(Long bidId, Long tenantId) {
-        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
-                .eq(Tender::getId, bidId)
-                .eq(Tender::getTenantId, tenantId));
+    public String ensureUploaded(Long bidId) {
+        Long tenantId = TenantScope.requiredTenantId();
+        Tender tender = tenderMapper.selectOne(new QueryWrapper<Tender>()
+                .eq("id", bidId)
+                .eq("tenant_id", tenantId));
         if (tender == null) {
-            throw new BizException(5704, "标书不存在: bidId=" + bidId);
+            throw TenantScope.resourceNotFound();
         }
-
         // 已有缓存 → 验证有效性
         if (StringUtils.hasText(tender.getRustDocumentId())) {
             if (verifyExists(tender.getRustDocumentId())) {
@@ -81,22 +81,25 @@ public class RustDocumentService {
         }
 
         // 首次上传或重新上传
-        return uploadToRust(bidId, tender);
+        return uploadToRust(bidId, tenantId, tender);
     }
 
     /**
      * 仅返回数据库中已缓存的 Rust 文档 ID，不验证 Rust 内存中的文档是否仍存在。
      * 用于任务恢复：Rust 的最终结果有磁盘 fallback，即使服务重启后文档对象
      * 尚未恢复，旧 document_id 对应的结果仍然可以读取。
-     *
-     * @param bidId    Java 侧 Tender 主键
-     * @param tenantId 租户 ID（由调用方显式传入，同时用于租户隔离验证）
      */
-    public String getCachedDocumentId(Long bidId, Long tenantId) {
-        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
-                .eq(Tender::getId, bidId)
-                .eq(Tender::getTenantId, tenantId));
-        return tender == null ? null : tender.getRustDocumentId();
+    public String getCachedDocumentId(Long bidId) {
+        Long tenantId = TenantScope.requiredTenantId();
+        Tender tender = tenderMapper.selectOne(new QueryWrapper<Tender>()
+                .eq("id", bidId)
+                .eq("tenant_id", tenantId));
+        if (tender == null) {
+            // 缓存查找：查不到一律返回 null（不抛异常），保证 recover 的优雅降级。
+            // 租户隔离由上面的 tenant_id 谓词保证，与"返回 null"无关，跨租户不会泄露。
+            return null;
+        }
+        return tender.getRustDocumentId();
     }
 
     // ── 私有方法 ──────────────────────────────────────────────────
@@ -111,7 +114,7 @@ public class RustDocumentService {
         }
     }
 
-    private String uploadToRust(Long bidId, Tender tender) {
+    private String uploadToRust(Long bidId, Long tenantId, Tender tender) {
         // 1. 解析文件物理路径
         Path filePath = storagePathService.resolveStoredPath(tender.getFilePath());
         if (filePath == null) {
@@ -138,7 +141,10 @@ public class RustDocumentService {
         // 3. 回写缓存
         tender.setRustDocumentId(result.getDocumentId());
         tender.setPageCount(result.getTotalPages());  // 顺便更新页数
-        tenderMapper.updateById(tender);
+        tender.setTenantId(tenantId);
+        tenderMapper.update(tender, new QueryWrapper<Tender>()
+                .eq("id", bidId)
+                .eq("tenant_id", tenantId));
 
         log.info("Rust upload complete: bidId={}, rustDocId={}, chunks={}, pages={}",
                 bidId, result.getDocumentId(), result.getTotalChunks(), result.getTotalPages());

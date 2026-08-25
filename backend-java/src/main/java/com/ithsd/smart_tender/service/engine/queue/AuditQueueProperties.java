@@ -15,6 +15,7 @@ public class AuditQueueProperties {
     private Integer pollDelayMs = 500;
     private Integer maxRetry = 3;
     private String dlqStreamKey = "queue:audit:tasks:dlq";
+    private String dlqListKey = "queue:audit:tasks:list-dlq";
 
     public String getMode() {
         return mode;
@@ -86,5 +87,13 @@ public class AuditQueueProperties {
 
     public void setDlqStreamKey(String dlqStreamKey) {
         this.dlqStreamKey = dlqStreamKey;
+    }
+
+    public String getDlqListKey() {
+        return dlqListKey;
+    }
+
+    public void setDlqListKey(String dlqListKey) {
+        this.dlqListKey = dlqListKey;
     }
 }

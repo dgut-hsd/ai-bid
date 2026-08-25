@@ -1,4 +1,9 @@
 # ── 生产环境配置覆盖 ──
+spring:
+  sql:
+    init:
+      mode: never
+
 server:
   port: 3000
 

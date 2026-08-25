@@ -5,8 +5,8 @@ import java.util.concurrent.Callable;
 
 /**
  * Request context holder. The only supported propagation mechanism is an
- * explicit snapshot/wrapper; callers must never rely on a raw ThreadLocal
- * crossing an executor boundary.
+ * explicit wrapper (see {@link #wrap(Runnable)}); callers must never rely on
+ * a raw ThreadLocal crossing an executor boundary.
  */
 public final class TenantContext {
 
@@ -27,10 +27,6 @@ public final class TenantContext {
 
     public static TenantRequestContext current() {
         return get();
-    }
-
-    public static TenantContextSnapshot snapshot() {
-        return TenantContextSnapshot.from(get());
     }
 
     public static void clear() {

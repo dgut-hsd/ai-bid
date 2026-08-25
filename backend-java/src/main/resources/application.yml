@@ -127,6 +127,7 @@ audit:
     poll-delay-ms: 500
     max-retry: 3
     dlq-stream-key: queue:audit:tasks:dlq
+    dlq-list-key: queue:audit:tasks:list-dlq
   sse:
     replay-max-events: 100
   async:

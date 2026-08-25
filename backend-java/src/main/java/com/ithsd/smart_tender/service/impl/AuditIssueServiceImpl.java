@@ -33,6 +33,7 @@ public class AuditIssueServiceImpl extends ServiceImpl<AuditIssueMapper, AuditIs
 
     @Override
     public Map<String, Long> countByCategory() {
+        Long tenantId = TenantScope.requiredTenantId();
         List<Long> bidIds = tenderService.getBidIdsByUserId(BaseContext.getCurrentId());
         List<Long> auditIds = auditTaskService.getAuditIdsByBidIds(bidIds);
         if(auditIds.isEmpty())
@@ -41,6 +42,7 @@ public class AuditIssueServiceImpl extends ServiceImpl<AuditIssueMapper, AuditIs
         QueryWrapper<AuditIssue> queryWrapper = new QueryWrapper<>();
         queryWrapper.select("category", "count(1) as count")
                 .in("audit_id", auditIds)
+                .eq("tenant_id", tenantId)
                 .groupBy("category");
 
         List<Map<String, Object>> result = this.baseMapper.selectMaps(queryWrapper);

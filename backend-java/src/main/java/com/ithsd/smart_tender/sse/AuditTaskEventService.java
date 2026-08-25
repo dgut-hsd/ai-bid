@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ithsd.smart_tender.mapper.AuditTaskEventMapper;
 import com.ithsd.smart_tender.model.entity.AuditTaskEvent;
 import com.ithsd.smart_tender.model.enums.SseEventTypeEnum;
+import com.ithsd.smart_tender.service.impl.TenantScope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -31,8 +32,10 @@ public class AuditTaskEventService {
         if (!StringUtils.hasText(taskId) || eventType == null || payload == null) {
             return null;
         }
+        Long tenantId = TenantScope.requiredTenantId();
         try {
             AuditTaskEvent event = new AuditTaskEvent();
+            event.setTenantId(tenantId);
             event.setTaskId(taskId);
             event.setEventType(eventType.getEventName());
             event.setEventData(OBJECT_MAPPER.writeValueAsString(payload));
@@ -52,9 +55,11 @@ public class AuditTaskEventService {
         }
         long startId = parseLastEventId(lastEventId);
         int limit = Math.max(1, sseProperties.getReplayMaxEvents());
+        Long tenantId = TenantScope.requiredTenantId();
 
         LambdaQueryWrapper<AuditTaskEvent> qw = new LambdaQueryWrapper<AuditTaskEvent>()
                 .eq(AuditTaskEvent::getTaskId, taskId)
+                .eq(AuditTaskEvent::getTenantId, tenantId)
                 .gt(AuditTaskEvent::getId, startId)
                 .orderByAsc(AuditTaskEvent::getId)
                 .last("LIMIT " + limit);
