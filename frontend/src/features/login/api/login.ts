@@ -36,4 +36,12 @@ export const loginApi = {
    register: (data: RegisterParams): Promise<BaseResponse<unknown>> => {
       return request.post('/api/auth/register', data);
    },
+
+    /** 用户本人修改密码：校验旧密码，设置新密码，旧会话失效。 */
+    changePassword: (data: {
+      old_password: string;
+      new_password: string;
+    }): Promise<BaseResponse<unknown>> => {
+      return request.post('/api/auth/change-password', data);
+    },
 };

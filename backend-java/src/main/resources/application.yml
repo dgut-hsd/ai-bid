@@ -64,14 +64,16 @@ security:
     accept-legacy-user-id: false
 
 # 私有化单企业部署初始化：首次启动自动创建「财务部门」租户和初始管理员。
-# 生产安装务必通过 AIBID_BOOTSTRAP_ADMIN_PASSWORD 覆盖默认密码，并在首次登录后修改。
+# 默认账号 admin / 密码 123456（与历史种子 sql/test_data.sql 一致；仅在新装且
+# admin 不存在时创建，不会覆盖已存在账号的密码）。生产安装务必通过
+# AIBID_BOOTSTRAP_ADMIN_PASSWORD 覆盖默认密码，并在首次登录后修改。
 app:
   bootstrap:
     enabled: ${AIBID_BOOTSTRAP_ENABLED:true}
     tenant-code: ${AIBID_BOOTSTRAP_TENANT_CODE:finance}
     tenant-name: ${AIBID_BOOTSTRAP_TENANT_NAME:财务部门}
     admin-username: ${AIBID_BOOTSTRAP_ADMIN_USERNAME:admin}
-    admin-password: ${AIBID_BOOTSTRAP_ADMIN_PASSWORD:admin123}
+    admin-password: ${AIBID_BOOTSTRAP_ADMIN_PASSWORD:123456}
     admin-realname: ${AIBID_BOOTSTRAP_ADMIN_REALNAME:系统管理员}
 
 # 文件存储配置

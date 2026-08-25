@@ -58,22 +58,13 @@ export interface ProjectItem {
 /** 问题类型分布：后端按 audit_issue.category（实际为 Rust 引擎的 risk_type 中文标签）分组计数 */
 export type DistributionResponse = Record<string, number>;
 
-export interface AuditCount {
-  周一: number;
-  周二: number;
-  周三: number;
-  周四: number;
-  周五: number;
-  周六: number;
-  周日: number;
-}
-
 export interface IssueChartItem {
   name: string;
   value: number;
 }
 
-export interface AuditCountItem {
+/** 月度每日问题数（name=当月第几日，count=问题数） */
+export interface DailyIssueCountItem {
   name: string;
   count: number;
 }

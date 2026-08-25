@@ -128,7 +128,7 @@ describe('useTenant', () => {
       defaultOptions: { queries: { retry: false } },
     });
     queryClient.setQueryData(['dashboardList', '20001'], ['old tenant data']);
-    queryClient.setQueryData(['auditCount', '20001'], ['old tenant stats']);
+    queryClient.setQueryData(['dailyIssues', '20001'], ['old tenant issue stats']);
     const { store, Wrapper } = createWrapper(queryClient);
     const { result } = renderHook(() => useTenant(), { wrapper: Wrapper });
 
@@ -144,7 +144,7 @@ describe('useTenant', () => {
     expect(store.getState().auth.currentTenantId).toBe('20002');
     expect(store.getState().auth.tenantList[0]?.name).toBe('第二个租户');
     expect(queryClient.getQueryData(['dashboardList', '20001'])).toBeUndefined();
-    expect(queryClient.getQueryData(['auditCount', '20001'])).toBeUndefined();
+    expect(queryClient.getQueryData(['dailyIssues', '20001'])).toBeUndefined();
     expect(localStorage.getItem('token')).toBe('second-token');
   });
 });

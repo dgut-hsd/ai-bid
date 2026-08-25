@@ -272,7 +272,6 @@ pnpm install && pnpm dev
 
 ## 文档
 
-- [CLAUDE.md](CLAUDE.md) — 项目总览与环境变量
 - [backend-rust/CLAUDE.md](backend-rust/CLAUDE.md) — Rust 引擎架构
 - [backend-java/CLAUDE.md](backend-java/CLAUDE.md) — Java 网关架构
 - [frontend/CLAUDE.md](frontend/CLAUDE.md) — 前端开发指南

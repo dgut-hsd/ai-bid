@@ -6,12 +6,12 @@ import {
    LayoutDashboard,
    FileSearch,
    BookOpen,
-   Building2,
+   Users,
 } from 'lucide-react';
 
 import { useSidebarStyle } from './style';
 import type { RootState } from '../../store';
-import { canAccessTenantManage } from '../../features/tenant/access';
+import { isCurrentTenantOwner } from '../../features/admin/access';
 import bidAuditLogo from '../../assets/bid-audit.svg';
 
 const { Sider } = Layout;
@@ -22,20 +22,21 @@ const BASE_NAV_ITEMS = [
    { key: '/library', icon: <BookOpen size={18} />, label: '标准库管理' },
 ];
 
-const TENANT_MANAGE_ITEM = {
-   key: '/tenant-manage',
-   icon: <Building2 size={18} />,
-   label: '租户管理',
+const ADMIN_ITEM = {
+   key: '/admin/users',
+   icon: <Users size={18} />,
+   label: '系统管理',
 };
 
 /**
- * 只有租户拥有者/管理员（或尚未加入任何租户、需要创建首个租户的用户）
- * 才能看到「租户管理」入口；普通成员/审核/只读用户隐藏。
+ * 只有企业 OWNER 才能看到「系统管理」入口；普通 MEMBER 隐藏。
  */
 function useNavItems() {
-   const tenantList = useSelector((state: RootState) => state.auth.tenantList);
-   return canAccessTenantManage(tenantList)
-      ? [...BASE_NAV_ITEMS, TENANT_MANAGE_ITEM]
+   const { tenantList, currentTenantId } = useSelector(
+      (state: RootState) => state.auth
+   );
+   return isCurrentTenantOwner(tenantList, currentTenantId)
+      ? [...BASE_NAV_ITEMS, ADMIN_ITEM]
       : BASE_NAV_ITEMS;
 }
 
@@ -51,8 +52,8 @@ export const Sidebar: React.FC<{ collapsed: boolean }> = ({ collapsed }) => {
       if (pathname.startsWith('/bidReview')) {
          return ['/bidReview'];
       }
-      if (pathname.startsWith('/tenant-manage')) {
-         return ['/tenant-manage'];
+      if (pathname.startsWith('/admin')) {
+         return ['/admin/users'];
       }
       return [pathname];
    };

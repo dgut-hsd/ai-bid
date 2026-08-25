@@ -125,7 +125,7 @@ export const IssueTypePieChart: React.FC<IssueTypePieChartProps> = ({
 
          <span style={{ fontSize: 12 }}>按风险类型统计审核发现的问题数量。</span>
 
-         <div ref={chartRef} style={{ width: '100%', height: 250 }} />
+         <div ref={chartRef} style={{ width: '100%', flex: 1, minHeight: 150 }} />
       </div>
    );
 };

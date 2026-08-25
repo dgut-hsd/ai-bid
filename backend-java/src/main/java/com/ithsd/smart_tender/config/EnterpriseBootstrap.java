@@ -25,7 +25,7 @@ import java.time.ZoneOffset;
  * <p>首次启动时自动创建「财务部门」企业租户和初始 OWNER 管理员账号，使系统
  * 安装后即可登录后台管理用户。全部操作幂等：已存在时不会重复创建。</p>
  *
- * <p>初始管理员密码来自配置（默认 admin/admin123），生产安装必须通过环境变量
+ * <p>初始管理员密码来自配置（默认 admin/123456），生产安装必须通过环境变量
  * 覆盖并在首次登录后立即修改。</p>
  */
 @Component
@@ -46,7 +46,7 @@ public class EnterpriseBootstrap implements ApplicationRunner {
     private String tenantName;
     @Value("${app.bootstrap.admin-username:admin}")
     private String adminUsername;
-    @Value("${app.bootstrap.admin-password:admin123}")
+    @Value("${app.bootstrap.admin-password:123456}")
     private String adminPassword;
     @Value("${app.bootstrap.admin-realname:系统管理员}")
     private String adminRealName;

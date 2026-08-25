@@ -1,25 +1,14 @@
 import request from '@/api/request';
 import type { BaseResponse } from '@/api/types';
 import type {
-   AuditCount,
    IssueChartItem,
    DistributionResponse,
    ProjectItem,
    ProjectParams,
-   AuditCountItem,
+   DailyIssueCountItem,
 } from '../types';
 import { mutationOptions, queryOptions } from '@tanstack/react-query';
 import { getStoredCurrentTenantId } from '@/store/slices/authSlice';
-
-const WEEKDAY_LABEL_MAP: Record<string, string> = {
-   Monday: '周一',
-   Tuesday: '周二',
-   Wednesday: '周三',
-   Thursday: '周四',
-   Friday: '周五',
-   Saturday: '周六',
-   Sunday: '周日',
-};
 
 export const getDashboardList = async (): Promise<ProjectItem[]> => {
    const res = await request.get<
@@ -80,17 +69,18 @@ export const getIssueDistribution = async (): Promise<IssueChartItem[]> => {
       .sort((a, b) => b.value - a.value);
 };
 
-export const getAuditCount = async (): Promise<AuditCountItem[]> => {
-   const res = await request.get<unknown, BaseResponse<AuditCount>>(
-      '/api/audit-tasks/count-audit'
+export const getDailyIssueCount = async (): Promise<DailyIssueCountItem[]> => {
+   const res = await request.get<unknown, BaseResponse<Record<string, number>>>(
+      '/api/audit-issues/count-by-day'
    );
 
    const data = res.data;
 
-   if (!data) return [];
+   if (!data || typeof data !== 'object') return [];
 
-   return Object.entries(data).map(([key, value]) => ({
-      name: WEEKDAY_LABEL_MAP[key] ?? key,
+   // 后端返回 Map<当月第几日, 问题数>，直接透传
+   return Object.entries(data).map(([day, value]) => ({
+      name: day,
       count: Number(value) || 0,
    }));
 };
@@ -118,12 +108,12 @@ export const dashboardOptions = {
          staleTime: 0,
       });
    },
-   auditCount: (tenantId?: string | null) => {
+   dailyIssues: (tenantId?: string | null) => {
       const resolvedTenantId =
          tenantId === undefined ? getStoredCurrentTenantId() : tenantId;
       return queryOptions({
-         queryKey: ['auditCount', resolvedTenantId],
-         queryFn: () => getAuditCount(),
+         queryKey: ['dailyIssues', resolvedTenantId],
+         queryFn: () => getDailyIssueCount(),
          enabled: Boolean(resolvedTenantId),
          placeholderData: (previousData) => previousData,
          staleTime: 0,

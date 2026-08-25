@@ -12,6 +12,8 @@ import com.ithsd.smart_tender.service.TenderService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDate;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -50,5 +52,32 @@ public class AuditIssueServiceImpl extends ServiceImpl<AuditIssueMapper, AuditIs
                         Long::sum
                 ));
 
+    }
+
+    @Override
+    public Map<String, Long> countByDayCurrentMonth() {
+        List<Long> bidIds = tenderService.getBidIdsByUserId(BaseContext.getCurrentId());
+        List<Long> auditIds = auditTaskService.getAuditIdsByBidIds(bidIds);
+
+        LocalDate today = LocalDate.now();
+        Map<String, Long> result = new LinkedHashMap<>();
+        for (int d = 1; d <= today.lengthOfMonth(); d++) {
+            result.put(String.valueOf(d), 0L);
+        }
+        if (auditIds.isEmpty()) {
+            return result;
+        }
+
+        List<Map<String, Object>> rows = this.baseMapper.countIssuesByDayCurrentMonth(auditIds);
+        for (Map<String, Object> row : rows) {
+            Object dayNum = row.get("day_num");
+            if (dayNum == null) {
+                continue;
+            }
+            int day = ((Number) dayNum).intValue();
+            long count = row.get("count") == null ? 0L : ((Number) row.get("count")).longValue();
+            result.put(String.valueOf(day), count);
+        }
+        return result;
     }
 }
