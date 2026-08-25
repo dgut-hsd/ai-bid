@@ -315,14 +315,8 @@ public class TenantAuthServiceImpl implements TenantAuthService {
                 "tenant.read", "tenant.settings.write", "tenant.members.invite", "tenant.members.remove",
                 "tenant.members.role.write", "tenant.owner.transfer", "tender.write", "audit.start",
                 "audit.report.read", "knowledge.write", "tenant.delete"));
-        permissions.put("ADMIN", List.of(
-                "tenant.read", "tenant.settings.write", "tenant.members.invite", "tenant.members.remove",
-                "tenant.members.role.write", "tender.write", "audit.start", "audit.report.read", "knowledge.write"));
-        permissions.put("AUDITOR", List.of(
-                "tenant.read", "tender.write", "audit.start", "audit.report.read", "knowledge.write"));
         permissions.put("MEMBER", List.of(
                 "tenant.read", "tender.write", "audit.start", "audit.report.read", "knowledge.write"));
-        permissions.put("VIEWER", List.of("tenant.read", "audit.report.read"));
         return Map.copyOf(permissions);
     }
 

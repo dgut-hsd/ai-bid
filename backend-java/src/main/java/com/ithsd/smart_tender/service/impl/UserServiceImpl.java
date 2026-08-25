@@ -21,7 +21,7 @@ public class UserServiceImpl implements UserService {
     @Override
     public User login(UserLoginDTO userLoginDTO) {
         LambdaQueryWrapper<User> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(User::getPhone, userLoginDTO.getPhone());
+        wrapper.eq(User::getUsername, userLoginDTO.getUsername());
         User user = userMapper.selectOne(wrapper);
         
         if (user == null) {

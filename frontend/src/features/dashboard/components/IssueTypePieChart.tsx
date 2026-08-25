@@ -5,14 +5,23 @@ import { Typography } from 'antd';
 import { useStyles } from '../style';
 import type { IssueChartItem } from '../types';
 
-// 基于全局配置生成渐变调色盘
+// 风险类型饼图配色：分类是动态的（可能超过 6 个），超过颜色数量时 ECharts 自动循环取色。
 const PIE_COLORS = [
    COLORS.primary, // 学校绿
    COLORS.primaryHover, // 中绿
    COLORS.success, // 成功绿
-   '#81C784', // 补充渐变过渡色
-   '#A5D6A7', // 补充渐变过渡色
-   COLORS.primaryLight, // 浅绿色
+   '#1890ff', // 蓝
+   '#faad14', // 琥珀
+   '#f5222d', // 红
+   '#722ed1', // 紫
+   '#13c2c2', // 青
+   '#eb2f96', // 品红
+   '#2f54eb', // 靛蓝
+   '#a0d911', // 柠檬
+   '#fa8c16', // 橙
+   '#08979c', // 深青
+   '#c41d7f', // 玫红
+   '#d48806', // 金
 ];
 
 interface IssueTypePieChartProps {
@@ -27,15 +36,33 @@ export const IssueTypePieChart: React.FC<IssueTypePieChartProps> = ({
    const chartRef = useRef<HTMLDivElement>(null);
    const { styles } = useStyles();
    const chartData = Array.isArray(data) ? data : [];
+   const isEmpty = chartData.length === 0;
 
-   const option: echarts.EChartsOption = useMemo(
-      () => ({
+   const option: echarts.EChartsOption = useMemo(() => {
+      if (isEmpty) {
+         return {
+            graphic: {
+               type: 'text',
+               left: 'center',
+               top: 'middle',
+               style: {
+                  text: '暂无审核问题',
+                  fill: COLORS.textSecondary,
+                  fontSize: 14,
+               },
+            },
+            series: [{ type: 'pie' as const, data: [] }],
+         } as echarts.EChartsOption;
+      }
+
+      return {
          color: PIE_COLORS,
          tooltip: {
             trigger: 'item',
          },
          legend: {
-            bottom: '5',
+            type: 'scroll',
+            bottom: 0,
             left: 'center',
             icon: 'square',
             textStyle: {
@@ -61,10 +88,10 @@ export const IssueTypePieChart: React.FC<IssueTypePieChartProps> = ({
                data: chartData,
             },
          ],
-      }),
-      [chartData]
-   );
+      };
+   }, [chartData, isEmpty]);
 
+   // 图表容器始终常驻（空数据时用 graphic 显示占位），保证空 → 有数据时无需重建实例
    useEffect(() => {
       if (!chartRef.current) return;
       const chart = echarts.init(chartRef.current);
@@ -86,7 +113,8 @@ export const IssueTypePieChart: React.FC<IssueTypePieChartProps> = ({
       const chart = echarts.getInstanceByDom(chartRef.current);
       if (!chart) return;
 
-      chart.setOption(option);
+      // notMerge=true：空态 graphic 与饼图之间切换时彻底替换，避免残留
+      chart.setOption(option, true);
    }, [option]);
 
    return (
@@ -95,7 +123,7 @@ export const IssueTypePieChart: React.FC<IssueTypePieChartProps> = ({
             问题类型分布
          </Title>
 
-         <span style={{ fontSize: 12 }}>合规性、法律法规、采购需求等维度分布。</span>
+         <span style={{ fontSize: 12 }}>按风险类型统计审核发现的问题数量。</span>
 
          <div ref={chartRef} style={{ width: '100%', height: 250 }} />
       </div>

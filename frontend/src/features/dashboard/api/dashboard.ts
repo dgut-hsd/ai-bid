@@ -70,12 +70,14 @@ export const getIssueDistribution = async (): Promise<IssueChartItem[]> => {
    );
 
    const data = res.data;
+   if (!data || typeof data !== 'object') return [];
 
-   return [
-      { name: '合规性', value: data?.budget || 0 },
-      { name: '法律法规', value: data?.legal || 0 },
-      { name: '采购需求', value: data?.demand || 0 },
-   ];
+   // category 列实际存的是 Rust 引擎 risk_type（"地域歧视"/"品牌指定"/… 等中文标签），
+   // 直接透传后端 map 的 key/value，不再硬编码 budget/legal/demand 三个旧分类。
+   return Object.entries(data)
+      .map(([name, value]) => ({ name, value: Number(value) || 0 }))
+      .filter((item) => item.value > 0)
+      .sort((a, b) => b.value - a.value);
 };
 
 export const getAuditCount = async (): Promise<AuditCountItem[]> => {

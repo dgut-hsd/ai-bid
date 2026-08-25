@@ -5,7 +5,6 @@ import com.ithsd.smart_tender.common.TenantAuthException;
 import com.ithsd.smart_tender.model.dto.TenantSwitchDTO;
 import com.ithsd.smart_tender.model.vo.UserLoginVO;
 import com.ithsd.smart_tender.service.TenantAuthService;
-import com.ithsd.smart_tender.service.UserService;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
@@ -21,10 +20,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 class UserControllerTest {
 
-    private final UserService userService = mock(UserService.class);
     private final TenantAuthService tenantAuthService = mock(TenantAuthService.class);
     private final MockMvc mvc = MockMvcBuilders
-            .standaloneSetup(new UserController(userService, tenantAuthService))
+            .standaloneSetup(new UserController(tenantAuthService))
             .setControllerAdvice(new GlobalExceptionHandler())
             .build();
 

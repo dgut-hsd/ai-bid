@@ -1,0 +1,4 @@
+# 部署运行时状态文件（不提交仓库）
+.env
+.deploy-history
+.rollback-hold

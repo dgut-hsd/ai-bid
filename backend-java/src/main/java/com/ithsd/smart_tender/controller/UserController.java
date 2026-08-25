@@ -4,11 +4,9 @@ import com.ithsd.smart_tender.common.TenantContext;
 import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.model.dto.TenantSwitchDTO;
 import com.ithsd.smart_tender.model.dto.UserLoginDTO;
-import com.ithsd.smart_tender.model.dto.UserRegisterDTO;
 import com.ithsd.smart_tender.model.result.Result;
 import com.ithsd.smart_tender.model.vo.UserLoginVO;
 import com.ithsd.smart_tender.service.TenantAuthService;
-import com.ithsd.smart_tender.service.UserService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -24,7 +22,6 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class UserController {
 
-    private final UserService userService;
     private final TenantAuthService tenantAuthService;
 
     @PostMapping("/login")
@@ -57,12 +54,6 @@ public class UserController {
     ) {
         return Result.success(tenantAuthService.switchTenant(
                 authorization, request, resolveRequestId(requestId)));
-    }
-
-    @PostMapping("/register")
-    public Result<Void> register(@RequestBody UserRegisterDTO userRegisterDTO) {
-        userService.register(userRegisterDTO);
-        return Result.success();
     }
 
     private String resolveRequestId(String requestId) {

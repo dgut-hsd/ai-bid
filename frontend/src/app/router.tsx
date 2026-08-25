@@ -2,6 +2,7 @@ import { createBrowserRouter, Navigate } from 'react-router-dom';
 import MainLayout from '../components/layout/MainLayout';
 import { RouteGuard } from './RouteGuard';
 import { TenantGuard } from './TenantGuard';
+import { TenantManageGuard } from './TenantManageGuard';
 
 import { loginRoutes } from '../features/login/routes';
 import { dashboardRoutes } from '../features/dashboard/routes';
@@ -28,8 +29,11 @@ export const router = createBrowserRouter([
       children: [
          { index: true, element: <Navigate to='/dashboard' replace /> },
 
-         // 租户管理 — 无需租户上下文即可访问
-         ...tenantRoutes,
+         // 租户管理 — 仅有拥有者/管理员角色（或无租户待创建）的用户可访问
+         {
+            element: <TenantManageGuard />,
+            children: tenantRoutes,
+         },
 
          // 业务路由 — 需要租户上下文
          {

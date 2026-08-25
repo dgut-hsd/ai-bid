@@ -36,12 +36,17 @@ spring:
           max-idle: 8
           min-idle: 0
   flyway:
-    enabled: false
+    enabled: true
     baseline-on-migrate: true
+    # 存量库（已手动应用过 V1~V6、但没有 flyway_schema_history 表）首次启用时，
+    # baseline 到 6 以跳过已应用的迁移；全新空库不受影响，会从 V1 完整执行。
+    baseline-version: 6
+    locations: classpath:db/migration
   sql:
     init:
-      mode: always
-      schema-locations: classpath:audit_task_event.sql,classpath:trace_schema.sql
+      # schema 已交由 Flyway 接管；禁用启动期脚本初始化，
+      # 避免 audit_task_event.sql / trace_schema.sql 里的 DROP TABLE 在每次重启时清空数据。
+      mode: never
   servlet:
     encoding:
       charset: UTF-8
@@ -57,6 +62,17 @@ security:
     secret: ${ST_JWT_SECRET:local-test-only-jwt-secret-change-me}
     ttl-millis: ${ST_JWT_TTL_MILLIS:86400000}
     accept-legacy-user-id: false
+
+# 私有化单企业部署初始化：首次启动自动创建「财务部门」租户和初始管理员。
+# 生产安装务必通过 AIBID_BOOTSTRAP_ADMIN_PASSWORD 覆盖默认密码，并在首次登录后修改。
+app:
+  bootstrap:
+    enabled: ${AIBID_BOOTSTRAP_ENABLED:true}
+    tenant-code: ${AIBID_BOOTSTRAP_TENANT_CODE:finance}
+    tenant-name: ${AIBID_BOOTSTRAP_TENANT_NAME:财务部门}
+    admin-username: ${AIBID_BOOTSTRAP_ADMIN_USERNAME:admin}
+    admin-password: ${AIBID_BOOTSTRAP_ADMIN_PASSWORD:admin123}
+    admin-realname: ${AIBID_BOOTSTRAP_ADMIN_REALNAME:系统管理员}
 
 # 文件存储配置
 file:

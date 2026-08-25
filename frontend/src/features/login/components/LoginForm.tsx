@@ -1,10 +1,10 @@
 import { Form, Input, Checkbox, Button } from 'antd';
 import type { FormInstance } from 'antd';
-import { PhoneOutlined, LockOutlined } from '@ant-design/icons';
+import { UserOutlined, LockOutlined } from '@ant-design/icons';
 import { useStyles } from '../style';
 
 export type LoginFormValues = {
-   phone: string;
+   username: string;
    password: string;
    remember?: boolean;
 };
@@ -36,21 +36,16 @@ export function LoginForm({
          validateTrigger={['onBlur', 'onSubmit']}
       >
          <Form.Item
-            name='phone'
-            label={<span>手机号</span>}
-            rules={[
-               { required: true, message: '请输入手机号' },
-               { pattern: /^1[3-9]\d{9}$/, message: '请输入正确的手机号' },
-            ]}
+            name='username'
+            label={<span>账号</span>}
+            rules={[{ required: true, message: '请输入账号' }]}
          >
             <Input
                prefix={
-                  <PhoneOutlined
-                     style={{ color: theme.colorTextDescription }}
-                  />
+                  <UserOutlined style={{ color: theme.colorTextDescription }} />
                }
-               placeholder='请输入手机号'
-               autoComplete='tel'
+               placeholder='请输入账号（用户名）'
+               autoComplete='username'
             />
          </Form.Item>
 

@@ -8,6 +8,7 @@ backend-rust/target
 backend-rust/output
 backend-rust/models
 backend-rust/tmp
+backend-rust/agents
 
 # ── 后端 Java (业务平台) ──
 backend-java/target
@@ -47,6 +48,7 @@ __pycache__/
 env/
 data/
 dump.rdb
+agents/
 
 # ── Python 缓存 ──
 __pycache__/

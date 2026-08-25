@@ -55,11 +55,8 @@ export interface ProjectItem {
   tenders: BidDetail[];
 }
 
-export interface DistributionResponse {
-  budget: number;
-  legal: number;
-  demand: number;
-}
+/** 问题类型分布：后端按 audit_issue.category（实际为 Rust 引擎的 risk_type 中文标签）分组计数 */
+export type DistributionResponse = Record<string, number>;
 
 export interface AuditCount {
   周一: number;

@@ -46,7 +46,7 @@ public class AuditIssueServiceImpl extends ServiceImpl<AuditIssueMapper, AuditIs
         return result.stream()
                 .collect(java.util.stream.Collectors.toMap(
                         row -> (String) row.get("category"),
-                        row -> (Long) row.get("count"),
+                        row -> ((Number) row.get("count")).longValue(),
                         Long::sum
                 ));
 
