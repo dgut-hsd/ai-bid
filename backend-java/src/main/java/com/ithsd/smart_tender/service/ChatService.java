@@ -1,15 +1,21 @@
 package com.ithsd.smart_tender.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.ithsd.smart_tender.common.BaseContext;
+import com.ithsd.smart_tender.common.TenantContext;
 import com.ithsd.smart_tender.mapper.ChatMessageMapper;
+import com.ithsd.smart_tender.mapper.ProjectMapper;
 import com.ithsd.smart_tender.mapper.TenderMapper;
 import com.ithsd.smart_tender.model.dto.ChatRequestDTO;
 import com.ithsd.smart_tender.model.entity.ChatMessage;
+import com.ithsd.smart_tender.model.entity.Project;
 import com.ithsd.smart_tender.model.entity.Tender;
 import com.ithsd.smart_tender.model.vo.ChatMessageVO;
 import com.ithsd.smart_tender.model.vo.ChatResponseVO;
 import com.ithsd.smart_tender.service.engine.rust.RustApiClient;
 import com.ithsd.smart_tender.service.engine.rust.RustDocumentService;
+import com.ithsd.smart_tender.service.impl.TenantScope;
 import com.ithsd.smart_tender.model.dto.rust.RustChatRequest;
 import com.ithsd.smart_tender.model.dto.rust.RustChatResponse;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -41,27 +47,29 @@ import java.util.stream.Collectors;
 public class ChatService {
 
     private final ChatMessageMapper chatMessageMapper;
+    private final ProjectMapper projectMapper;
     private final TenderMapper tenderMapper;
     private final RustApiClient rustApiClient;
     private final RustDocumentService rustDocumentService;
 
     @Transactional
     public ChatResponseVO chat(ChatRequestDTO requestDTO) {
+        ChatResource resource = resolveChatResource(requestDTO.getProjectId(), requestDTO.getBidId());
         Long rawUserId = BaseContext.getCurrentId();
         final Long userId = rawUserId != null ? rawUserId : 0L;
         Long projectId = requestDTO.getProjectId();
         Long bidId = requestDTO.getBidId();
+        Long tenantId = resource.tenantId();
+        Tender tender = resource.tender();
 
         // 1. 保存用户消息
         ChatMessage userMsg = ChatMessage.builder()
-                .projectId(projectId).bidId(bidId).userId(userId)
+                .tenantId(tenantId).projectId(projectId).bidId(bidId).userId(userId)
                 .role("user").content(requestDTO.getContent())
                 .createTime(LocalDateTime.now()).build();
         chatMessageMapper.insert(userMsg);
 
         // 2. 获取标书
-        Tender tender = tenderMapper.selectById(bidId);
-
         // 3. 确保文件已上传到 Rust（幂等，Rust 重启后自动重传）
         ChatResponseVO response;
         try {
@@ -76,7 +84,7 @@ public class ChatService {
 
         // 4. 保存 AI 回复
         ChatMessage aiMsg = ChatMessage.builder()
-                .projectId(projectId).bidId(bidId).userId(userId)
+                .tenantId(tenantId).projectId(projectId).bidId(bidId).userId(userId)
                 .role("assistant").content(response.getContent())
                 .createTime(LocalDateTime.now()).build();
         chatMessageMapper.insert(aiMsg);
@@ -103,6 +111,9 @@ public class ChatService {
     public SseEmitter chatStream(ChatRequestDTO requestDTO) {
         Long projectId = requestDTO.getProjectId();
         Long bidId = requestDTO.getBidId();
+        ChatResource resource = resolveChatResource(projectId, bidId);
+        Long tenantId = resource.tenantId();
+        Tender tender = resource.tender();
 
         Long rawUserId = BaseContext.getCurrentId();
         final Long userId = rawUserId != null ? rawUserId : 0L;
@@ -112,13 +123,12 @@ public class ChatService {
 
         // 1. Save user message
         ChatMessage userMsg = ChatMessage.builder()
-                .projectId(projectId).bidId(bidId).userId(userId)
+                .tenantId(tenantId).projectId(projectId).bidId(bidId).userId(userId)
                 .role("user").content(requestDTO.getContent())
                 .createTime(LocalDateTime.now()).build();
         chatMessageMapper.insert(userMsg);
 
         // 2. Get tender & ensure uploaded to Rust (lazy upload, like sync chat())
-        Tender tender = tenderMapper.selectById(bidId);
         log.info("chatStream tender: bidId={}, found={}, rustDocId={}", bidId,
                 tender != null, tender != null ? tender.getRustDocumentId() : "N/A");
 
@@ -147,7 +157,7 @@ public class ChatService {
 
         // 4. Async: connect to Rust SSE, relay events, save AI response on done
         String threadName = "chat-stream-" + bidId;
-        new Thread(() -> {
+        new Thread(TenantContext.wrap(() -> {
             try {
                 CompletableFuture<Void> connected = rustApiClient.connectChatStream(
                         rustDocId, rustReq, (eventType, jsonNode) -> {
@@ -173,7 +183,7 @@ public class ChatService {
                                         }
                                         // Save AI message to DB
                                         ChatMessage aiMsg = ChatMessage.builder()
-                                                .projectId(projectId).bidId(bidId).userId(userId)
+                                                .tenantId(tenantId).projectId(projectId).bidId(bidId).userId(userId)
                                                 .role("assistant").content(answer)
                                                 .createTime(LocalDateTime.now()).build();
                                         chatMessageMapper.insert(aiMsg);
@@ -212,7 +222,7 @@ public class ChatService {
                     emitter.completeWithError(ex);
                 }
             }
-        }, threadName).start();
+        }), threadName).start();
 
         log.info("chatStream: emitter returned, bidId={}", bidId);
         return emitter;
@@ -220,7 +230,7 @@ public class ChatService {
 
     /** Async error sender — lets Spring initialize the emitter first. */
     private void sendErrorAsync(SseEmitter emitter, String message, Long bidId) {
-        new Thread(() -> {
+        new Thread(TenantContext.wrap(() -> {
             try {
                 Thread.sleep(50);
                 String json = objectMapper.writeValueAsString(Map.of("message", message));
@@ -231,7 +241,7 @@ public class ChatService {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
-        }, "chat-stream-err-" + bidId).start();
+        }), "chat-stream-err-" + bidId).start();
     }
 
     // ── Rust ChatAgent ──────────────────────────────────────────────
@@ -283,6 +293,7 @@ public class ChatService {
     }
 
     private RustChatRequest buildRustChatRequest(ChatRequestDTO dto, Long projectId, Long bidId, Long userId) {
+        Long tenantId = resolveChatResource(projectId, bidId).tenantId();
         RustChatRequest req = new RustChatRequest();
         req.setUserInput(dto.getContent());
         req.setMaxTurns(12); // 对齐 Rust ChatAgentConfig 默认值
@@ -307,7 +318,8 @@ public class ChatService {
         // 对话历史（最近 6 条）
         LocalDateTime startTime = LocalDateTime.now().minusDays(3);
         List<ChatMessage> history = chatMessageMapper.selectList(
-                new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<ChatMessage>()
+                new LambdaQueryWrapper<ChatMessage>()
+                        .eq(ChatMessage::getTenantId, tenantId)
                         .eq(ChatMessage::getProjectId, projectId)
                         .eq(ChatMessage::getBidId, bidId)
                         .eq(ChatMessage::getUserId, userId)
@@ -332,12 +344,14 @@ public class ChatService {
 
     @Transactional(readOnly = true)
     public List<ChatMessageVO> getHistory(Long projectId, Long bidId, Integer days) {
+        Long tenantId = resolveChatResource(projectId, bidId).tenantId();
         Long rawUserId = BaseContext.getCurrentId();
         final Long userId = rawUserId != null ? rawUserId : 0L;
         int queryDays = (days != null && days > 0) ? days : 10;
         LocalDateTime startTime = LocalDateTime.now().minusDays(queryDays);
         List<ChatMessage> messages = chatMessageMapper.selectList(
-                new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<ChatMessage>()
+                new LambdaQueryWrapper<ChatMessage>()
+                        .eq(ChatMessage::getTenantId, tenantId)
                         .eq(ChatMessage::getProjectId, projectId)
                         .eq(ChatMessage::getBidId, bidId)
                         .eq(ChatMessage::getUserId, userId)
@@ -348,6 +362,32 @@ public class ChatService {
             BeanUtils.copyProperties(msg, vo);
             return vo;
         }).collect(Collectors.toList());
+    }
+
+    private ChatResource resolveChatResource(Long projectId, Long bidId) {
+        Long tenantId = TenantScope.requiredTenantId();
+        if (projectId == null || bidId == null) {
+            throw TenantScope.resourceNotFound();
+        }
+
+        Project project = projectMapper.selectOne(new QueryWrapper<Project>()
+                .eq("id", projectId)
+                .eq("tenant_id", tenantId));
+        if (project == null) {
+            throw TenantScope.resourceNotFound();
+        }
+
+        Tender tender = tenderMapper.selectOne(new QueryWrapper<Tender>()
+                .eq("id", bidId)
+                .eq("project_id", projectId)
+                .eq("tenant_id", tenantId));
+        if (tender == null) {
+            throw TenantScope.resourceNotFound();
+        }
+        return new ChatResource(tenantId, tender);
+    }
+
+    private record ChatResource(Long tenantId, Tender tender) {
     }
 
 }

@@ -14,7 +14,7 @@ public class AsyncAuditTaskDispatcher implements AuditTaskDispatcher {
     }
 
     @Override
-    public void dispatch(String taskId) {
-        auditEngineService.start(taskId);
+    public void dispatch(AuditTaskEnvelope envelope) {
+        auditEngineService.start(envelope);
     }
 }

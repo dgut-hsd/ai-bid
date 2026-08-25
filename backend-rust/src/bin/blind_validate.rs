@@ -1,4 +1,4 @@
-﻿//! Blind-v2 ground truth validation — runs the YAML rule engine + normalize_finding
+//! Blind-v2 ground truth validation -- runs the YAML rule engine + normalize_finding
 //! directly against the 30 frozen annotations' source_quote texts.
 //!
 //! This is a lightweight proxy for the full pipeline: it tests whether the rule
@@ -33,7 +33,7 @@ struct Annotation {
 /// Map blind-v2 category codes (e.g. "C01_LOCAL_REGISTRATION") to canonical
 /// codes (e.g. "LOCAL_REGISTRATION").
 fn canonical_from_blind(code: &str) -> &str {
-    // Format: "C01_LOCAL_REGISTRATION" → strip prefix before first '_'
+    // Format: "C01_LOCAL_REGISTRATION" -- strip prefix before first '_'
     if let Some(idx) = code.find('_') {
         &code[idx + 1..]
     } else {
@@ -41,7 +41,7 @@ fn canonical_from_blind(code: &str) -> &str {
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv::dotenv().ok();
     if let Some(parent) = std::env::current_dir()
         .ok()
@@ -55,21 +55,22 @@ fn main() {
     // 1. Load rulebook
     let rulebook_path = "src/rules/data/conditions.yaml";
     let (book, warnings) = load_rulebook(Path::new(rulebook_path))
-        .expect("Failed to load conditions.yaml");
+        .map_err(|e| format!("Failed to load {rulebook_path}: {e}. Run from backend-rust/ dir."))?;
     if !warnings.is_empty() {
-        eprintln!("??  Rulebook warnings: {}", warnings.len());
+        eprintln!("!!  Rulebook warnings: {}", warnings.len());
     }
     eprintln!("Loaded {} rules", book.rules.len());
 
     // 2. Load annotations
     let ann_path = "../benchmark/blind-v2/data/annotations.jsonl";
     let raw = std::fs::read_to_string(ann_path)
-        .expect("Failed to read annotations.jsonl");
-    let annotations: Vec<Annotation> = raw
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).expect("Failed to parse annotation"))
-        .collect();
+        .map_err(|e| format!("Failed to read {ann_path}: {e}. Run from backend-rust/ dir."))?;
+    let mut annotations: Vec<Annotation> = Vec::new();
+    for (i, l) in raw.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+        let ann: Annotation = serde_json::from_str(l)
+            .map_err(|e| format!("Failed to parse annotation on line {}: {e}", i + 1))?;
+        annotations.push(ann);
+    }
     eprintln!("Loaded {} ground truth annotations", annotations.len());
 
     // 3. Evaluate each annotation
@@ -135,6 +136,8 @@ fn main() {
             verification_required: vec![],
             hypothesized_by: vec![],
             verified_by: vec![],
+            evidence_verdict: None,
+            verifier_reason: None,
             page_number: None,
             section_path: None,
             context: None,
@@ -187,10 +190,10 @@ fn main() {
         }
 
         // Per-annotation detail
-        let cat_status = if cat_matched { "?" } else { "?" };
+        let cat_status = if cat_matched { "+" } else { "-" };
         let crit_status = if ann.is_critical {
-            if critical_matched { "?C" } else { "?C" }
-        } else if critical_matched { "?FP" } else { "  " };
+            if critical_matched { "+C" } else { "-C" }
+        } else if critical_matched { "!FP" } else { "  " };
         eprintln!(
             "  {} {} {:<25} [{:<8}] crit={} hits={:?} legacy={:?}",
             ann.finding_id,
@@ -215,36 +218,36 @@ fn main() {
         critical_tp as f64 / (critical_tp + critical_fp) as f64
     } else { 1.0 };
 
-    eprintln!("\n╔══════════════════════════════════════════════════════════╗");
-    eprintln!("║  Blind-v2 Ground Truth — Rule Engine Validation         ║");
-    eprintln!("╚══════════════════════════════════════════════════════════╝");
+    eprintln!("\n============================================================");
+    eprintln!("|  Blind-v2 Ground Truth -- Rule Engine Validation         |");
+    eprintln!("============================================================");
     eprintln!("  Total annotations:     {total}");
-    eprintln!("  ─────────────────────────────────────────────────────");
+    eprintln!("  ============================================================");
     eprintln!("  Category detection:");
     eprintln!("    TP={tp}  FP={fp}  FN={fn_}");
     eprintln!("    Recall={:.1}%  Precision={:.1}%  F1={:.1}%", recall * 100.0, precision * 100.0, f1 * 100.0);
-    eprintln!("  ─────────────────────────────────────────────────────");
+    eprintln!("  ============================================================");
     eprintln!("  Critical marking:");
     eprintln!("    Critical TP={critical_tp}  Critical FN={critical_fn}  Critical FP={critical_fp}");
     eprintln!("    Critical Recall={:.1}%  Critical Precision={:.1}%",
         critical_recall * 100.0, critical_precision * 100.0);
-    eprintln!("  ─────────────────────────────────────────────────────");
+    eprintln!("  ============================================================");
     eprintln!("  Per-category breakdown:");
     per_category.sort_by(|a, b| a.0.cmp(&b.0));
     for (cat, total_c, hit, miss) in &per_category {
-        let display = display_name(cat).unwrap_or("—");
+        let display = display_name(cat).unwrap_or("?");
         eprintln!("    {:<25} {}/{} hit, {} miss  ({})",
             cat, hit, total_c, miss, display);
     }
 
     // Baseline comparison
-    eprintln!("  ─────────────────────────────────────────────────────");
+    eprintln!("  ============================================================");
     eprintln!("  Baseline (blind-v2-final-20260727):");
     eprintln!("    Recall=70.0%  Precision=56.8%  F1=62.7%");
     eprintln!("    Critical Recall=30.0%");
-    eprintln!("  ─────────────────────────────────────────────────────");
+    eprintln!("  ============================================================");
     eprintln!("  Target:");
-    eprintln!("    Critical Recall ≥ 95%");
+    eprintln!("    Critical Recall >= 95%");
 
     // JSON output for piping
     let report = serde_json::json!({
@@ -254,5 +257,7 @@ fn main() {
         "baseline": { "recall": 0.70, "precision": 0.568, "f1": 0.627, "critical_recall": 0.30 },
         "per_category": per_category,
     });
-    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    Ok(())
 }

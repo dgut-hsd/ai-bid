@@ -1,6 +1,6 @@
 import type { AuditIssue } from '../types';
 
-const categories: string[] = ['合规性', '法律法规', '采购需求'];
+const categories: string[] = ['地域歧视', '品牌指定', '程序违规', '资质排他', '评分倾斜', '需求不清'];
 const severities = ['high', 'medium', 'info'] as const;
 
 export const generateMockIssues = (): AuditIssue[] => {
@@ -11,7 +11,7 @@ export const generateMockIssues = (): AuditIssue[] => {
       return {
          issueNo: `ISSUE-${String(index + 1).padStart(4, '0')}`,
          severity,
-         category: categories[index % 3],
+         category: categories[index % categories.length],
          description: `[测试长文本] 标书第 ${pageNumber} 页发现潜在的${
             severity === 'high'
                ? '严重'

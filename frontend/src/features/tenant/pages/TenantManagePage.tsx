@@ -94,8 +94,11 @@ export const TenantManagePage: React.FC = () => {
       key: 'role',
       render: (role?: string) => {
         if (!role) return '-';
-        const color = role === 'owner' ? 'gold' : 'blue';
-        const label = role === 'owner' ? '拥有者' : role === 'admin' ? '管理员' : '成员';
+        const normalized = role.toUpperCase();
+        const color =
+          normalized === 'OWNER' ? 'gold' : normalized === 'ADMIN' ? 'blue' : 'default';
+        const label =
+          normalized === 'OWNER' ? '拥有者' : normalized === 'ADMIN' ? '管理员' : '成员';
         return <Tag color={color}>{label}</Tag>;
       },
     },
@@ -158,8 +161,11 @@ export const TenantManagePage: React.FC = () => {
       dataIndex: 'role',
       key: 'role',
       render: (role: string) => {
-        const color = role === 'owner' ? 'gold' : role === 'admin' ? 'blue' : 'default';
-        const label = role === 'owner' ? '拥有者' : role === 'admin' ? '管理员' : '成员';
+        const normalized = role.toUpperCase();
+        const color =
+          normalized === 'OWNER' ? 'gold' : normalized === 'ADMIN' ? 'blue' : 'default';
+        const label =
+          normalized === 'OWNER' ? '拥有者' : normalized === 'ADMIN' ? '管理员' : '成员';
         return <Tag color={color}>{label}</Tag>;
       },
     },

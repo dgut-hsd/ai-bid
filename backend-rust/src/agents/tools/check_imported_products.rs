@@ -148,8 +148,21 @@ impl CheckImportedProductsTool {
         // 弱信号检测（需排除上下文）
         for kw in IMPORT_WEAK_KEYWORDS {
             if text.contains(kw) {
-                let window_start = text.find(kw).unwrap_or(0).saturating_sub(20);
-                let context = &text[window_start..(window_start + kw.len() + 20).min(text.len())];
+                let pos = text.find(kw).unwrap_or(0);
+                // 20 字节上下文窗口可能落在多字节 UTF-8 字符中间，需回退到字符边界，
+                // 否则对中文文本切片会 panic（byte index is not a char boundary）。
+                let mut window_start = pos.saturating_sub(20);
+                while window_start > 0 && !text.is_char_boundary(window_start) {
+                    window_start -= 1;
+                }
+                let mut window_end = window_start
+                    .saturating_add(kw.len())
+                    .saturating_add(20)
+                    .min(text.len());
+                while window_end > window_start && !text.is_char_boundary(window_end) {
+                    window_end -= 1;
+                }
+                let context = &text[window_start..window_end];
                 let is_excluded = IMPORT_EXCLUDE_CONTEXT.iter().any(|ex| context.contains(ex));
                 if !is_excluded {
                     detected_keywords.push(kw.to_string());
@@ -350,7 +363,7 @@ mod tests {
         assert!(result.imported_detected);
         assert!(result.need_approval);
         assert!(!result.has_approval);
-        assert!(result.detected_keywords.contains(&"进口".to_string()));
+        assert!(result.detected_keywords.contains(&"进口产品".to_string()));
     }
 
     #[test]

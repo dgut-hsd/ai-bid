@@ -2,6 +2,7 @@ package com.ithsd.smart_tender.service.queue;
 
 import com.ithsd.smart_tender.service.AuditEngineService;
 import com.ithsd.smart_tender.service.engine.queue.AuditQueueProperties;
+import com.ithsd.smart_tender.service.engine.queue.AuditTaskEnvelope;
 import com.ithsd.smart_tender.service.engine.queue.RedisListAuditTaskWorker;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -15,6 +16,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
@@ -41,11 +43,14 @@ class RedisListAuditTaskWorkerTest {
         when(redisTemplate.opsForList()).thenReturn(listOperations);
         when(queueProperties.getStreamKey()).thenReturn("queue:audit:tasks");
         when(queueProperties.getBlockMs()).thenReturn(1000);
-        when(listOperations.leftPop(eq("queue:audit:tasks"), eq(1000L), eq(TimeUnit.MILLISECONDS))).thenReturn("task_123");
+        AuditTaskEnvelope envelope = new AuditTaskEnvelope(
+                1, 20001L, "task_123", 10001L, "OWNER", 1L, "request-a");
+        when(listOperations.leftPop(eq("queue:audit:tasks"), eq(1000L), eq(TimeUnit.MILLISECONDS)))
+                .thenReturn(envelope.toJson());
 
         worker.poll();
 
-        verify(auditEngineService).start("task_123");
+        verify(auditEngineService).start(envelope);
     }
 
     @Test
@@ -57,6 +62,23 @@ class RedisListAuditTaskWorkerTest {
 
         worker.poll();
 
-        verify(auditEngineService, never()).start(anyString());
+        verify(auditEngineService, never()).start(any(AuditTaskEnvelope.class));
+    }
+
+    @Test
+    void poll_LegacyPayload_RoutesToDlq() {
+        when(redisTemplate.opsForList()).thenReturn(listOperations);
+        when(queueProperties.getStreamKey()).thenReturn("queue:audit:tasks");
+        when(queueProperties.getBlockMs()).thenReturn(1000);
+        when(queueProperties.getDlqListKey()).thenReturn("queue:audit:tasks:list-dlq");
+        // 旧格式：裸 taskId 字符串（非 envelope JSON）→ fromJson 抛 IllegalArgumentException
+        when(listOperations.leftPop(eq("queue:audit:tasks"), eq(1000L), eq(TimeUnit.MILLISECONDS)))
+                .thenReturn("task_legacy_123");
+
+        worker.poll();
+
+        // 不再静默丢弃：不触发 start，且原样落入 DLQ list
+        verify(auditEngineService, never()).start(any(AuditTaskEnvelope.class));
+        verify(listOperations).rightPush(eq("queue:audit:tasks:list-dlq"), anyString());
     }
 }

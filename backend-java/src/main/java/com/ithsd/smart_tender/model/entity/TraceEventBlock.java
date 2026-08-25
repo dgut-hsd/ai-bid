@@ -18,6 +18,9 @@ public class TraceEventBlock implements Serializable {
     @TableId(value = "id", type = IdType.AUTO)
     private Long id;
 
+    @TableField("tenant_id")
+    private Long tenantId;
+
     @TableField("event_id")
     private String eventId;
 
@@ -28,6 +31,9 @@ public class TraceEventBlock implements Serializable {
 
     public Long getId() { return id; }
     public void setId(Long id) { this.id = id; }
+
+    public Long getTenantId() { return tenantId; }
+    public void setTenantId(Long tenantId) { this.tenantId = tenantId; }
 
     public String getEventId() { return eventId; }
     public void setEventId(String eventId) { this.eventId = eventId; }

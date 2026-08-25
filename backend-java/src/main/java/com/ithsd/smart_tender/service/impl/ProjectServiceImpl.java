@@ -86,9 +86,11 @@ public class ProjectServiceImpl implements ProjectService {
             if (CollectionUtils.isNotEmpty(auditIds)) {
                 auditIssueMapper.delete(
                         new LambdaQueryWrapper<AuditIssue>().in(AuditIssue::getAuditId, auditIds)
+                                .eq(AuditIssue::getTenantId, tenantId)
                 );
                 auditReportMapper.delete(
                         new LambdaQueryWrapper<AuditReport>().in(AuditReport::getAuditId, auditIds)
+                                .eq(AuditReport::getTenantId, tenantId)
                 );
                 auditTaskMapper.delete(
                         new LambdaQueryWrapper<AuditTask>().in(AuditTask::getId, auditIds)
@@ -194,7 +196,9 @@ public class ProjectServiceImpl implements ProjectService {
                 if (task != null) {
                     tVO.setAuditTask(task);
                     AuditReport report = auditReportMapper.selectOne(
-                            new LambdaQueryWrapper<AuditReport>().eq(AuditReport::getAuditId, task.getId())
+                            new LambdaQueryWrapper<AuditReport>()
+                                    .eq(AuditReport::getAuditId, task.getId())
+                                    .eq(AuditReport::getTenantId, tenantId)
                     );
                     tVO.setAuditReport(report);
                 }

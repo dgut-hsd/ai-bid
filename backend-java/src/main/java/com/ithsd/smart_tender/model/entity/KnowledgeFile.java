@@ -92,6 +92,12 @@ public class KnowledgeFile implements Serializable {
     private Integer chunkCount;
 
     /**
+     * Rust/Qdrant 对应的 document_id（向量化入库成功后回填，用于删除文件时联动清理向量）
+     */
+    @TableField("rust_document_id")
+    private String rustDocumentId;
+
+    /**
      * 上传用户ID
      */
     @TableField(value = "upload_user_id",fill = FieldFill.INSERT)

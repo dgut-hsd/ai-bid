@@ -6,7 +6,16 @@ use anyhow::{Context, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 加载 .env：依次尝试当前目录 → 上级目录（开发时 .env 在项目根）
     dotenv::dotenv().ok();
+    if let Some(parent) = std::env::current_dir()
+        .ok()
+        .and_then(|d| d.parent().map(|p| p.join(".env")))
+    {
+        if parent.exists() {
+            dotenv::from_path(&parent).ok();
+        }
+    }
     println!("=== 千问 LLM 连接测试 ===\n");
 
     let api_key =

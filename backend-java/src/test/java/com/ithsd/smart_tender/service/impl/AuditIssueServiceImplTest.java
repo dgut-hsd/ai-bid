@@ -1,6 +1,8 @@
 package com.ithsd.smart_tender.service.impl;
 
 import com.ithsd.smart_tender.common.BaseContext;
+import com.ithsd.smart_tender.common.TenantContext;
+import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.service.AuditTaskService;
 import com.ithsd.smart_tender.service.TenderService;
@@ -52,6 +54,7 @@ class AuditIssueServiceImplTest {
     @BeforeEach
     void setUp() {
         BaseContext.setCurrentId(CURRENT_USER_ID);
+        TenantContext.set(new TenantRequestContext(CURRENT_USER_ID, 20001L, "OWNER", 1L, "audit-issue-test"));
         // baseMapper 是 ServiceImpl<AuditIssueMapper, AuditIssue> 父类的 protected 字段，
         // 无法通过构造函数注入，需要通过反射设置
         ReflectionTestUtils.setField(auditIssueService, "baseMapper", auditIssueMapper);
@@ -60,6 +63,7 @@ class AuditIssueServiceImplTest {
     @AfterEach
     void tearDown() {
         BaseContext.removeCurrentId();
+        TenantContext.clear();
     }
 
     @Test

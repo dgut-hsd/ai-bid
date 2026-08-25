@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS `audit_issue` (
   `audit_id` bigint(20) NOT NULL COMMENT '审核任务ID',
   `issue_no` varchar(20) DEFAULT NULL COMMENT '问题编号',
   `severity` varchar(20) DEFAULT NULL COMMENT '严重程度（critical严重/warning一般/info提示）',
-  `category` varchar(50) DEFAULT NULL COMMENT '问题类型（budget预算合规性/demand需求合规性/legal政策合法性）',
+  `category` varchar(50) DEFAULT NULL COMMENT '风险类型（Rust引擎risk_type，如：地域歧视/品牌指定/程序违规）',
   `description` text COMMENT '问题描述',
   `suggestion` text COMMENT '修改建议',
   `page_number` int(11) DEFAULT NULL COMMENT '页码',

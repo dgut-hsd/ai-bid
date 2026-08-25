@@ -30,6 +30,6 @@ public class WebMvcConfiguration implements WebMvcConfigurer {
     public void addInterceptors(InterceptorRegistry registry) {
         registry.addInterceptor(jwtTokenAdminInterceptor)
                 .addPathPatterns("/api/**")
-                .excludePathPatterns("/api/auth/login", "/api/auth/register", "/api/audit-tasks/callback");
+                .excludePathPatterns("/api/auth/login", "/api/audit-tasks/callback");
     }
 }

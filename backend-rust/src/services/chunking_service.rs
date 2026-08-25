@@ -742,6 +742,38 @@ fn same_parent(a: &[String], b: &[String]) -> bool {
     }
 }
 
+/// 判断文本是否以法规/合同条文序号「第X条」开头。
+///
+/// 匹配形如「第二条…」「第十条…」「第三十二条…」「第一百二十三条…」。
+fn matches_article_prefix(text: &str) -> bool {
+    const NUM: [char; 12] = [
+        '一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '百', '千',
+    ];
+    let chars: Vec<char> = text.trim_start().chars().take(16).collect();
+    if chars.len() < 3 || chars[0] != '第' {
+        return false;
+    }
+    let mut i = 1;
+    while i < chars.len() && NUM.contains(&chars[i]) {
+        i += 1;
+    }
+    // 至少一个数字字符，且紧接着是「条」
+    i >= 2 && i < chars.len() && chars[i] == '条'
+}
+
+/// 判断 chunk 是否代表一条独立的法规/合同条文（「第X条 …」）。
+///
+/// 条文是语义检索的最小可定位单元。若在碎片合并阶段把它并入相邻 chunk，
+/// section_path 会丢失条文序号（如「第二条」），导致精确的条款查询
+/// （“第二条是什么”）无法命中。因此即使条文文本很短，也应保持独立 chunk。
+fn is_article_chunk(chunk: &Chunk) -> bool {
+    chunk
+        .section_path
+        .last()
+        .map(|t| matches_article_prefix(t))
+        .unwrap_or(false)
+}
+
 /// 合并过短的碎片 chunk 到相邻 chunk。
 ///
 /// 两阶段处理：
@@ -770,6 +802,7 @@ fn merge_tiny_chunks(chunks: Vec<Chunk>, config: &ChunkingConfig) -> Vec<Chunk> 
 
     for chunk in chunks {
         if chunk.text.chars().count() < min
+            && !is_article_chunk(&chunk)
             && let Some(prev) = result.last_mut()
             && same_parent(&prev.section_path, &chunk.section_path)
         {
@@ -811,6 +844,10 @@ fn merge_tiny_chunks(chunks: Vec<Chunk>, config: &ChunkingConfig) -> Vec<Chunk> 
 
     for i in 0..result.len() {
         if result[i].text.chars().count() >= min {
+            continue;
+        }
+        // 条文 chunk 保持独立，不并入相邻 chunk（避免丢失「第X条」定位）
+        if is_article_chunk(&result[i]) {
             continue;
         }
         if i + 1 < result.len() && same_parent(&result[i].section_path, &result[i + 1].section_path)
@@ -961,14 +998,19 @@ fn extract_table_keys(text: &str) -> Vec<String> {
 ///
 /// 调用时机：`chunk_sections()` 之后、序列化到 JSON 或存入 `DocumentState` 之前。
 pub fn populate_bbox_refs(chunks: &mut [Chunk], raw_doc: &RawDocument) {
-    let mut block_map: HashMap<String, (usize, crate::domain::raw_document::BBox, f64)> =
+    let mut block_map: HashMap<String, (usize, crate::domain::raw_document::BBox, f64, usize)> =
         HashMap::new();
 
     for page in &raw_doc.pages {
         for block in &page.blocks {
             block_map.insert(
                 block.id.clone(),
-                (page.page_index, block.bbox.clone(), page.width),
+                (
+                    page.page_index,
+                    block.bbox.clone(),
+                    page.width,
+                    block.text.chars().count(),
+                ),
             );
         }
     }
@@ -976,12 +1018,13 @@ pub fn populate_bbox_refs(chunks: &mut [Chunk], raw_doc: &RawDocument) {
     for chunk in chunks.iter_mut() {
         let mut refs: Vec<BlockBBox> = Vec::with_capacity(chunk.source_block_ids.len());
         for block_id in &chunk.source_block_ids {
-            if let Some((page, bbox, page_width)) = block_map.get(block_id) {
+            if let Some((page, bbox, page_width, char_count)) = block_map.get(block_id) {
                 refs.push(BlockBBox {
                     block_id: block_id.clone(),
                     page: *page,
                     bbox: bbox.clone(),
                     page_width: *page_width,
+                    char_count: *char_count,
                 });
             }
         }

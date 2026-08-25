@@ -3,7 +3,7 @@ import authReducer, { setCredentials, logout, restoreAuth } from './authSlice';
 import type { AuthState, UserInfo } from './authSlice';
 
 describe('authSlice', () => {
-  const mockUser: UserInfo = { id: 1, username: 'testuser', realName: '测试用户' };
+  const mockUser: UserInfo = { id: '1', username: 'testuser', realName: '测试用户' };
   const mockToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.mock-token';
 
   beforeEach(() => {
@@ -15,7 +15,7 @@ describe('authSlice', () => {
 
   describe('initialState', () => {
     it('should have null token, null userInfo, and isAuthenticated false', () => {
-      const state = authReducer(undefined, { type: 'init' } as any);
+      const state = authReducer(undefined, { type: 'init' });
       expect(state.token).toBeNull();
       expect(state.userInfo).toBeNull();
       expect(state.isAuthenticated).toBe(false);
@@ -92,6 +92,8 @@ describe('authSlice', () => {
         token: mockToken,
         userInfo: mockUser,
         isAuthenticated: true,
+        currentTenantId: null,
+        tenantList: [],
       };
       const state = authReducer(prevState, logout());
       expect(state.token).toBeNull();
@@ -107,7 +109,13 @@ describe('authSlice', () => {
       sessionStorage.setItem('userInfo', JSON.stringify(mockUser));
 
       authReducer(
-        { token: mockToken, userInfo: mockUser, isAuthenticated: true },
+        {
+          token: mockToken,
+          userInfo: mockUser,
+          isAuthenticated: true,
+          currentTenantId: null,
+          tenantList: [],
+        },
         logout(),
       );
 
@@ -126,7 +134,13 @@ describe('authSlice', () => {
       localStorage.setItem('userInfo', JSON.stringify(mockUser));
 
       const state = authReducer(
-        { token: null, userInfo: null, isAuthenticated: false },
+        {
+          token: null,
+          userInfo: null,
+          isAuthenticated: false,
+          currentTenantId: null,
+          tenantList: [],
+        },
         restoreAuth(),
       );
       expect(state.token).toBe(mockToken);
@@ -139,7 +153,13 @@ describe('authSlice', () => {
       sessionStorage.setItem('userInfo', JSON.stringify(mockUser));
 
       const state = authReducer(
-        { token: null, userInfo: null, isAuthenticated: false },
+        {
+          token: null,
+          userInfo: null,
+          isAuthenticated: false,
+          currentTenantId: null,
+          tenantList: [],
+        },
         restoreAuth(),
       );
       expect(state.token).toBe(mockToken);
@@ -152,6 +172,8 @@ describe('authSlice', () => {
         token: null,
         userInfo: null,
         isAuthenticated: false,
+        currentTenantId: null,
+        tenantList: [],
       };
       const state = authReducer(currentState, restoreAuth());
       expect(state).toEqual(currentState);
@@ -166,6 +188,8 @@ describe('authSlice', () => {
         token: null,
         userInfo: null,
         isAuthenticated: false,
+        currentTenantId: null,
+        tenantList: [],
       };
       const state = authReducer(currentState, restoreAuth());
 

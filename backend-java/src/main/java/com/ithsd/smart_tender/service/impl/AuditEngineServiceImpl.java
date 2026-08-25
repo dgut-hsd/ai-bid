@@ -2,6 +2,9 @@ package com.ithsd.smart_tender.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.ithsd.smart_tender.common.BaseContext;
+import com.ithsd.smart_tender.common.TenantContext;
+import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.config.RustApiProperties;
 import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
@@ -19,6 +22,7 @@ import com.ithsd.smart_tender.service.TraceService;
 import com.ithsd.smart_tender.service.engine.rust.RustApiClient;
 import com.ithsd.smart_tender.service.engine.rust.RustDocumentService;
 import com.ithsd.smart_tender.service.engine.rust.RustSseClient;
+import com.ithsd.smart_tender.service.engine.queue.AuditTaskEnvelope;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewAcceptedResponse;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewRequest;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewResponse;
@@ -38,6 +42,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
@@ -88,16 +93,33 @@ public class AuditEngineServiceImpl implements AuditEngineService {
 
     @Override
     @Async("auditTaskExecutor")
-    public void start(String taskId) {
-        log.info("audit async task started: taskId={}, thread={}", taskId, Thread.currentThread().getName());
-        if (!RUNNING_TASKS.add(taskId)) {
-            log.warn("audit task skipped due to concurrent start, taskId={}", taskId);
-            return;
-        }
+    public void start(AuditTaskEnvelope envelope) {
+        Objects.requireNonNull(envelope, "envelope");
+        TenantRequestContext previous = TenantContext.get();
+        Long previousUserId = BaseContext.getCurrentId();
+        TenantContext.set(envelope.toContext());
+        String taskId = envelope.taskId();
+        String runningKey = envelope.tenantId() + ":" + taskId;
         try {
-            runEngine(taskId);
+            log.info("audit async task started: taskId={}, tenantId={}, thread={}"
+                    , taskId, envelope.tenantId(), Thread.currentThread().getName());
+            if (!RUNNING_TASKS.add(runningKey)) {
+                log.warn("audit task skipped due to concurrent start, taskId={}, tenantId={}"
+                        , taskId, envelope.tenantId());
+                return;
+            }
+            try {
+                runEngine(taskId);
+            } finally {
+                RUNNING_TASKS.remove(runningKey);
+            }
         } finally {
-            RUNNING_TASKS.remove(taskId);
+            TenantContext.clear();
+            if (previous != null) {
+                TenantContext.set(previous);
+            } else if (previousUserId != null) {
+                BaseContext.setCurrentId(previousUserId);
+            }
         }
     }
 
@@ -124,9 +146,10 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             log.warn("recover: Rust result unavailable, taskId={}, {}", taskId, e.getMessage());
             return false;
         }
-        if (result != null && result.isCompleted() && result.getResult() != null) {
-            log.info("recover: completed Rust result found, taskId={}, docId={}",
-                    taskId, rustDocId);
+        if (result != null && result.getResult() != null
+                && (result.isCompleted() || result.isPartialFailed())) {
+            log.info("recover: {} Rust result found, taskId={}, docId={}",
+                    result.isPartialFailed() ? "partial_failed" : "completed", taskId, rustDocId);
             completeTaskFromReview(task, result.getResult());
             return true;
         }
@@ -140,7 +163,9 @@ public class AuditEngineServiceImpl implements AuditEngineService {
 
     private AuditTask loadTask(String taskId) {
         return auditTaskMapper.selectOne(
-                new LambdaQueryWrapper<AuditTask>().eq(AuditTask::getTaskId, taskId));
+                new LambdaQueryWrapper<AuditTask>()
+                        .eq(AuditTask::getTaskId, taskId)
+                        .eq(AuditTask::getTenantId, TenantScope.requiredTenantId()));
     }
 
     private void runEngine(String taskId) {
@@ -211,14 +236,14 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                             String phase = data.has("phase") ? data.get("phase").asText() : "";
                             int progress = "execute".equals(phase) ? 35 : "merge".equals(phase) ? 45 : "legal_verify".equals(phase) ? 55 : 60;
                             // 使用无乐观锁的单调推进 SQL。不要在多个异步回调中共享并修改 task.version。
-                            CompletableFuture.runAsync(() -> {
+                            CompletableFuture.runAsync(TenantContext.wrap(() -> {
                                 try {
                                     auditTaskMapper.advanceReviewProgress(
                                             taskId, task.getTenantId(), progress, LocalDateTime.now());
                                 } catch (Exception e) {
                                     log.warn("advanceReviewProgress async failed: {}", e.getMessage());
                                 }
-                            });
+                            }));
                         }
                         case "stats" -> {
                             emitSafe(taskId, SseEventTypeEnum.STATS, data);
@@ -247,6 +272,16 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                         case "done" -> {
                             log.info("Rust SSE done received: docId={}", rustDocId);
                             // 标记所有 running session 为 completed
+                            try {
+                                traceService.markSessionsCompleted(taskId);
+                            } catch (Exception e) {
+                                log.warn("Trace markSessionsCompleted failed: taskId={}", taskId, e);
+                            }
+                            reviewDoneSignal.complete(null);
+                        }
+                        case "partial_done" -> {
+                            log.warn("Rust SSE partial_done received: docId={} (部分 clause 失败，结果仍可落库)", rustDocId);
+                            // 部分完成同样视为审核结束，最终结果通过 GET /result 获取（status=partial_failed）
                             try {
                                 traceService.markSessionsCompleted(taskId);
                             } catch (Exception e) {
@@ -352,7 +387,8 @@ public class AuditEngineServiceImpl implements AuditEngineService {
         List<RustRiskFinding> activeFindings = new ArrayList<>();
         // 先删除旧数据，确保恢复操作可安全重试。
         auditIssueMapper.delete(new LambdaQueryWrapper<AuditIssue>()
-                .eq(AuditIssue::getAuditId, task.getId()));
+                .eq(AuditIssue::getAuditId, task.getId())
+                .eq(AuditIssue::getTenantId, task.getTenantId()));
 
         if (reviewResp.getFindings() != null) {
             int seq = 0;
@@ -362,6 +398,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                 try {
                     AuditIssue issue = AuditIssue.builder()
                             .auditId(task.getId())
+                            .tenantId(task.getTenantId())
                             .issueNo("ISSUE-" + (finding.getRiskId() != null
                                     ? finding.getRiskId() : String.valueOf(++seq)))
                             .severity(finding.mappedSeverity())
@@ -554,6 +591,12 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             try {
                 RustReviewResultResponse result = rustApiClient.getReviewResult(rustDocId);
                 if (result != null && result.isCompleted()) {
+                    return result.getResult();
+                }
+                if (result != null && result.isPartialFailed() && result.getResult() != null) {
+                    log.warn("Rust review partial_failed (部分 clause 失败，落库已有 findings): docId={}, findings={}",
+                            rustDocId,
+                            result.getResult().getFindings() != null ? result.getResult().getFindings().size() : 0);
                     return result.getResult();
                 }
                 if (result != null && result.isFailed()) {

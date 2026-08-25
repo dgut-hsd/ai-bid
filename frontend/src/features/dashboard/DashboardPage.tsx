@@ -1,7 +1,9 @@
 import React, { useState, useMemo } from 'react';
+import { useSelector } from 'react-redux';
+import { useNavigate } from 'react-router-dom';
 
 import { IssueTypePieChart } from './components/IssueTypePieChart';
-import { WeeklyAuditBarChart } from './components/WeeklyAuditBarChart';
+import { MonthlyIssueBarChart } from './components/MonthlyIssueBarChart';
 import { DashboardTable } from './components/DashboardTable';
 
 import { DashboardStatCard } from '@/components/StatCard/DashboardStatCard';
@@ -19,6 +21,7 @@ import {
    ProjectOutlined,
 } from '@ant-design/icons';
 import { useUrlState } from '@/hooks/useUrlState';
+import type { RootState } from '@/store';
 
 const STATUS_CONFIG = {
    pending: { label: '待审核', icon: <AuditOutlined />, color: 'green' },
@@ -32,6 +35,10 @@ interface NewProjectFormValues {
 export const DashboardPage: React.FC = () => {
    const { styles } = useStyles();
    const queryClient = useQueryClient();
+   const navigate = useNavigate();
+   const currentTenantId = useSelector(
+      (state: RootState) => state.auth.currentTenantId
+   );
 
    const [queryParams, setQueryParams] = useUrlState<{
       page: number;
@@ -52,19 +59,19 @@ export const DashboardPage: React.FC = () => {
       isLoading: isListLoading,
       isError: isListError,
       error: listError,
-   } = useQuery(dashboardOptions.list());
+   } = useQuery(dashboardOptions.list(currentTenantId));
 
    const {
       data: issueDistribution,
       isLoading: isIssueDistributionLoading,
       isError: isIssueDistributionError,
-   } = useQuery(dashboardOptions.issueDistribution());
+   } = useQuery(dashboardOptions.issueDistribution(currentTenantId));
    
    const {
-      data: auditCount,
-      isLoading: isAuditCountLoading,
-      isError: isAuditCountError,
-   } = useQuery(dashboardOptions.auditCount());
+      data: dailyIssues,
+      isLoading: isDailyIssuesLoading,
+      isError: isDailyIssuesError,
+   } = useQuery(dashboardOptions.dailyIssues(currentTenantId));
 
    const stats: Record<string, number> = useMemo(() => {
       const pending =
@@ -98,7 +105,7 @@ export const DashboardPage: React.FC = () => {
       ...dashboardMutations.create(),
       onSuccess: () => {
          message.success('项目创建成功');
-         queryClient.invalidateQueries(dashboardOptions.list());
+         queryClient.invalidateQueries(dashboardOptions.list(currentTenantId));
          handleCloseNewProjectModal();
       },
       onError: (error: Error) => {
@@ -110,7 +117,13 @@ export const DashboardPage: React.FC = () => {
       setQueryParams({ page });
    };
 
-   const handleOpenNewProjectModal = () => setIsNewProjectModalOpen(true);
+   const handleOpenNewProjectModal = () => {
+      if (!currentTenantId) {
+         message.info('请先选择或创建租户');
+         return;
+      }
+      setIsNewProjectModalOpen(true);
+   };
 
    const handleCloseNewProjectModal = () => {
       setIsNewProjectModalOpen(false);
@@ -118,11 +131,34 @@ export const DashboardPage: React.FC = () => {
    };
 
    const handleNewProjectSubmit = (values: NewProjectFormValues) => {
+      if (!currentTenantId) {
+         message.info('请先选择或创建租户');
+         return;
+      }
       submitCreateProject({
          id: 0,
          projectName: values.projectName,
       });
    };
+
+   if (!currentTenantId) {
+      return (
+         <div className={styles.pageContainer}>
+            <div className={styles.mainContent}>
+               <Result
+                  status='info'
+                  title='请先选择或创建租户'
+                  subTitle='选择租户后才能查看项目和审核统计。'
+                  extra={
+                     <Button type='primary' onClick={() => navigate('/tenant-manage')}>
+                        创建或选择租户
+                     </Button>
+                  }
+               />
+            </div>
+         </div>
+      );
+   }
 
    return (
       <div className={styles.pageContainer}>
@@ -159,7 +195,11 @@ export const DashboardPage: React.FC = () => {
                </div>
 
                <div className={styles.headerActions}>
-                  <Button type='primary' onClick={handleOpenNewProjectModal}>
+                  <Button
+                     type='primary'
+                     onClick={handleOpenNewProjectModal}
+                     disabled={!currentTenantId}
+                  >
                      新建项目
                   </Button>
                </div>
@@ -195,12 +235,12 @@ export const DashboardPage: React.FC = () => {
                   <IssueTypePieChart data={issueDistribution} />
                )}
 
-               {isAuditCountLoading ? (
+               {isDailyIssuesLoading ? (
                   <Spin />
-               ) : isAuditCountError ? (
-                  <Result status='warning' title='审核统计加载失败' />
+               ) : isDailyIssuesError ? (
+                  <Result status='warning' title='问题统计加载失败' />
                ) : (
-                  <WeeklyAuditBarChart data={auditCount} />
+                  <MonthlyIssueBarChart data={dailyIssues} />
                )}
             </div>
          </div>

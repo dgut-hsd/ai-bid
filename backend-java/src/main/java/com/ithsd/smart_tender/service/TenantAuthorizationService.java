@@ -23,14 +23,7 @@ public class TenantAuthorizationService {
                     "tenant.members.remove", "tenant.members.role.write", "tenant.owner.transfer",
                     "tender.write", "audit.start", "audit.report.read", "knowledge.write", "tenant.delete"
             ),
-            "ADMIN", List.of(
-                    "tenant.read", "tenant.settings.write", "tenant.members.invite",
-                    "tenant.members.remove", "tenant.members.role.write", "tender.write",
-                    "audit.start", "audit.report.read", "knowledge.write"
-            ),
-            "AUDITOR", List.of("tenant.read", "tender.write", "audit.start", "audit.report.read", "knowledge.write"),
-            "MEMBER", List.of("tenant.read", "tender.write", "audit.start", "audit.report.read", "knowledge.write"),
-            "VIEWER", List.of("tenant.read", "audit.report.read")
+            "MEMBER", List.of("tenant.read", "tender.write", "audit.start", "audit.report.read", "knowledge.write")
     );
 
     public TenantRequestContext requireAuthenticated() {

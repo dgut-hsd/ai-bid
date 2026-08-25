@@ -1,3 +1,9 @@
+-- ═══════════════════════════════════════════════════════════════
+-- ⚠️ DEPRECATED — 本文件已由 Flyway 接管（db/migration/V1__baseline.sql）。
+-- 禁止再挂到 spring.sql.init.schema-locations：本文件以 DROP TABLE 开头，
+-- 配合 sql.init.mode=always 会导致每次应用重启清空 audit_task_event、
+-- document_parse_job、rag_trigger_outbox 表的数据。
+-- ═══════════════════════════════════════════════════════════════
 DROP TABLE IF EXISTS audit_task_event;
 
 CREATE TABLE audit_task_event (

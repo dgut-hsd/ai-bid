@@ -1,6 +1,6 @@
 package com.ithsd.smart_tender.service.impl;
 
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.mapper.AuditReportMapper;
@@ -43,13 +43,15 @@ public class AuditHistoryServiceImpl implements AuditHistoryService {
 
     @Override
     public PageResult page(AuditHistoryPageQueryDTO dto) {
+        Long tenantId = TenantScope.requiredTenantId();
         Page<AuditTask> pageInfo = new Page<>(dto.getPage(), dto.getSize());
-        LambdaQueryWrapper<AuditTask> wrapper = new LambdaQueryWrapper<>();
+        QueryWrapper<AuditTask> wrapper = new QueryWrapper<>();
         
-        wrapper.eq(dto.getAuditUserId() != null, AuditTask::getAuditUserId, dto.getAuditUserId())
-               .ge(dto.getStartDate() != null, AuditTask::getCreateTime, dto.getStartDate().atStartOfDay())
-               .le(dto.getEndDate() != null, AuditTask::getCreateTime, dto.getEndDate().atTime(LocalTime.MAX))
-               .orderByDesc(AuditTask::getCreateTime);
+        wrapper.eq("tenant_id", tenantId)
+               .eq(dto.getAuditUserId() != null, "audit_user_id", dto.getAuditUserId())
+               .ge(dto.getStartDate() != null, "create_time", dto.getStartDate().atStartOfDay())
+               .le(dto.getEndDate() != null, "create_time", dto.getEndDate().atTime(LocalTime.MAX))
+               .orderByDesc("create_time");
         
         Page<AuditTask> p = auditTaskMapper.selectPage(pageInfo, wrapper);
         
@@ -57,7 +59,9 @@ public class AuditHistoryServiceImpl implements AuditHistoryService {
             AuditHistoryVO vo = new AuditHistoryVO();
             BeanUtils.copyProperties(task, vo);
             
-            Tender tender = tenderMapper.selectById(task.getBidId());
+            Tender tender = tenderMapper.selectOne(new QueryWrapper<Tender>()
+                    .eq("id", task.getBidId())
+                    .eq("tenant_id", tenantId));
             if (tender != null) {
                 vo.setProjectName(tender.getBidName());
                 vo.setFileCategory(tender.getFileCategory());
@@ -93,15 +97,23 @@ public class AuditHistoryServiceImpl implements AuditHistoryService {
 
     @Override
     public AuditHistoryDetailVO getDetailById(Long id) {
-        AuditTask task = auditTaskMapper.selectById(id);
+        Long tenantId = TenantScope.requiredTenantId();
+        AuditTask task = auditTaskMapper.selectOne(new QueryWrapper<AuditTask>()
+                .eq("id", id)
+                .eq("tenant_id", tenantId));
         if (task == null) {
-            return null;
+            throw TenantScope.resourceNotFound();
         }
         
         AuditHistoryDetailVO vo = new AuditHistoryDetailVO();
         BeanUtils.copyProperties(task, vo);
         
-        Tender tender = tenderMapper.selectById(task.getBidId());
+        Tender tender = tenderMapper.selectOne(new QueryWrapper<Tender>()
+                .eq("id", task.getBidId())
+                .eq("tenant_id", tenantId));
+        if (tender == null) {
+            throw TenantScope.resourceNotFound();
+        }
         if (tender != null) {
             vo.setFileName(tender.getFileName());
             vo.setFileType(tender.getFileType());
@@ -119,10 +131,11 @@ public class AuditHistoryServiceImpl implements AuditHistoryService {
             }
         }
         
-        LambdaQueryWrapper<AuditIssue> issueWrapper = new LambdaQueryWrapper<>();
-        issueWrapper.eq(AuditIssue::getAuditId, id)
-                    .orderByAsc(AuditIssue::getSeverity)
-                    .orderByAsc(AuditIssue::getCategory);
+        QueryWrapper<AuditIssue> issueWrapper = new QueryWrapper<>();
+        issueWrapper.eq("audit_id", id)
+                    .eq("tenant_id", tenantId)
+                    .orderByAsc("severity")
+                    .orderByAsc("category");
         List<AuditIssue> issues = auditIssueMapper.selectList(issueWrapper);
         
         List<AuditIssueVO> issueVOs = issues.stream().map(issue -> {
@@ -132,8 +145,9 @@ public class AuditHistoryServiceImpl implements AuditHistoryService {
         }).collect(Collectors.toList());
         vo.setIssues(issueVOs);
         
-        LambdaQueryWrapper<AuditReport> reportWrapper = new LambdaQueryWrapper<>();
-        reportWrapper.eq(AuditReport::getAuditId, id);
+        QueryWrapper<AuditReport> reportWrapper = new QueryWrapper<>();
+        reportWrapper.eq("audit_id", id)
+                .eq("tenant_id", tenantId);
         AuditReport report = auditReportMapper.selectOne(reportWrapper);
         if (report != null) {
             vo.setDocContent(report.getDocContent());
@@ -145,35 +159,47 @@ public class AuditHistoryServiceImpl implements AuditHistoryService {
 
     @Override
     public void delete(Long id) {
-        AuditTask task = auditTaskMapper.selectById(id);
-        if (task != null) {
-            LambdaQueryWrapper<AuditIssue> issueWrapper = new LambdaQueryWrapper<>();
-            issueWrapper.eq(AuditIssue::getAuditId, id);
+        Long tenantId = TenantScope.requiredTenantId();
+        AuditTask task = auditTaskMapper.selectOne(new QueryWrapper<AuditTask>()
+                .eq("id", id)
+                .eq("tenant_id", tenantId));
+        if (task == null) {
+            throw TenantScope.resourceNotFound();
+        }
+        {
+            QueryWrapper<AuditIssue> issueWrapper = new QueryWrapper<>();
+            issueWrapper.eq("audit_id", id)
+                    .eq("tenant_id", tenantId);
             auditIssueMapper.delete(issueWrapper);
             
-            LambdaQueryWrapper<AuditReport> reportWrapper = new LambdaQueryWrapper<>();
-            reportWrapper.eq(AuditReport::getAuditId, id);
+            QueryWrapper<AuditReport> reportWrapper = new QueryWrapper<>();
+            reportWrapper.eq("audit_id", id)
+                    .eq("tenant_id", tenantId);
             auditReportMapper.delete(reportWrapper);
             
-            auditTaskMapper.deleteById(id);
+            auditTaskMapper.delete(new QueryWrapper<AuditTask>()
+                    .eq("id", id)
+                    .eq("tenant_id", tenantId));
         }
     }
 
     @Override
     public Map<String, Object> getStatistics(AuditHistoryPageQueryDTO dto) {
+        Long tenantId = TenantScope.requiredTenantId();
         Map<String, Object> result = new HashMap<>();
         
-        LambdaQueryWrapper<AuditTask> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(AuditTask::getTaskStatus, 2);
+        QueryWrapper<AuditTask> wrapper = new QueryWrapper<>();
+        wrapper.eq("tenant_id", tenantId)
+                .eq("task_status", 2);
         
         if (dto.getAuditUserId() != null) {
-            wrapper.eq(AuditTask::getAuditUserId, dto.getAuditUserId());
+            wrapper.eq("audit_user_id", dto.getAuditUserId());
         }
         if (dto.getStartDate() != null) {
-            wrapper.ge(AuditTask::getCreateTime, dto.getStartDate().atStartOfDay());
+            wrapper.ge("create_time", dto.getStartDate().atStartOfDay());
         }
         if (dto.getEndDate() != null) {
-            wrapper.le(AuditTask::getCreateTime, dto.getEndDate().atTime(LocalTime.MAX));
+            wrapper.le("create_time", dto.getEndDate().atTime(LocalTime.MAX));
         }
         
         List<AuditTask> tasks = auditTaskMapper.selectList(wrapper);
@@ -185,7 +211,9 @@ public class AuditHistoryServiceImpl implements AuditHistoryService {
         
         Map<Long, Tender> tenderMap = new HashMap<>();
         if (!bidIds.isEmpty()) {
-            List<Tender> tenders = tenderMapper.selectBatchIds(bidIds);
+            List<Tender> tenders = tenderMapper.selectList(new QueryWrapper<Tender>()
+                    .in("id", bidIds)
+                    .eq("tenant_id", tenantId));
             tenderMap = tenders.stream()
                     .collect(Collectors.toMap(Tender::getId, t -> t));
         }

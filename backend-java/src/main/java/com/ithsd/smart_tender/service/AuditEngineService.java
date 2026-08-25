@@ -1,7 +1,9 @@
 package com.ithsd.smart_tender.service;
 
+import com.ithsd.smart_tender.service.engine.queue.AuditTaskEnvelope;
+
 public interface AuditEngineService {
-    void start(String taskId);
+    void start(AuditTaskEnvelope envelope);
 
     /**
      * 从 Rust 已完成的结果恢复 Java 侧孤儿任务，不重新执行模型审核。
