@@ -13,7 +13,7 @@ import {
   Typography,
   Popconfirm,
 } from 'antd';
-import { PlusOutlined, KeyOutlined, UserDeleteOutlined } from '@ant-design/icons';
+import { PlusOutlined, KeyOutlined, UserDeleteOutlined, EditOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { adminApi } from '../api/admin';
@@ -32,8 +32,10 @@ export const AdminUsersPage: React.FC = () => {
 
   const [createModalOpen, setCreateModalOpen] = React.useState(false);
   const [resetTarget, setResetTarget] = React.useState<AdminUser | null>(null);
+  const [editTarget, setEditTarget] = React.useState<AdminUser | null>(null);
   const [createForm] = Form.useForm<CreateUserParams>();
   const [resetForm] = Form.useForm<{ password: string }>();
+  const [editForm] = Form.useForm<{ username: string; real_name: string }>();
 
   const usersQuery = useQuery({
     queryKey: ['admin-users'],
@@ -95,6 +97,31 @@ export const AdminUsersPage: React.FC = () => {
     },
   });
 
+  const updateMutation = useMutation({
+    mutationFn: ({
+      userId,
+      username,
+      real_name,
+    }: {
+      userId: string;
+      username: string;
+      real_name: string;
+    }) => adminApi.updateUser(userId, { username, real_name }),
+    onSuccess: (resp) => {
+      if (resp.code === 200) {
+        message.success('姓名已更新');
+        setEditTarget(null);
+        editForm.resetFields();
+        invalidate();
+      } else {
+        message.error(resp.msg || '更新失败');
+      }
+    },
+    onError: (error: any) => {
+      message.error(error?.response?.data?.msg || '更新失败');
+    },
+  });
+
   const columns: ColumnsType<AdminUser> = [
     { title: '账号', dataIndex: 'username', key: 'username' },
     {
@@ -131,6 +158,20 @@ export const AdminUsersPage: React.FC = () => {
       width: 180,
       render: (_: unknown, record: AdminUser) => (
         <Space>
+          <Button
+            size='small'
+            type='link'
+            icon={<EditOutlined />}
+            onClick={() => {
+              setEditTarget(record);
+              editForm.setFieldsValue({
+                username: record.username,
+                real_name: record.real_name ?? '',
+              });
+            }}
+          >
+            编辑
+          </Button>
           <Button
             size='small'
             type='link'
@@ -240,6 +281,48 @@ export const AdminUsersPage: React.FC = () => {
                 { value: 'MEMBER', label: '成员（普通业务用户）' },
               ]}
             />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* ── 编辑用户（姓名）弹窗 ─────────────────────────────────── */}
+      <Modal
+        title={`编辑用户 — ${editTarget?.username || ''}`}
+        open={!!editTarget}
+        onCancel={() => setEditTarget(null)}
+        onOk={() => editForm.submit()}
+        confirmLoading={updateMutation.isPending}
+        okText='保存'
+        cancelText='取消'
+      >
+        <Form
+          form={editForm}
+          layout='vertical'
+          onFinish={(values) =>
+            editTarget &&
+            updateMutation.mutate({
+              userId: editTarget.user_id,
+              username: values.username,
+              real_name: values.real_name,
+            })
+          }
+        >
+          <Form.Item
+            name='username'
+            label='账号'
+            rules={[
+              { required: true, message: '请输入账号' },
+              { min: 3, max: 50, message: '账号长度 3~50 个字符' },
+            ]}
+          >
+            <Input placeholder='登录账号' autoComplete='off' />
+          </Form.Item>
+          <Form.Item
+            name='real_name'
+            label='姓名'
+            rules={[{ required: true, message: '请输入姓名' }]}
+          >
+            <Input placeholder='真实姓名' />
           </Form.Item>
         </Form>
       </Modal>

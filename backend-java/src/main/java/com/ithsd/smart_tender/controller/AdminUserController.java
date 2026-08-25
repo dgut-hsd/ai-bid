@@ -2,6 +2,7 @@ package com.ithsd.smart_tender.controller;
 
 import com.ithsd.smart_tender.model.dto.AdminCreateUserRequest;
 import com.ithsd.smart_tender.model.dto.AdminResetPasswordRequest;
+import com.ithsd.smart_tender.model.dto.AdminUpdateUserRequest;
 import com.ithsd.smart_tender.model.result.Result;
 import com.ithsd.smart_tender.model.vo.AdminUserVO;
 import com.ithsd.smart_tender.service.AdminUserService;
@@ -11,6 +12,7 @@ import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -33,6 +35,15 @@ public class AdminUserController {
     @PostMapping
     public Result<AdminUserVO> createUser(@Valid @RequestBody AdminCreateUserRequest request) {
         return Result.success(adminUserService.createUser(request));
+    }
+
+    @PutMapping("/{userId}")
+    public Result<Void> updateUser(
+            @PathVariable Long userId,
+            @RequestBody AdminUpdateUserRequest request
+    ) {
+        adminUserService.updateUser(userId, request);
+        return Result.success();
     }
 
     @PostMapping("/{userId}/password")

@@ -7,6 +7,7 @@ import com.ithsd.smart_tender.common.util.MD5Util;
 import com.ithsd.smart_tender.mapper.TenantMemberMapper;
 import com.ithsd.smart_tender.mapper.UserMapper;
 import com.ithsd.smart_tender.model.dto.AdminCreateUserRequest;
+import com.ithsd.smart_tender.model.dto.AdminUpdateUserRequest;
 import com.ithsd.smart_tender.model.entity.TenantMember;
 import com.ithsd.smart_tender.model.entity.User;
 import com.ithsd.smart_tender.model.vo.AdminUserVO;
@@ -94,6 +95,55 @@ public class AdminUserServiceImpl implements AdminUserService {
         tenantMemberMapper.insert(member);
 
         return toVO(member, user);
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void updateUser(Long userId, AdminUpdateUserRequest request) {
+        TenantRequestContext context = requireOwner();
+        User user = requireMemberUser(userId, context);
+
+        String newUsername = request.getUsername() == null ? null : request.getUsername().trim();
+        String newRealName = request.getRealName() == null ? null : request.getRealName().trim();
+
+        boolean noUsername = newUsername == null || newUsername.isEmpty();
+        boolean noRealName = newRealName == null || newRealName.isEmpty();
+        if (noUsername && noRealName) {
+            throw error(400, "REQUEST_INVALID", "至少提供一个要修改的字段", context.requestId());
+        }
+
+        boolean usernameChanged = false;
+        if (!noUsername) {
+            if (newUsername.length() < 3 || newUsername.length() > 50) {
+                throw error(400, "REQUEST_INVALID", "账号长度需 3~50 个字符", context.requestId());
+            }
+            if (!newUsername.equals(user.getUsername())) {
+                Long exists = userMapper.selectCount(
+                        new LambdaQueryWrapper<User>()
+                                .eq(User::getUsername, newUsername)
+                                .ne(User::getId, userId));
+                if (exists != null && exists > 0) {
+                    throw error(409, "TENANT_MEMBER_EXISTS", "用户名已存在", context.requestId());
+                }
+                user.setUsername(newUsername);
+                usernameChanged = true;
+            }
+        }
+
+        if (!noRealName) {
+            if (newRealName.length() > 50) {
+                throw error(400, "REQUEST_INVALID", "姓名不能超过 50 个字符", context.requestId());
+            }
+            user.setRealName(newRealName);
+        }
+
+        user.setUpdateTime(LocalDateTime.now(ZoneOffset.UTC));
+        userMapper.updateById(user);
+
+        if (usernameChanged) {
+            // 账号变更后使旧会话失效，用户需用新账号重新登录
+            tenantSessionStore.deleteByUserId(userId);
+        }
     }
 
     @Override

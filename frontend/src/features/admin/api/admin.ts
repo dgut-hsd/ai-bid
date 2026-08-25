@@ -12,6 +12,13 @@ export const adminApi = {
     return request.post('/api/admin/users', data);
   },
 
+  updateUser: (
+    userId: string,
+    data: { username?: string; real_name?: string }
+  ): Promise<BaseResponse<unknown>> => {
+    return request.put(`/api/admin/users/${userId}`, data);
+  },
+
   resetPassword: (userId: string, password: string): Promise<BaseResponse<unknown>> => {
     return request.post(`/api/admin/users/${userId}/password`, { password });
   },

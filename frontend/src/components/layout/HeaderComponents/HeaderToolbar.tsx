@@ -116,7 +116,7 @@ export const HeaderToolbar: React.FC<HeaderToolbarProps> = ({ isMobile }) => {
             size={isMobile ? 'default' : 'small'}
             style={{ backgroundColor: antdTheme.colorPrimary }}
           >
-            {userInfo?.realName?.charAt(0) || <User size={14} />}
+            {userInfo?.username?.charAt(0)?.toUpperCase() || <User size={14} />}
           </Avatar>
 
           {!isMobile && (
@@ -129,7 +129,7 @@ export const HeaderToolbar: React.FC<HeaderToolbarProps> = ({ isMobile }) => {
                 alignItems: 'center',
               }}
             >
-              {userInfo?.realName || userInfo?.username || '未知用户'}
+              {userInfo?.username || '未知用户'}
             </span>
           )}
         </Space>

@@ -40,10 +40,10 @@ export const MonthlyIssueBarChart: React.FC<MonthlyIssueBarChartProps> = ({
 
       return {
          grid: {
-            top: 5,
-            right: 15,
-            left: 30,
-            bottom: 0,
+            top: 20,
+            right: 20,
+            left: 40,
+            bottom: 4,
             containLabel: true,
          },
          tooltip: {
@@ -113,13 +113,16 @@ export const MonthlyIssueBarChart: React.FC<MonthlyIssueBarChartProps> = ({
 
    return (
       <div className={styles.chartCard}>
-         <Title level={4} style={{ marginTop: 5 }}>
-            本月发现问题数
-         </Title>
+         <div style={{ flexShrink: 0, marginBottom: 12 }}>
+            <Title level={4} style={{ margin: '5px 0 4px' }}>
+               本月发现问题数
+            </Title>
+         </div>
 
-         <span style={{ fontSize: 12 }}>按天统计本月审核发现的问题数量。</span>
-
-         <div ref={chartRef} style={{ width: '100%', flex: 1, minHeight: 150 }} />
+         <div
+            ref={chartRef}
+            style={{ width: '100%', flex: 1, minHeight: 150, position: 'relative' }}
+         />
       </div>
    );
 };

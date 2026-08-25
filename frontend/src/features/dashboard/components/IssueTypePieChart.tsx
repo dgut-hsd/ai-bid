@@ -119,13 +119,19 @@ export const IssueTypePieChart: React.FC<IssueTypePieChartProps> = ({
 
    return (
       <div className={styles.chartCard}>
-         <Title level={4} style={{ marginTop: 5 }}>
-            问题类型分布
-         </Title>
+         <div style={{ flexShrink: 0, marginBottom: 8 }}>
+            <Title level={4} style={{ margin: '5px 0 4px' }}>
+               问题类型分布
+            </Title>
+            <span style={{ fontSize: 12, display: 'block' }}>
+               按风险类型统计审核发现的问题数量。
+            </span>
+         </div>
 
-         <span style={{ fontSize: 12 }}>按风险类型统计审核发现的问题数量。</span>
-
-         <div ref={chartRef} style={{ width: '100%', flex: 1, minHeight: 150 }} />
+         <div
+            ref={chartRef}
+            style={{ width: '100%', flex: 1, minHeight: 150, position: 'relative' }}
+         />
       </div>
    );
 };
