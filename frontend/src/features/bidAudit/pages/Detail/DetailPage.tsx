@@ -144,7 +144,7 @@ export const DetailPage: React.FC = () => {
             <div className={styles.leftPanel}>
                <PdfPreview
                   ref={pdfPreviewRef}
-                  fileUrl={`/api/bid-documents/${bidData.id}/download`}
+                  fileUrl={`${import.meta.env.VITE_API_BASE_URL}/api/bid-documents/${bidData.id}/download`}
                   fileType={bidData.fileType}
                   isComplete={isComplete}
                />
