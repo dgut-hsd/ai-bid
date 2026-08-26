@@ -15,11 +15,11 @@ security:
 
 file:
   storage:
-    path: /opt/smart-tender/data/uploads
+    path: ${FILE_STORAGE_PATH:/opt/smart-tender/data/uploads}
 
 preview:
   cache:
-    path: /opt/smart-tender/data/preview-cache
+    path: ${PREVIEW_CACHE_PATH:/opt/smart-tender/data/preview-cache}
 
 rag:
   base-url: http://127.0.0.1:8000
