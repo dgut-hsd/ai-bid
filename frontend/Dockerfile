@@ -15,6 +15,11 @@ RUN pnpm install --frozen-lockfile
 
 # 复制源码并构建（tsc 类型检查 + vite 打包）
 COPY . .
+
+# 子路径部署基路径（默认 /aibid/，可用 --build-arg BASE_PATH=... 覆盖；根路径部署传 /）
+ARG BASE_PATH=/aibid/
+ENV AIBID_BASE_PATH=$BASE_PATH
+
 RUN pnpm build
 
 # ── 运行阶段：Nginx 托管静态产物并反代 API ──

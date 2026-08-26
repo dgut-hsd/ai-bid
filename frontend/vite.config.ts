@@ -5,9 +5,12 @@ import path from 'path';
 
 const javaApiTarget = process.env.AIBID_JAVA_BASE_URL || 'http://127.0.0.1:3000';
 const frontendPort = Number(process.env.AIBID_FRONTEND_PORT || 5173);
+// 子路径部署基路径：默认 '/'，生产构建通过 AIBID_BASE_PATH=/aibid/ 注入
+const basePath = process.env.AIBID_BASE_PATH || '/';
 
 // https://vite.dev/config/
 export default defineConfig({
+   base: basePath,
    plugins: [react()],
    resolve: {
       alias: {
