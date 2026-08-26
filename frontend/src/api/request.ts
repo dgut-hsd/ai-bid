@@ -72,7 +72,7 @@ function forceLogout() {
   isLoggingOut = true;
   console.error('登录过期，请重新登录');
   store.dispatch(logout());
-  window.location.href = '/login';
+  window.location.href = `${import.meta.env.BASE_URL}login`;
   setTimeout(() => { isLoggingOut = false; }, 500);
 }
 

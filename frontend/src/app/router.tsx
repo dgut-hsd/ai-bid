@@ -11,6 +11,13 @@ import { bidAuditRoutes } from '../features/bidAudit/routes';
 import { libraryRoutes } from '../features/bidLibrary/routes';
 import { adminRoutes } from '../features/admin/routes';
 
+// basename 跟随 Vite 的 base 配置：base='/aibid/' 时 import.meta.env.BASE_URL 自动等于 '/aibid/'，
+// 路由据此识别子路径前缀；base='/'（本地开发）时 basename 为 undefined（根路径）。
+const basename =
+   import.meta.env.BASE_URL && import.meta.env.BASE_URL !== '/'
+      ? import.meta.env.BASE_URL.replace(/\/+$/, '')
+      : undefined;
+
 export const router = createBrowserRouter([
    {
       path: '/login',
@@ -47,4 +54,4 @@ export const router = createBrowserRouter([
          },
       ],
    },
-]);
+], basename ? { basename } : {});
