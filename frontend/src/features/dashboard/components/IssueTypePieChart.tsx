@@ -40,6 +40,7 @@ export const IssueTypePieChart: React.FC<IssueTypePieChartProps> = ({
 
    const option: echarts.EChartsOption = useMemo(() => {
       if (isEmpty) {
+         // 空态只渲染占位文字，不放置空 series，与柱状图空态保持一致
          return {
             graphic: {
                type: 'text',
@@ -51,7 +52,6 @@ export const IssueTypePieChart: React.FC<IssueTypePieChartProps> = ({
                   fontSize: 14,
                },
             },
-            series: [{ type: 'pie' as const, data: [] }],
          } as echarts.EChartsOption;
       }
 

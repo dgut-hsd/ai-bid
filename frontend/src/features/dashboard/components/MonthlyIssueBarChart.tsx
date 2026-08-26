@@ -23,6 +23,8 @@ export const MonthlyIssueBarChart: React.FC<MonthlyIssueBarChartProps> = ({
       const isEmpty = counts.length === 0 || counts.every((n) => n === 0);
 
       if (isEmpty) {
+         // 空态只渲染占位文字；不能放空 bar 系列——bar 依赖 cartesian2d 坐标系，
+         // 没有 xAxis/yAxis/grid 会导致 echarts 读取 undefined 崩溃
          return {
             graphic: {
                type: 'text',
@@ -34,7 +36,6 @@ export const MonthlyIssueBarChart: React.FC<MonthlyIssueBarChartProps> = ({
                   fontSize: 14,
                },
             },
-            series: [{ type: 'bar' as const, data: [] }],
          } as echarts.EChartsOption;
       }
 
