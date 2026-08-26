@@ -263,9 +263,9 @@ const parseSourceReference = (reference?: string): ParsedSourceRef | null => {
    const baseName = nameParts.length ? nameParts[nameParts.length - 1] : String(fileName || '');
    const previewUrl =
       sourceType === 'knowledge' && fileId
-         ? `/api/knowledge-files/${fileId}/preview`
+         ? `${import.meta.env.VITE_API_BASE_URL}/api/knowledge-files/${fileId}/preview`
          : fileId
-            ? `/api/bid-documents/${fileId}/download`
+            ? `${import.meta.env.VITE_API_BASE_URL}/api/bid-documents/${fileId}/download`
             : undefined;
    return {
       fileName: baseName || '未返回来源文件',

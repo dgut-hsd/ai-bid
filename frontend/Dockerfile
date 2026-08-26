@@ -20,6 +20,10 @@ COPY . .
 ARG BASE_PATH=/aibid/
 ENV AIBID_BASE_PATH=$BASE_PATH
 
+# API 基路径（默认 /aibid，让前端请求走 /aibid/api/...，由 nginx 反代到后端）
+ARG API_BASE=/aibid
+ENV VITE_API_BASE_URL=$API_BASE
+
 RUN pnpm build
 
 # ── 运行阶段：Nginx 托管静态产物并反代 API ──

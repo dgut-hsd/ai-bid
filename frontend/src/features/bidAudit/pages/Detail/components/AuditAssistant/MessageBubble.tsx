@@ -201,7 +201,7 @@ const getSourceRefs = (message: ChatMessage): SourceRef[] => {
         : undefined;
     const previewUrl =
       fileId && sourceType === 'knowledge'
-        ? `/api/knowledge-files/${fileId}/preview`
+        ? `${import.meta.env.VITE_API_BASE_URL}/api/knowledge-files/${fileId}/preview`
         : undefined;
     const key = `${sourceType || 'unknown'}-${fileId || fileName}-${pageNumber || 'na'}`;
     if (dedupe.has(key)) {
