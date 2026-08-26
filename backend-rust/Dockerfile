@@ -34,6 +34,9 @@ WORKDIR /app
 
 COPY --from=build /app/target/release/server /usr/local/bin/server
 
+# 规则库数据（conditions.yaml / catalog.yaml）—— 引擎按 CARGO_MANIFEST_DIR=/app 定位 /app/src/rules/data，必须拷入
+COPY src/rules/data /app/src/rules/data
+
 # 数据目录（中间产物、.env 等），宿主机挂卷
 VOLUME /data
 
