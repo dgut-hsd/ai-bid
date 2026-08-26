@@ -7,7 +7,8 @@ RUN npm install -g pnpm@11.20.0
 WORKDIR /app
 
 # 先复制依赖清单，利用 Docker 层缓存（依赖没变就不重装）
-COPY package.json pnpm-lock.yaml ./
+# pnpm-workspace.yaml 含 allowBuilds（esbuild 放行），必须一起 COPY，否则 pnpm 11 会忽略 esbuild 构建脚本
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 
 # 按锁文件安装依赖，保证可复现
 RUN pnpm install --frozen-lockfile
