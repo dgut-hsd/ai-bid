@@ -1,5 +1,7 @@
 # ── Rust 引擎多阶段构建：编译 → 精简运行 ──
-FROM rust:1 AS build
+# 必须用 bookworm 变体：运行阶段是 debian:bookworm-slim(glibc 2.36)，
+# 若用默认 rust:1(基于 Trixie, glibc 2.39)编译，产物会报 GLIBC_2.38/2.39 not found
+FROM rust:1-bookworm AS build
 
 # 安装编译期系统依赖：
 # - build-essential/cc : cc crate（C 编译器）
