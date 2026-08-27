@@ -27,7 +27,7 @@
 | 缓存 | Redis 7.2 | 6379 |
 | 图数据库 | Neo4j 5.21 | 7474/7687 |
 | 向量库 | Qdrant 1.7 | 6333 |
-| 文档转换 | JODConverter + LibreOffice | 8088 |
+| 文档转换 |LibreOffice | 8088 |
 
 ## 目录结构
 
