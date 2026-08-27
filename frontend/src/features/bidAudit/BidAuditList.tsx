@@ -2,7 +2,7 @@ import React, { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useStyles } from './style';
 import { App, Result, Button, Modal, Form, Input, Tabs } from 'antd';
-import { PlusOutlined, ProjectOutlined } from '@ant-design/icons';
+import { ProjectOutlined } from '@ant-design/icons';
 
 import { AuditFilter } from './components/AuditFilter';
 import { AuditTable } from './components/AuditTable';
@@ -15,13 +15,13 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { auditListOptions, useDeleteProject } from './api/auditList';
 import { dashboardMutations } from '@/features/dashboard/api/dashboard';
 
-const STATUS_TAB_ITEMS = [
-   { key: 'all', label: '全部' },
-   { key: '0', label: '待审核' },
-   { key: '1', label: '审核中' },
-   { key: '2', label: '已完成' },
-   { key: '3', label: '审核失败' },
-];
+const STATUS_TABS = [
+   { key: 'all', label: '全部', countKey: 'allCount' },
+   { key: '0', label: '待审核', countKey: 'pendingCount' },
+   { key: '1', label: '审核中', countKey: 'processingCount' },
+   { key: '2', label: '已完成', countKey: 'completedCount' },
+   { key: '3', label: '审核失败', countKey: 'failedCount' },
+] as const;
 
 interface NewProjectFormValues {
    projectName: string;
@@ -56,6 +56,25 @@ export const BidAuditList: React.FC = () => {
       isError: isAuditListError,
       error: auditListError,
    } = useQuery(auditListOptions.queryList(queryParams));
+
+   // 顶部状态 Tab 的计数角标数据
+   const { data: statsData } = useQuery(auditListOptions.stats());
+
+   const tabItems = useMemo(
+      () =>
+         STATUS_TABS.map((item) => ({
+            key: item.key,
+            label: (
+               <span>
+                  {item.label}
+                  <span className={styles.tabCount}>
+                     {statsData?.[item.countKey] ?? 0}
+                  </span>
+               </span>
+            ),
+         })),
+      [statsData, styles]
+   );
 
    // 按上传时间倒序：刚上传的标书直接置顶，不用在列表里翻找
    const sortedRecords = useMemo(() => {
@@ -128,6 +147,7 @@ export const BidAuditList: React.FC = () => {
          });
          message.success('项目创建成功，请上传招标文件');
          queryClient.invalidateQueries({ queryKey: ['dashboardList'] });
+         queryClient.invalidateQueries({ queryKey: ['auditListStats'] });
          setIsCreateModalOpen(false);
          createForm.resetFields();
          navigate(`/upload/${created.id}`);
@@ -147,7 +167,7 @@ export const BidAuditList: React.FC = () => {
                   : String(queryParams.status)
             }
             onChange={handleStatusChange}
-            items={STATUS_TAB_ITEMS}
+            items={tabItems}
             style={{ marginBottom: 8 }}
          />
 
@@ -159,10 +179,9 @@ export const BidAuditList: React.FC = () => {
             extra={
                <Button
                   type='primary'
-                  icon={<PlusOutlined />}
                   onClick={() => setIsCreateModalOpen(true)}
                >
-                  新建项目并上传招标文件
+                  +新建项目
                </Button>
             }
          />

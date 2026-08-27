@@ -184,6 +184,9 @@ export async function generateWordDocument(
              table { border-collapse: collapse; width: 100%; margin: 12pt 0; }
              th, td { border: 1px solid #000000; padding: 6pt; text-align: left; }
              th { background-color: #f2f2f2; font-weight: bold; }
+             /* 长 URL 在导出文档内换行，避免溢出页面宽度 */
+             body { overflow-wrap: break-word; }
+             a { word-break: break-all; overflow-wrap: anywhere; }
            </style>
          </head>
          <body>

@@ -55,3 +55,12 @@ export interface ProjectItem {
   projectId: number;
   auditorName: string;
 }
+
+/** 审核状态统计（首页顶部状态 Tab 角标），对齐后端 TenderStatsVO */
+export interface TenderStats {
+  allCount: number;
+  pendingCount: number;
+  processingCount: number;
+  completedCount: number;
+  failedCount: number;
+}

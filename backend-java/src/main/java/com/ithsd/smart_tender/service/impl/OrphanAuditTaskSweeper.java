@@ -3,6 +3,7 @@ package com.ithsd.smart_tender.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ithsd.smart_tender.common.TenantContext;
 import com.ithsd.smart_tender.common.TenantRequestContext;
+import com.ithsd.smart_tender.config.RustApiProperties;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
 import com.ithsd.smart_tender.model.entity.AuditTask;
 import com.ithsd.smart_tender.model.enums.AuditTaskStatusEnum;
@@ -16,6 +17,7 @@ import org.springframework.stereotype.Component;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 孤儿任务守护：周期性对账滞留的 PENDING/PROCESSING 审核任务。
@@ -43,6 +45,7 @@ public class OrphanAuditTaskSweeper {
     private final AuditTaskMapper auditTaskMapper;
     private final AuditEngineService auditEngineService;
     private final RunningTaskRegistry runningTaskRegistry;
+    private final RustApiProperties rustApiProperties;
     private final boolean enabled;
     private final long staleAfterMs;
 
@@ -50,12 +53,14 @@ public class OrphanAuditTaskSweeper {
             AuditTaskMapper auditTaskMapper,
             AuditEngineService auditEngineService,
             RunningTaskRegistry runningTaskRegistry,
+            RustApiProperties rustApiProperties,
             @Value("${audit.orphan.enabled:true}") boolean enabled,
             @Value("${audit.orphan.stale-after-ms:180000}") long staleAfterMs
     ) {
         this.auditTaskMapper = auditTaskMapper;
         this.auditEngineService = auditEngineService;
         this.runningTaskRegistry = runningTaskRegistry;
+        this.rustApiProperties = rustApiProperties;
         this.enabled = enabled;
         this.staleAfterMs = staleAfterMs;
     }
@@ -123,9 +128,30 @@ public class OrphanAuditTaskSweeper {
         log.info("orphan sweep: taskId={}, outcome={}", taskId, outcome);
         switch (outcome) {
             case STATE_LOST, NOT_FOUND -> auditEngineService.failOrphan(taskId);
-            case COMPLETED, FAILED, STILL_RUNNING, UNREACHABLE -> {
-                // 已完成/已失败：无需动作；仍在跑/不可达：留给下一轮守护。
+            case STILL_RUNNING, UNREACHABLE -> {
+                // Rust 仍在跑 / 暂时不可达：通常留给下一轮守护。
+                // 但若任务自 start_time 起已超过 review-timeout（等价于活线程
+                // awaitReviewResult 的兜底超时），说明已无 Java 线程在推进、且 Rust
+                // 迟迟不收敛，强制判失败，避免永远停留在 PROCESSING。
+                if (overdue(task)) {
+                    log.warn("orphan sweep: PROCESSING task overdue, force failing, taskId={}, outcome={}",
+                            taskId, outcome);
+                    auditEngineService.failOrphan(taskId);
+                }
+            }
+            case COMPLETED, FAILED -> {
+                // 已完成/已失败：无需动作。
             }
         }
+    }
+
+    /** 任务自 start_time 起是否已超过 Rust 审核总超时（review-timeout-minutes）。 */
+    private boolean overdue(AuditTask task) {
+        LocalDateTime start = task.getStartTime();
+        if (start == null) {
+            return false;
+        }
+        long maxRunMs = TimeUnit.MINUTES.toMillis(rustApiProperties.getReviewTimeoutMinutes());
+        return start.plusNanos(maxRunMs * 1_000_000L).isBefore(LocalDateTime.now());
     }
 }

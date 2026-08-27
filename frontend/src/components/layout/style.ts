@@ -17,6 +17,25 @@ export const useHeaderStyle = createStyles(({ token, css }) => ({
       top: 0;
       z-index: 999;
    `,
+   // 左侧容器（折叠按钮 + 面包屑）：可收缩、不挤压右侧工具栏
+   headerLeft: css`
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow: hidden;
+   `,
+   // 面包屑单个条目：长文件名在此截断为省略号，而不是把顶栏撑爆
+   crumbLabel: css`
+      display: inline-block;
+      max-width: 260px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: middle;
+
+      @media (max-width: 768px) {
+         max-width: 120px;
+      }
+   `,
    trigger: css`
       font-size: 1.5rem;
       line-height: 1;

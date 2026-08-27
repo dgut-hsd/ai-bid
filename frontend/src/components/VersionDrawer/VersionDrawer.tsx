@@ -20,6 +20,7 @@ import { CloseOutlined, PlusOutlined } from '@ant-design/icons';
 import { useIsMobile } from '@/hooks/useMediaQuery';
 import { EllipsisTooltip } from '@/components/EllipsisTooltip/EllipsisTooltip';
 import dayjs from 'dayjs';
+import { useStyles } from './style';
 
 interface VersionDrawerProps {
    open: boolean;
@@ -46,6 +47,7 @@ export const VersionDrawer = ({
    const cardRefs = useRef<(HTMLDivElement | null)[]>([]);
    const navigate = useNavigate();
    const isMobile = useIsMobile();
+   const { styles } = useStyles();
 
    const [drawerWidth] = useState<string | number>('72vw');
 
@@ -144,6 +146,7 @@ export const VersionDrawer = ({
 
             <div style={{ flex: 1 }}>
                <Timeline
+                  className={styles.timeline}
                   items={versions.map((item, index) => ({
                      key: item.id,
                      children: (

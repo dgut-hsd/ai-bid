@@ -8,6 +8,7 @@ import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
 
 import java.time.LocalDateTime;
+import java.util.Map;
 
 @Mapper
 public interface ProjectMapper extends BaseMapper<Project> {
@@ -62,4 +63,41 @@ public interface ProjectMapper extends BaseMapper<Project> {
                                                @Param("status") Integer status,
                                                @Param("uploadStartTime") LocalDateTime uploadStartTime,
                                                @Param("uploadEndTime") LocalDateTime uploadEndTime);
+
+    /**
+     * 按状态统计标书数量（首页顶部状态 Tab 角标）
+     *
+     * <p>与 {@link #selectProjectPageWithStatus} 使用完全一致的「最新版本标书 + 最新审核任务」
+     * 口径，一次性返回各状态计数，避免逐项目解析：
+     * <ul>
+     *   <li>pending    待审核：latest 标书无审核任务（lt.task_status IS NULL）</li>
+     *   <li>processing 审核中：PENDING(0)/PROCESSING(1)</li>
+     *   <li>completed  已完成：COMPLETED(2)</li>
+     *   <li>failed     审核失败：FAILED(3)</li>
+     *   <li>total      全部</li>
+     * </ul>
+     */
+    @Select("<script>"
+            + "SELECT "
+            + "  COUNT(*) AS total, "
+            + "  SUM(CASE WHEN lt.task_status IS NULL THEN 1 ELSE 0 END) AS pending, "
+            + "  SUM(CASE WHEN lt.task_status IN (0, 1) THEN 1 ELSE 0 END) AS processing, "
+            + "  SUM(CASE WHEN lt.task_status = 2 THEN 1 ELSE 0 END) AS completed, "
+            + "  SUM(CASE WHEN lt.task_status = 3 THEN 1 ELSE 0 END) AS failed "
+            + "FROM project p "
+            + "LEFT JOIN ( "
+            + "  SELECT x.project_id, x.tenant_id, x.task_status "
+            + "  FROM ( "
+            + "    SELECT pbd.project_id, pbd.tenant_id, "
+            + "           at.task_status, "
+            + "           ROW_NUMBER() OVER (PARTITION BY pbd.project_id, pbd.tenant_id "
+            + "             ORDER BY pbd.version DESC, at.create_time DESC, at.id DESC) AS rn "
+            + "    FROM bid_document pbd "
+            + "    LEFT JOIN audit_task at ON at.bid_id = pbd.id AND at.tenant_id = pbd.tenant_id "
+            + "  ) x WHERE x.rn = 1 "
+            + ") lt ON lt.project_id = p.id AND lt.tenant_id = p.tenant_id "
+            + "WHERE p.tenant_id = #{tenantId} AND p.user_id = #{userId} "
+            + "</script>")
+    Map<String, Object> countByStatus(@Param("tenantId") Long tenantId,
+                                      @Param("userId") Long userId);
 }

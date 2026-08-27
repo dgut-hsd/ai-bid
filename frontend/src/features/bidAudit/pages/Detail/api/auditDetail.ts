@@ -27,6 +27,17 @@ export const getAuditStatus = async (taskId: string): Promise<AuditStatus> => {
    return res.data;
 };
 
+/** 按标书(bid)取「当前任务」状态（服务端裁决 taskId，不再依赖 localStorage）。 */
+export const getAuditStatusByBid = async (
+   bidId: number
+): Promise<AuditStatus | null> => {
+   const res = await request.get<unknown, BaseResponse<AuditStatus>>(
+      `/api/audit-tasks/by-bid/${bidId}`
+   );
+
+   return res.data ?? null;
+};
+
 export const getAuditResult = async (
    taskId: string,
    params?: { page?: number; size?: number; sinceIssueNo?: string }

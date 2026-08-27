@@ -5,6 +5,20 @@ export const useStyles = createStyles(({ css, token }) => ({
       background-color: ${token.colorBgLayout};
       min-height: 100%;
 
+      /* 顶部状态 Tab 栏：左右留白不再贴边，并拉开各 Tab 之间的块间距 */
+      .ant-tabs-nav {
+         margin: 0;
+         padding: 8px 1.2rem 0;
+      }
+
+      .ant-tabs-tab {
+         padding-block: 10px 8px;
+      }
+
+      .ant-tabs-tab + .ant-tabs-tab {
+         margin-inline-start: 24px;
+      }
+
       .ant-tabs-tab-btn {
          font-size: 1.2rem;
       }
@@ -17,7 +31,7 @@ export const useStyles = createStyles(({ css, token }) => ({
       min-width: 1.8rem;
       height: 1.8rem;
       padding: 0 6px;
-      margin-left: 6px;
+      margin-left: 8px;
       border-radius: 999px;
       background-color: ${token.colorFillSecondary};
       color: ${token.colorTextSecondary};
@@ -105,30 +119,31 @@ export const useStyles = createStyles(({ css, token }) => ({
          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
       }
    `,
-   auditCardHeader: css`
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 8px;
-   `,
    auditCardName: css`
+      display: block;
+      width: 100%;
       font-size: 1.5rem;
       font-weight: 600;
       color: ${token.colorText};
       line-height: 1.4;
-      word-break: break-all;
-      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
    `,
-   auditCardStatus: css`
-      flex-shrink: 0;
-   `,
-   auditCardActions: css`
+   auditCardFooter: css`
       display: flex;
       align-items: center;
-      gap: 4px;
-      flex-wrap: wrap;
-      margin-top: 10px;
-      padding-top: 10px;
-      border-top: 1px solid ${token.colorBorderSecondary};
+      gap: 8px;
+      margin-top: 12px;
+   `,
+   auditCardTime: css`
+      flex: 1;
+      min-width: 0;
+      text-align: center;
+      color: ${token.colorTextTertiary};
+      font-size: 1.2rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
    `,
 }));

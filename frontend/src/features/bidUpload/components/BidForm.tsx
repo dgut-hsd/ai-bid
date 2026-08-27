@@ -96,7 +96,7 @@ export const BidForm: React.FC<Props> = ({
             <Form.Item
                label='文件名称'
                name='bidName'
-               style={{ flex: 1 }}
+               style={{ flex: 1, maxWidth: 800 }}
                rules={[{ required: true, message: '请输入文件名称' }]}
             >
                <Input

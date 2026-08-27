@@ -503,76 +503,85 @@ class TenderServiceImplTest {
 
     // ========================= getStats =========================
 
+    private Map<String, Object> statsRow(long total, long pending, long processing, long completed, long failed) {
+        Map<String, Object> map = new HashMap<>();
+        map.put("total", total);
+        map.put("pending", pending);
+        map.put("processing", processing);
+        map.put("completed", completed);
+        map.put("failed", failed);
+        return map;
+    }
+
     @Test
     void getStats_shouldAggregateCorrectly() {
         TenderPageQueryDTO dto = new TenderPageQueryDTO();
 
-        // simulate GROUP BY returning {status=0, count=5}, {status=1, count=3}
-        Map<String, Object> rowUnreviewed = new HashMap<>();
-        rowUnreviewed.put("parse_status", 0);
-        rowUnreviewed.put("count", 5L);
-
-        Map<String, Object> rowCompleted = new HashMap<>();
-        rowCompleted.put("parse_status", 1);
-        rowCompleted.put("count", 3L);
-
-        when(tenderMapper.selectMaps(any(QueryWrapper.class)))
-                .thenReturn(Arrays.asList(rowUnreviewed, rowCompleted));
+        when(projectMapper.countByStatus(CURRENT_TENANT_ID, CURRENT_USER_ID))
+                .thenReturn(statsRow(6L, 1L, 2L, 3L, 0L));
 
         TenderStatsVO stats = tenderService.getStats(dto);
 
         assertNotNull(stats);
-        assertEquals(8L, stats.getAllCount());
-        assertEquals(5L, stats.getUnreviewedCount());
+        assertEquals(6L, stats.getAllCount());
+        assertEquals(1L, stats.getPendingCount());
+        assertEquals(2L, stats.getProcessingCount());
         assertEquals(3L, stats.getCompletedCount());
+        assertEquals(0L, stats.getFailedCount());
     }
 
     @Test
-    void getStats_shouldHandleNoData() {
+    void getStats_shouldHandleNullMap() {
         TenderPageQueryDTO dto = new TenderPageQueryDTO();
 
-        when(tenderMapper.selectMaps(any(QueryWrapper.class)))
-                .thenReturn(Collections.emptyList());
+        when(projectMapper.countByStatus(CURRENT_TENANT_ID, CURRENT_USER_ID))
+                .thenReturn(null);
 
         TenderStatsVO stats = tenderService.getStats(dto);
 
         assertNotNull(stats);
         assertEquals(0L, stats.getAllCount());
-        assertEquals(0L, stats.getUnreviewedCount());
+        assertEquals(0L, stats.getPendingCount());
+        assertEquals(0L, stats.getProcessingCount());
         assertEquals(0L, stats.getCompletedCount());
+        assertEquals(0L, stats.getFailedCount());
     }
 
     @Test
-    void getStats_shouldHandleNullStatusRows() {
+    void getStats_shouldHandleEmptyMap() {
         TenderPageQueryDTO dto = new TenderPageQueryDTO();
 
-        Map<String, Object> rowNull = new HashMap<>();
-        rowNull.put("parse_status", null);
-        rowNull.put("count", 2L);
-
-        when(tenderMapper.selectMaps(any(QueryWrapper.class)))
-                .thenReturn(Collections.singletonList(rowNull));
+        when(projectMapper.countByStatus(CURRENT_TENANT_ID, CURRENT_USER_ID))
+                .thenReturn(Collections.emptyMap());
 
         TenderStatsVO stats = tenderService.getStats(dto);
 
         assertNotNull(stats);
         assertEquals(0L, stats.getAllCount());
-        assertEquals(0L, stats.getUnreviewedCount());
+        assertEquals(0L, stats.getPendingCount());
+        assertEquals(0L, stats.getProcessingCount());
         assertEquals(0L, stats.getCompletedCount());
+        assertEquals(0L, stats.getFailedCount());
     }
 
     @Test
-    void getStats_shouldPassFilterConditionsToQuery() {
+    void getStats_shouldHandleSparseMap() {
         TenderPageQueryDTO dto = new TenderPageQueryDTO();
-        dto.setBidName("模糊查询");
-        dto.setFileCategory("bid");
 
-        when(tenderMapper.selectMaps(any(QueryWrapper.class)))
-                .thenReturn(Collections.emptyList());
+        // 某些状态为 null 时（异常数据），应回退为 0
+        Map<String, Object> sparse = statsRow(1L, 0L, 0L, 0L, 0L);
+        sparse.put("processing", null);
+        when(projectMapper.countByStatus(CURRENT_TENANT_ID, CURRENT_USER_ID))
+                .thenReturn(sparse);
 
-        tenderService.getStats(dto);
+        TenderStatsVO stats = tenderService.getStats(dto);
 
-        verify(tenderMapper).selectMaps(any(QueryWrapper.class));
+        assertNotNull(stats);
+        assertEquals(1L, stats.getAllCount());
+        assertEquals(0L, stats.getPendingCount());
+        assertEquals(0L, stats.getProcessingCount());
+        assertEquals(0L, stats.getCompletedCount());
+        assertEquals(0L, stats.getFailedCount());
     }
 
     // ========================= getById =========================

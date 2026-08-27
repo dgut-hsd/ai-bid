@@ -18,6 +18,7 @@ interface ColumnsProps {
    handleDeleteProject: (projectId: number) => void;
    deletingProjectId: number | null;
    isDeletingProject: boolean;
+   onView: (projectId: number) => void;
 }
 
 export const useAuditListTableColumns = ({
@@ -25,6 +26,7 @@ export const useAuditListTableColumns = ({
    handleDeleteProject,
    deletingProjectId,
    isDeletingProject,
+   onView,
 }: ColumnsProps) => {
    const isMobile = useIsMobile();
    const navigate = useNavigate();
@@ -106,7 +108,7 @@ export const useAuditListTableColumns = ({
                      className={styles.actionLinkBtn}
                      onClick={(e) => {
                         e.stopPropagation();
-                        navigate(`/bidReview/detail/${record.id}`);
+                        onView(record.projectId);
                      }}
                   >
                      查看详情

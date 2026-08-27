@@ -94,6 +94,15 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         if (tender == null) {
             throw TenantScope.resourceNotFound();
         }
+        // 去重：同一标书若已有「进行中/待调度」的审核任务，直接复用该任务，
+        // 避免前端重复点击 / 重复提交制造出多个并发任务，进而在 Rust 侧撞
+        // 「该文档已有进行中的审核任务」冲突而被快速失败。
+        AuditTask inProgress = findInProgressTaskByBidId(request.getBidId(), tenantId);
+        if (inProgress != null) {
+            log.info("重复提交已拦截：同一标书已有进行中的审核任务，复用 taskId={}, bidId={}",
+                    inProgress.getTaskId(), request.getBidId());
+            return new AuditTaskCreateVO(inProgress.getTaskId());
+        }
         LocalDateTime now = LocalDateTime.now();
         AuditTask entity = AuditTask.builder()
                 .tenantId(tenantId)
@@ -193,6 +202,21 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         return auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
                 .eq(AuditTask::getBidId, bidId)
                 .eq(AuditTask::getTenantId, TenantScope.requiredTenantId())
+                .orderByDesc(AuditTask::getCreateTime)
+                .last("LIMIT 1"));
+    }
+
+    /**
+     * 查找同一标书下「待调度(PENDING)/进行中(PROCESSING)」的审核任务。
+     * 用于 {@link #createTask} 去重：存在则复用，不再新建。
+     */
+    private AuditTask findInProgressTaskByBidId(Long bidId, Long tenantId) {
+        return auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getBidId, bidId)
+                .eq(AuditTask::getTenantId, tenantId)
+                .in(AuditTask::getTaskStatus,
+                        AuditTaskStatusEnum.PENDING.getCode(),
+                        AuditTaskStatusEnum.PROCESSING.getCode())
                 .orderByDesc(AuditTask::getCreateTime)
                 .last("LIMIT 1"));
     }

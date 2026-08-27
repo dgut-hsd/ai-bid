@@ -9,6 +9,7 @@ import type {
    AuditListQueryParams,
    AuditListItem,
    ProjectItem,
+   TenderStats,
 } from '../types';
 
 export const getAllAuditList = async (): Promise<AuditListItem[]> => {
@@ -93,6 +94,26 @@ export const deleteTenderVersion = async (id: number): Promise<void> => {
    await request.delete<unknown, BaseResponse<void>>(`/api/bid-documents/${id}`);
 };
 
+export const getAuditStats = async (): Promise<TenderStats> => {
+   const res = await request.get<unknown, BaseResponse<TenderStats>>(
+      '/api/bid-documents/stats'
+   );
+
+   if (res.code !== 0 && res.code !== 200) {
+      throw new Error(res.msg || '审核状态统计加载失败');
+   }
+
+   return (
+      res.data ?? {
+         allCount: 0,
+         pendingCount: 0,
+         processingCount: 0,
+         completedCount: 0,
+         failedCount: 0,
+      }
+   );
+};
+
 export const auditListOptions = {
    list: () =>
       queryOptions({
@@ -108,6 +129,14 @@ export const auditListOptions = {
          queryFn: () => getAuditListWithParams(params),
          placeholderData: (previousData) => previousData,
          staleTime: 0,
+      }),
+
+   stats: () =>
+      queryOptions({
+         queryKey: ['auditListStats'],
+         queryFn: () => getAuditStats(),
+         placeholderData: (previousData) => previousData,
+         staleTime: 30 * 1000,
       }),
 
    detail: (projectId: number | null) =>
@@ -128,6 +157,7 @@ export const useDeleteProject = () => {
          queryClient.invalidateQueries({ queryKey: ['auditList'] });
          queryClient.invalidateQueries({ queryKey: ['auditListWithParams'] });
          queryClient.invalidateQueries({ queryKey: ['dashboardList'] });
+         queryClient.invalidateQueries({ queryKey: ['auditListStats'] });
       },
    });
 };

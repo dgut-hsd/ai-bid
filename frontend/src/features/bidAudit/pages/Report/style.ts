@@ -93,13 +93,14 @@ export const useStyles = createStyles(({ css, token }) => ({
          background-color: white;
       }
 
-      /* 移动端：取消 flex 固定比例，允许横向滚动查看超宽 A4 纸 */
+      /* 移动端：纸张自适应宽度，纵向堆叠阅读，不再横向滚动 */
       @media (max-width: 768px) {
          flex: none;
          height: auto;
-         padding: 20px 16px;
-         justify-content: flex-start; /* 防止左侧内容被屏幕外截断 */
-         overflow-x: auto;
+         width: 100%;
+         padding: 16px 12px;
+         justify-content: center;
+         overflow-x: hidden;
       }
    `,
 
@@ -118,6 +119,13 @@ export const useStyles = createStyles(({ css, token }) => ({
       color: ${token.colorTextBase};
       font-size: 14px;
       line-height: 1.8;
+      /* 长 URL / 无空格长串在固定 A4 宽度内自动换行，避免内容横向溢出 */
+      overflow-wrap: break-word;
+
+      a {
+         overflow-wrap: anywhere; /* URL 链接：需要时可在任意字符处断行 */
+         word-break: break-all;
+      }
 
       h1 {
          font-size: 24px;
@@ -188,10 +196,14 @@ export const useStyles = createStyles(({ css, token }) => ({
          }
       }
 
-      /* 移动端：确保纸张边缘不会紧贴屏幕，同时缩小内边距节省空间 */
+      /* 移动端：纸张宽度铺满屏宽、禁用缩放，缩小内边距便于阅读 */
       @media (max-width: 768px) {
+         width: 100%;
+         min-height: auto;
          margin: 0 auto;
-         padding: 15mm 20mm;
+         padding: 12mm 8mm;
+         box-shadow: none;
+         transform: none !important;
       }
    `,
 

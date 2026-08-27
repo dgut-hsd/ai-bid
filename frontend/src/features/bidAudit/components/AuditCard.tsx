@@ -1,7 +1,14 @@
 import React from 'react';
-import { Button, Popconfirm } from 'antd';
-import { EyeOutlined, DeleteOutlined, UploadOutlined } from '@ant-design/icons';
+import { App, Button, Dropdown } from 'antd';
+import type { MenuProps } from 'antd';
+import {
+   DownOutlined,
+   EyeOutlined,
+   DeleteOutlined,
+   UploadOutlined,
+} from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
+import dayjs from 'dayjs';
 import { StatusTag } from './StatusTag';
 import type { ProjectItem } from '../types';
 
@@ -15,7 +22,7 @@ interface AuditCardProps {
 
 /**
  * 移动端招标文件卡片 —— 只保留核心信息：
- * 项目名称 + 审核状态 + 操作按钮（查看 / 上传新版本 / 删除）。
+ * 第一行：项目名称（过长省略）；第二行：审核状态 + 上传时间 + 操作按钮。
  */
 export const AuditCard: React.FC<AuditCardProps> = ({
    record,
@@ -25,64 +32,58 @@ export const AuditCard: React.FC<AuditCardProps> = ({
    styles,
 }) => {
    const navigate = useNavigate();
+   const { modal } = App.useApp();
+   const uploadTime = record.uploadTime
+      ? dayjs(record.uploadTime).format('YYYY-MM-DD')
+      : '-';
+
+   const menuItems: MenuProps['items'] = [
+      { key: 'view', icon: <EyeOutlined />, label: '查看' },
+      { key: 'upload', icon: <UploadOutlined />, label: '上传新版本' },
+      { type: 'divider' },
+      { key: 'delete', icon: <DeleteOutlined />, danger: true, label: '删除' },
+   ];
+
+   const handleMenuClick: MenuProps['onClick'] = ({ key }) => {
+      if (key === 'view') {
+         onView(record.projectId);
+      } else if (key === 'upload') {
+         navigate(`/upload/${record.projectId}`);
+      } else if (key === 'delete') {
+         modal.confirm({
+            title: '确定要删除该项目吗？',
+            content: '删除后将同步移除该项目下全部版本与审核记录，且不可恢复。',
+            okText: '确认删除',
+            okButtonProps: { danger: true, loading: deleting },
+            cancelText: '取消',
+            onOk: () => {
+               onDelete(record.projectId);
+            },
+         });
+      }
+   };
 
    return (
       <div className={styles.auditCard} onClick={() => onView(record.projectId)}>
-         <div className={styles.auditCardHeader}>
-            <span className={styles.auditCardName}>{record.bidName || '-'}</span>
-            <span className={styles.auditCardStatus}>
-               <StatusTag parseStatus={record.parseStatus} />
-            </span>
-         </div>
+         <span className={styles.auditCardName} title={record.bidName || '-'}>
+            {record.bidName || '-'}
+         </span>
 
-         <div className={styles.auditCardActions}>
-            <Button
-               type='link'
-               size='small'
-               icon={<EyeOutlined />}
-               onClick={(e) => {
-                  e.stopPropagation();
-                  onView(record.projectId);
-               }}
-            >
-               查看
-            </Button>
+         <div className={styles.auditCardFooter}>
+            <StatusTag parseStatus={record.parseStatus} />
 
-            <Button
-               type='link'
-               size='small'
-               icon={<UploadOutlined />}
-               onClick={(e) => {
-                  e.stopPropagation();
-                  navigate(`/upload/${record.projectId}`);
-               }}
-            >
-               上传新版本
-            </Button>
+            <span className={styles.auditCardTime}>{uploadTime}</span>
 
-            <Popconfirm
-               title='确定要删除该项目吗？'
-               description='删除后将同步移除该项目下全部版本与审核记录，且不可恢复。'
-               okText='确认删除'
-               cancelText='取消'
-               okButtonProps={{ danger: true, loading: deleting }}
-               onConfirm={(e) => {
-                  e?.stopPropagation();
-                  onDelete(record.projectId);
-               }}
-               onCancel={(e) => e?.stopPropagation()}
-            >
-               <Button
-                  type='link'
-                  danger
-                  size='small'
-                  icon={<DeleteOutlined />}
-                  loading={deleting}
-                  onClick={(e) => e.stopPropagation()}
+            <span onClick={(e) => e.stopPropagation()}>
+               <Dropdown
+                  menu={{ items: menuItems, onClick: handleMenuClick }}
+                  trigger={['click']}
                >
-                  删除
-               </Button>
-            </Popconfirm>
+                  <Button size='small'>
+                     操作 <DownOutlined />
+                  </Button>
+               </Dropdown>
+            </span>
          </div>
       </div>
    );

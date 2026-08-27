@@ -66,17 +66,18 @@ export const AuditTable: React.FC<AuditTableProps> = ({
       });
    };
 
+   const openVersionsDrawer = (projectId: number) => {
+      setSelectedProject(projectId);
+      setIsDrawerOpen(true);
+   };
+
    const columns = useAuditListTableColumns({
       styles,
       handleDeleteProject,
       deletingProjectId,
       isDeletingProject,
+      onView: openVersionsDrawer,
    });
-
-   const openVersionsDrawer = (projectId: number) => {
-      setSelectedProject(projectId);
-      setIsDrawerOpen(true);
-   };
 
    const versionsDrawer = (
       <VersionDrawer

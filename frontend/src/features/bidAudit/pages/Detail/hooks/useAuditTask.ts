@@ -5,6 +5,7 @@ import {
    connectStream,
    getAuditResult,
    getAuditStatus,
+   getAuditStatusByBid,
 } from '../api/auditDetail';
 import type {
   AuditIssue, AgentProgress, TraceEvent,
@@ -152,6 +153,37 @@ export const useAuditTask = (bidId?: number) => {
          setHasStartedAudit(false);
       },
    });
+
+   // 首次进入详情页且无 localStorage taskId 时，由服务端按标书(bid)裁决「当前任务」：
+   // 能直接加载已有的完成结果 / 进行中任务，而不是只丢一个「开始审核」按钮。
+   // 有 taskId（localStorage 命中）时不覆盖，交给下方 hydrate 处理。
+   useEffect(() => {
+      if (typeof bidId !== 'number' || Number.isNaN(bidId)) return;
+      if (taskId || isStarting || lastStartAt > 0) return;
+      let cancelled = false;
+      (async () => {
+         try {
+            const status = await getAuditStatusByBid(bidId);
+            if (cancelled || !status?.taskId) return;
+            if (storageKey) {
+               try {
+                  localStorage.setItem(
+                     storageKey,
+                     JSON.stringify({ taskId: status.taskId, startedAt: 0 })
+                  );
+               } catch (e) {
+                  console.error('[AuditTask] 服务端 taskId 持久化失败:', e);
+               }
+            }
+            setTaskId(status.taskId);
+         } catch (e) {
+            console.warn('[AuditTask] 按标书裁决当前任务失败（该标书尚未发起审核）:', e);
+         }
+      })();
+      return () => {
+         cancelled = true;
+      };
+   }, [bidId, taskId, storageKey, isStarting, lastStartAt]);
 
    useEffect(() => {
       let cancelled = false;
@@ -415,27 +447,11 @@ export const useAuditTask = (bidId?: number) => {
                setError(null);
                return;
             }
-            setAuditStartedAt((prev) => prev || Date.now());
-
-            const fallbackResult = await getAuditResult(taskId, {
-               page: 1,
-               size: 200,
-            });
-            if (stopped) return;
-            const hasResult =
-               (fallbackResult.issues?.length || 0) > 0 ||
-               (status.status === 'completed' && !!fallbackResult.auditResult);
-            if (hasResult) {
-               setIssues((fallbackResult.issues || []).map(withAnchorFallback));
-               updateFinalElapsed();
-               setIsComplete(true);
-               setProgress(100);
-               setCurrentStage('审核完成');
-               setShouldConnectStream(false);
-               setHasStartedAudit(false);
-               setError(null);
-               return;
-            }
+            // 进行中(PROCESSING)不再用 getResult 的 issues 数量去推断“已完成”：
+            // 长审核期间一旦有一段增量 finding，就会与 hydrate() 的 status=processing
+            // 判定互相翻转 setIsComplete/shouldConnectStream，导致 SSE 反复重连
+            // （详情页闪烁/卡死）。完成态统一由上方 status === 'completed' 分支与
+            // SSE 的 complete 事件收敛；此处仅保留 failed 的收尾。
 
             if (status.status === 'failed') {
                setError('审核任务执行失败，请点击重新审核');

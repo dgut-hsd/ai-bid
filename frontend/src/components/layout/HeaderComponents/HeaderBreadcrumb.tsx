@@ -3,6 +3,7 @@ import { Breadcrumb } from 'antd';
 import { useLocation, Link, matchPath } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { bidOptions } from '@/api/bid';
+import { useHeaderStyle } from '../style';
 
 const breadcrumbNameMap: Record<string, string> = {
    '/upload': '文件上传',
@@ -12,6 +13,7 @@ const breadcrumbNameMap: Record<string, string> = {
 
 export const HeaderBreadcrumb: React.FC = () => {
    const location = useLocation();
+   const { styles } = useHeaderStyle();
 
    const matchDetail = matchPath('/bidReview/detail/:bidId', location.pathname);
    const matchIssues = matchPath('/bidReview/issues/:bidId', location.pathname);
@@ -64,13 +66,16 @@ export const HeaderBreadcrumb: React.FC = () => {
       }
 
       return crumbs.map((crumb, index) => {
+         const labelNode = (
+            <span className={styles.crumbLabel}>{crumb.label}</span>
+         );
          return {
             key: crumb.path,
             title:
                index === crumbs.length - 1 ? (
-                  crumb.label
+                  labelNode
                ) : (
-                  <Link to={crumb.path}>{crumb.label}</Link>
+                  <Link to={crumb.path}>{labelNode}</Link>
                ),
          };
       });

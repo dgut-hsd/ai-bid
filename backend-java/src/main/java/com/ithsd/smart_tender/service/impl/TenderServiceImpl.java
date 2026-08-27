@@ -63,43 +63,33 @@ public class TenderServiceImpl implements TenderService {
     @Override
     public TenderStatsVO getStats(TenderPageQueryDTO dto) {
         Long tenantId = TenantScope.requiredTenantId();
-        // 使用 QueryWrapper 分组统计
-        QueryWrapper<Tender> wrapper = new QueryWrapper<>();
-        wrapper.select("parse_status", "count(*) as count");
-        wrapper.eq("tenant_id", tenantId);
-        // 动态查询条件，与page接口保持一致（除status外）
-        wrapper.like(StringUtils.hasText(dto.getBidName()), "bid_name", dto.getBidName());
-        wrapper.eq(StringUtils.hasText(dto.getFileCategory()), "file_category", dto.getFileCategory());
-        // 统计时不能根据 status 过滤，否则只能统计到单一状态的数量
+        Long userId = BaseContext.getCurrentId();
 
-        // 加上当前用户的限制
-        wrapper.eq("upload_user_id", BaseContext.getCurrentId());
-
-        wrapper.groupBy("parse_status");
-
-        List<Map<String, Object>> list = tenderMapper.selectMaps(wrapper);
-
-        long unreviewed = 0;
-        long completed = 0;
-
-        for (Map<String, Object> map : list) {
-            Integer status = (Integer) map.get("parse_status");
-            long count = ((Number) map.get("count")).longValue();
-
-            if (status != null) {
-                if (status == 0) { // 0:未审核
-                    unreviewed += count;
-                } else if (status == 1) { // 1:已审核
-                    completed += count;
-                }
-            }
+        // 复用审核列表的「最新版本标书 + 最新审核任务」口径，一次性统计各状态数量。
+        // 与 ProjectMapper#selectProjectPageWithStatus 完全一致：
+        //   待审核(0)=无任务；审核中(1)=PENDING/PROCESSING；已完成(2)=COMPLETED；审核失败(3)=FAILED。
+        Map<String, Object> counts = projectMapper.countByStatus(tenantId, userId);
+        if (counts == null || counts.isEmpty()) {
+            return TenderStatsVO.builder()
+                    .allCount(0L)
+                    .pendingCount(0L)
+                    .processingCount(0L)
+                    .completedCount(0L)
+                    .failedCount(0L)
+                    .build();
         }
 
         return TenderStatsVO.builder()
-                .allCount(unreviewed + completed)
-                .unreviewedCount(unreviewed)
-                .completedCount(completed)
+                .allCount(toLong(counts.get("total")))
+                .pendingCount(toLong(counts.get("pending")))
+                .processingCount(toLong(counts.get("processing")))
+                .completedCount(toLong(counts.get("completed")))
+                .failedCount(toLong(counts.get("failed")))
                 .build();
+    }
+
+    private static long toLong(Object value) {
+        return value == null ? 0L : ((Number) value).longValue();
     }
 
     @Override
