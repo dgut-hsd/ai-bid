@@ -26,8 +26,10 @@ RUN cargo build --release --bin server
 FROM debian:bookworm-slim
 
 # 运行时依赖：ca-certificates（HTTPS）+ libssl3 + libgomp1（ONNX 动态库的 OpenMP）
+# LibreOffice 用于 DOCX/DOC → PDF 转换（fonts-noto-cjk 避免中文标书转 PDF 乱码/豆腐块）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 libgomp1 \
+    libreoffice-core libreoffice-writer fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

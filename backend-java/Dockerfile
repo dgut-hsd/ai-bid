@@ -19,6 +19,11 @@ WORKDIR /app
 # 拷贝可执行 fat jar（名称 = artifactId-version.jar）
 COPY --from=build /app/target/smart_tender-0.0.1-SNAPSHOT.jar app.jar
 
+# LibreOffice 用于 DOCX → PDF 转换（含中文字体，否则中文标书转 PDF 乱码）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libreoffice-core libreoffice-writer fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
 # 数据目录（上传文件、预览缓存），宿主机挂卷
 VOLUME /data
 
