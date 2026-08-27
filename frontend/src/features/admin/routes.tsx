@@ -1,5 +1,9 @@
+import { lazy } from 'react';
 import type { RouteObject } from 'react-router-dom';
-import { AdminUsersPage } from './pages/AdminUsersPage';
+
+const AdminUsersPage = lazy(() =>
+   import('./pages/AdminUsersPage').then((m) => ({ default: m.AdminUsersPage }))
+);
 
 export const adminRoutes: RouteObject[] = [
   {

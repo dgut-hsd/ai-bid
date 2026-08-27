@@ -1,6 +1,16 @@
 import React, { useEffect, useMemo, useRef } from 'react';
-import * as echarts from 'echarts';
+import * as echarts from 'echarts/core';
+import { PieChart } from 'echarts/charts';
+import {
+   GraphicComponent,
+   LegendComponent,
+   TooltipComponent,
+} from 'echarts/components';
+import { CanvasRenderer } from 'echarts/renderers';
+import type { EChartsOption } from 'echarts';
 import { COLORS } from '@/theme/constants';
+
+echarts.use([PieChart, GraphicComponent, LegendComponent, TooltipComponent, CanvasRenderer]);
 import { Typography } from 'antd';
 import { useStyles } from '../style';
 import type { IssueChartItem } from '../types';
@@ -38,7 +48,7 @@ export const IssueTypePieChart: React.FC<IssueTypePieChartProps> = ({
    const chartData = Array.isArray(data) ? data : [];
    const isEmpty = chartData.length === 0;
 
-   const option: echarts.EChartsOption = useMemo(() => {
+   const option: EChartsOption = useMemo(() => {
       if (isEmpty) {
          // 空态只渲染占位文字，不放置空 series，与柱状图空态保持一致
          return {
@@ -52,7 +62,7 @@ export const IssueTypePieChart: React.FC<IssueTypePieChartProps> = ({
                   fontSize: 14,
                },
             },
-         } as echarts.EChartsOption;
+         } as EChartsOption;
       }
 
       return {

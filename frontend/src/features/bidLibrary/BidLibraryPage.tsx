@@ -43,6 +43,7 @@ export const BidLibraryPage: React.FC = () => {
    const { data: statsData } = useKnowledgeStatistics(queryParams);
 
    const [uploadVisible, setUploadVisible] = useState(false);
+   const [filterDrawerOpen, setFilterDrawerOpen] = useState(false);
    const [isUploading, setIsUploading] = useState(false);
    const [editVisible, setEditVisible] = useState(false);
    const [editSubmitting, setEditSubmitting] = useState(false);
@@ -87,6 +88,13 @@ export const BidLibraryPage: React.FC = () => {
       });
    };
 
+   // 移动端「筛选」按钮角标：统计已激活的次要筛选条件数
+   const activeFilterCount = [
+      queryParams.applicableScope ? 1 : 0,
+      queryParams.status ? 1 : 0,
+      queryParams.startDate || queryParams.endDate ? 1 : 0,
+   ].reduce((s, n) => s + n, 0);
+
    return (
       <div className={styles.pageContainer}>
          <Modal
@@ -111,6 +119,8 @@ export const BidLibraryPage: React.FC = () => {
                   searchKeyword={queryParams.keyword || ''}
                   onSearchChange={(keyword) => handleFilterChange({ keyword })}
                   onUploadClick={() => setUploadVisible(true)}
+                  onFilterClick={() => setFilterDrawerOpen(true)}
+                  activeFilterCount={activeFilterCount}
                />
 
                {/* 左侧的下部分：Tab + 筛选器 (新增了一层 div 包裹) */}
@@ -150,6 +160,8 @@ export const BidLibraryPage: React.FC = () => {
                         }
                      }}
                      onReset={handleReset}
+                     drawerOpen={filterDrawerOpen}
+                     onDrawerClose={() => setFilterDrawerOpen(false)}
                   />
                </div>
             </div>

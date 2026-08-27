@@ -11,13 +11,16 @@ import {
   App,
   Card,
   Typography,
-  Dropdown,
+  Empty,
+  Skeleton,
 } from 'antd';
-import { PlusOutlined, KeyOutlined, UserDeleteOutlined, EditOutlined, MoreOutlined } from '@ant-design/icons';
+import { PlusOutlined, KeyOutlined, UserDeleteOutlined, EditOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useIsMobile } from '@/hooks/useMediaQuery';
 import { adminApi } from '../api/admin';
+import { UserCard } from '../components/UserCard';
+import { useStyles } from '../style';
 import type { AdminUser, AdminRole, CreateUserParams } from '../types';
 
 const { Title } = Typography;
@@ -38,6 +41,7 @@ export const AdminUsersPage: React.FC = () => {
   const [resetForm] = Form.useForm<{ password: string }>();
   const [editForm] = Form.useForm<{ username: string; real_name: string }>();
   const isMobile = useIsMobile();
+  const { styles } = useStyles();
 
   const usersQuery = useQuery({
     queryKey: ['admin-users'],
@@ -124,6 +128,30 @@ export const AdminUsersPage: React.FC = () => {
     },
   });
 
+  const openEdit = (record: AdminUser) => {
+    setEditTarget(record);
+    editForm.setFieldsValue({
+      username: record.username,
+      real_name: record.real_name ?? '',
+    });
+  };
+
+  const openReset = (record: AdminUser) => {
+    setResetTarget(record);
+    resetForm.resetFields();
+  };
+
+  const confirmRemove = (record: AdminUser) => {
+    modal.confirm({
+      title: `确定移除「${record.real_name || record.username}」吗？`,
+      content: '移除后该账号将被停用，无法再登录。',
+      okText: '移除',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      onOk: () => removeMutation.mutate(record.user_id),
+    });
+  };
+
   const columns: ColumnsType<AdminUser> = [
     { title: '账号', dataIndex: 'username', key: 'username' },
     {
@@ -158,74 +186,42 @@ export const AdminUsersPage: React.FC = () => {
     {
       title: '操作',
       key: 'action',
-      width: isMobile ? 76 : 180,
+      width: 180,
       fixed: 'right',
-      render: (_: unknown, record: AdminUser) => {
-        const editAction = () => {
-          setEditTarget(record);
-          editForm.setFieldsValue({
-            username: record.username,
-            real_name: record.real_name ?? '',
-          });
-        };
-        const resetAction = () => {
-          setResetTarget(record);
-          resetForm.resetFields();
-        };
-        const removeAction = () => {
-          modal.confirm({
-            title: `确定移除「${record.real_name || record.username}」吗？`,
-            content: '移除后该账号将被停用，无法再登录。',
-            okText: '移除',
-            cancelText: '取消',
-            okButtonProps: { danger: true },
-            onOk: () => removeMutation.mutate(record.user_id),
-          });
-        };
-
-        // 手机端：三个操作合并进「更多」下拉，点击展开
-        if (isMobile) {
-          return (
-            <Dropdown
-              trigger={['click']}
-              menu={{
-                items: [
-                  { key: 'edit', icon: <EditOutlined />, label: '编辑', onClick: editAction },
-                  { key: 'reset', icon: <KeyOutlined />, label: '重置密码', onClick: resetAction },
-                  {
-                    key: 'remove',
-                    icon: <UserDeleteOutlined />,
-                    danger: true,
-                    label: '移除',
-                    onClick: removeAction,
-                  },
-                ],
-              }}
-            >
-              <Button size='small' aria-label='更多操作' icon={<MoreOutlined />} />
-            </Dropdown>
-          );
-        }
-
-        return (
-          <Space>
-            <Button size='small' type='link' icon={<EditOutlined />} onClick={editAction}>
-              编辑
-            </Button>
-            <Button size='small' type='link' icon={<KeyOutlined />} onClick={resetAction}>
-              重置密码
-            </Button>
-            <Button size='small' type='link' danger icon={<UserDeleteOutlined />} onClick={removeAction}>
-              移除
-            </Button>
-          </Space>
-        );
-      },
+      render: (_: unknown, record: AdminUser) => (
+        <Space>
+          <Button
+            size='small'
+            type='link'
+            icon={<EditOutlined />}
+            onClick={() => openEdit(record)}
+          >
+            编辑
+          </Button>
+          <Button
+            size='small'
+            type='link'
+            icon={<KeyOutlined />}
+            onClick={() => openReset(record)}
+          >
+            重置密码
+          </Button>
+          <Button
+            size='small'
+            type='link'
+            danger
+            icon={<UserDeleteOutlined />}
+            onClick={() => confirmRemove(record)}
+          >
+            移除
+          </Button>
+        </Space>
+      ),
     },
   ];
 
   return (
-    <div style={{ padding: 24 }}>
+    <div style={{ padding: isMobile ? 12 : 24 }}>
       <Card
         title={
           <Space>
@@ -244,16 +240,37 @@ export const AdminUsersPage: React.FC = () => {
             创建用户
           </Button>
         }
+        styles={{ body: { padding: isMobile ? 12 : 24 } }}
       >
-        <Table
-          rowKey='user_id'
-          columns={columns}
-          dataSource={usersQuery.data || []}
-          loading={usersQuery.isLoading}
-          pagination={false}
-          size='middle'
-          scroll={{ x: 'max-content' }}
-        />
+        {isMobile ? (
+          <div className={styles.mobileCardList}>
+            {usersQuery.isLoading ? (
+              <Skeleton active paragraph={{ rows: 5 }} />
+            ) : (usersQuery.data ?? []).length > 0 ? (
+              (usersQuery.data ?? []).map((user) => (
+                <UserCard
+                  key={user.user_id}
+                  user={user}
+                  onEdit={openEdit}
+                  onReset={openReset}
+                  onRemove={confirmRemove}
+                />
+              ))
+            ) : (
+              <Empty description='暂无用户' style={{ padding: '32px 0' }} />
+            )}
+          </div>
+        ) : (
+          <Table
+            rowKey='user_id'
+            columns={columns}
+            dataSource={usersQuery.data || []}
+            loading={usersQuery.isLoading}
+            pagination={false}
+            size='middle'
+            scroll={{ x: 'max-content' }}
+          />
+        )}
       </Card>
 
       {/* ── 创建用户弹窗 ─────────────────────────────────────────── */}

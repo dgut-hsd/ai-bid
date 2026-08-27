@@ -55,6 +55,7 @@ export const useAuditListTableColumns = ({
          key: 'supplierName',
          align: 'center',
          width: 150,
+         responsive: ['md', 'lg', 'xl', 'xxl'],
          ellipsis: true,
          render: (text: string) => <EllipsisTooltip text={text ?? '-'} />,
       },
@@ -72,6 +73,7 @@ export const useAuditListTableColumns = ({
          key: 'auditorName',
          align: 'center',
          width: 100,
+         responsive: ['md', 'lg', 'xl', 'xxl'],
          ellipsis: true,
          render: (text: string) => <EllipsisTooltip text={text ?? '-'} />,
       },
@@ -81,12 +83,14 @@ export const useAuditListTableColumns = ({
          key: 'version',
          align: 'center',
          width: 100,
+         responsive: ['md', 'lg', 'xl', 'xxl'],
       },
       {
          title: '操作',
          key: 'actions',
          align: 'center',
          width: 140,
+         fixed: 'right',
          render: (_, record) => {
             const deletingCurrent =
                isDeletingProject && deletingProjectId === record.projectId;

@@ -60,7 +60,7 @@ export const HistoryTable: React.FC<HistoryTableProps> = ({
                dataSource={data}
                rowKey='id'
                loading={loading}
-               scroll={{ x: 800 }}
+               scroll={{ x: 'max-content' }}
                pagination={false}
             />
 

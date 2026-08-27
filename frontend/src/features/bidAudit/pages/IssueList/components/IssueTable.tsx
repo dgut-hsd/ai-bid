@@ -1,13 +1,15 @@
 import React from 'react';
-import { Table, Button, Pagination, Tooltip } from 'antd';
+import { Table, Button, Pagination, Tooltip, Empty } from 'antd';
 import { ExportOutlined } from '@ant-design/icons';
 import { useStyles } from '../style';
 import type { AuditIssue, IssueQueryParams } from '../types';
 
 import { IssueTableFilter } from './IssueTableFilter';
+import { IssueCard } from './IssueCard';
 import { useTableColumns } from '../hooks/useTableColumns';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Loading } from '@/components/Loading/Loading';
+import { useIsMobile } from '@/hooks/useMediaQuery';
 
 interface IssueTableProps {
    issues: AuditIssue[];
@@ -25,6 +27,7 @@ export const IssueTable: React.FC<IssueTableProps> = ({
    onFilterChange,
 }) => {
    const { styles, theme } = useStyles();
+   const isMobile = useIsMobile();
    const navigate = useNavigate();
    const { id: bidId } = useParams<{ id: string }>();
 
@@ -53,13 +56,28 @@ export const IssueTable: React.FC<IssueTableProps> = ({
             onReset={handleReset}
          />
 
-         <Table<AuditIssue>
-            columns={columns}
-            dataSource={issues}
-            rowKey='issueNo'
-            pagination={false}
-            scroll={{ x: 800 }}
-         />
+         {isMobile ? (
+            issues.length > 0 ? (
+               <div className={styles.issueCardList}>
+                  {issues.map((issue) => (
+                     <IssueCard key={issue.issueNo} issue={issue} />
+                  ))}
+               </div>
+            ) : (
+               <Empty
+                  description='暂无符合条件的审核问题'
+                  style={{ padding: '32px 0' }}
+               />
+            )
+         ) : (
+            <Table<AuditIssue>
+               columns={columns}
+               dataSource={issues}
+               rowKey='issueNo'
+               pagination={false}
+               scroll={{ x: 'max-content' }}
+            />
+         )}
 
          <div className={styles.paginationArea}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -69,7 +87,8 @@ export const IssueTable: React.FC<IssueTableProps> = ({
                         current={queryParams.page}
                         pageSize={queryParams.size}
                         total={total}
-                        showQuickJumper
+                        showQuickJumper={!isMobile}
+                        size={isMobile ? 'small' : undefined}
                         onChange={(page) => onFilterChange({ page })}
                         style={{ fontSize: '1.2rem' }}
                      />

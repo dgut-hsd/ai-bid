@@ -8,6 +8,11 @@ export const useStyles = createStyles(({ css, token }) => ({
       display: flex;
       flex-direction: column;
       gap: 1rem;
+
+      @media (max-width: 768px) {
+         padding: 0;
+         gap: 0;
+      }
    `,
 
    // 2. 上部分区：主布局 (分为左右)
@@ -20,6 +25,7 @@ export const useStyles = createStyles(({ css, token }) => ({
 
       @media (max-width: 768px) {
          flex-direction: column;
+         gap: 0;
       }
    `,
 
@@ -30,6 +36,10 @@ export const useStyles = createStyles(({ css, token }) => ({
       display: flex;
       flex-direction: column;
       gap: 2rem;
+
+      @media (max-width: 768px) {
+         gap: 0;
+      }
    `,
 
    // --- 右侧：统计卡片区 ---
@@ -39,8 +49,8 @@ export const useStyles = createStyles(({ css, token }) => ({
       display: flex;
 
       @media (max-width: 768px) {
-         flex: 0 0 100%;
-         min-width: 100%;
+         /* 移动端隐藏统计卡，聚焦列表 */
+         display: none;
       }
    `,
 
@@ -54,8 +64,14 @@ export const useStyles = createStyles(({ css, token }) => ({
       width: 100%;
 
       @media (max-width: 768px) {
-         flex-direction: column;
-         align-items: stretch;
+         /* 移动端：单行吸顶，搜索 + 筛选 + 上传 */
+         position: sticky;
+         top: 0;
+         z-index: 100;
+         gap: 8px;
+         padding: 8px 12px;
+         background: ${token.colorBgContainer};
+         border-bottom: 1px solid ${token.colorBorderSecondary};
       }
    `,
    searchInput: css`
@@ -79,6 +95,10 @@ export const useStyles = createStyles(({ css, token }) => ({
       display: flex;
       flex-direction: column;
       gap: 16px;
+
+      @media (max-width: 768px) {
+         gap: 0;
+      }
    `,
 
    // --- 第一行：分类标签 ---
@@ -87,6 +107,18 @@ export const useStyles = createStyles(({ css, token }) => ({
       gap: 1rem 1.5rem;
       flex-wrap: wrap;
       border-bottom: 1px solid ${token.colorBorderSecondary};
+
+      @media (max-width: 768px) {
+         /* 移动端：横向滚动单行，不再换行堆积 */
+         flex-wrap: nowrap;
+         overflow-x: auto;
+         padding: 8px 12px 0;
+         gap: 0.5rem 1.25rem;
+         scrollbar-width: none;
+         &::-webkit-scrollbar {
+            display: none;
+         }
+      }
    `,
    categoryTab: css`
       display: flex;
@@ -99,6 +131,7 @@ export const useStyles = createStyles(({ css, token }) => ({
       transition: all 0.2s ease-in;
       margin-bottom: -1px; // 盖住父元素的底边框
       border-bottom: 2px solid transparent;
+      white-space: nowrap;
 
       &:hover {
          color: ${token.colorPrimary};
@@ -229,6 +262,10 @@ export const useStyles = createStyles(({ css, token }) => ({
       box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
       overflow: hidden;
 
+      @media (max-width: 768px) {
+         margin: 8px 12px;
+      }
+
       .ant-table {
          font-size: 1.2rem;
       }
@@ -292,9 +329,79 @@ export const useStyles = createStyles(({ css, token }) => ({
       background: ${token.colorBgContainer};
       border-top: 1px solid ${token.colorBorderSecondary};
       flex-wrap: wrap;
+
+      @media (max-width: 768px) {
+         justify-content: center;
+         padding: 12px;
+      }
    `,
    totalText: css`
       font-size: 14px;
       color: ${token.colorTextSecondary};
+   `,
+
+   // 6. 移动端：卡片式文件列表
+   mobileListContainer: css`
+      padding: 12px;
+      padding-bottom: 24px;
+   `,
+   mobileCardList: css`
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+   `,
+   mobileCard: css`
+      background: ${token.colorBgContainer};
+      border: 1px solid ${token.colorBorderSecondary};
+      border-radius: ${token.borderRadiusLG}px;
+      padding: 12px;
+      transition: box-shadow 0.2s ease;
+
+      &:active {
+         transform: scale(0.98);
+      }
+   `,
+   mobileCardHeader: css`
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+      margin-bottom: 8px;
+   `,
+   mobileCardName: css`
+      flex: 1;
+      font-size: 14px;
+      font-weight: 600;
+      color: ${token.colorText};
+      line-height: 1.4;
+      word-break: break-all;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+   `,
+   mobileCardBadges: css`
+      display: flex;
+      gap: 4px;
+      flex-shrink: 0;
+   `,
+   mobileCardMeta: css`
+      font-size: 12px;
+      color: ${token.colorTextSecondary};
+      line-height: 1.5;
+      margin-bottom: 8px;
+   `,
+   mobileCardActions: css`
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-top: 8px;
+      border-top: 1px solid ${token.colorBorderSecondary};
+
+      .ant-btn-link {
+         color: ${token.colorPrimary};
+         padding: 0 8px;
+         font-size: 13px;
+      }
    `,
 }));
