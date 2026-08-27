@@ -1,5 +1,5 @@
 import React from 'react';
-import { App, Button, Dropdown } from 'antd';
+import { App, Button, Dropdown, Tag } from 'antd';
 import type { MenuProps } from 'antd';
 import {
    DownOutlined,
@@ -65,9 +65,12 @@ export const AuditCard: React.FC<AuditCardProps> = ({
 
    return (
       <div className={styles.auditCard} onClick={() => onView(record.projectId)}>
-         <span className={styles.auditCardName} title={record.bidName || '-'}>
-            {record.bidName || '-'}
-         </span>
+         <div className={styles.auditCardHeader}>
+            <span className={styles.auditCardName} title={record.bidName || '-'}>
+               {record.bidName || '-'}
+            </span>
+            <Tag className={styles.auditCardVersion}>V{record.version}</Tag>
+         </div>
 
          <div className={styles.auditCardFooter}>
             <StatusTag parseStatus={record.parseStatus} />

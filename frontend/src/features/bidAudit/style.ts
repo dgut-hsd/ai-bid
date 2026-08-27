@@ -119,9 +119,15 @@ export const useStyles = createStyles(({ css, token }) => ({
          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
       }
    `,
+   auditCardHeader: css`
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px;
+   `,
    auditCardName: css`
-      display: block;
-      width: 100%;
+      flex: 1;
+      min-width: 0;
       font-size: 1.5rem;
       font-weight: 600;
       color: ${token.colorText};
@@ -129,6 +135,10 @@ export const useStyles = createStyles(({ css, token }) => ({
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+   `,
+   auditCardVersion: css`
+      flex-shrink: 0;
+      margin-inline-end: 0;
    `,
    auditCardFooter: css`
       display: flex;

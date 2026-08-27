@@ -200,7 +200,6 @@ export const VersionDrawer = ({
                                     padding: '0.9rem 1.1rem',
                                  },
                               }}
-                              style={{ marginBottom: '0.75rem' }}
                            >
                               <Descriptions
                                  size='small'
