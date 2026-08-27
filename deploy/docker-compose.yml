@@ -46,11 +46,19 @@ services:
       RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
       # JWT 密钥
       ST_JWT_SECRET: ${ST_JWT_SECRET:-local-test-only-jwt-secret-change-me}
+      # JVM 堆上限（宿主机 7.7G 无 swap，避免 JVM+LibreOffice 撑爆触发 OOM）
+      JAVA_TOOL_OPTIONS: "-Xmx1024m"
+      # 孤儿任务守护（Spring relaxed binding：AUDIT_ORPHAN_* → audit.orphan.*）
+      AUDIT_ORPHAN_ENABLED: "${AUDIT_ORPHAN_ENABLED:-true}"
+      AUDIT_ORPHAN_SWEEP_INTERVAL_MS: "${AUDIT_ORPHAN_SWEEP_INTERVAL_MS:-60000}"
+      AUDIT_ORPHAN_STALE_AFTER_MS: "${AUDIT_ORPHAN_STALE_AFTER_MS:-180000}"
       # 文件存储（覆盖 prod profile 里硬编码的 /opt 路径）
       FILE_STORAGE_PATH: /data/uploads
       PREVIEW_CACHE_PATH: /data/preview-cache
     volumes:
       - app_data:/data
+    mem_limit: 1536m
+    mem_reservation: 512m
     networks: [default]
 
   # ───────────────────────── Rust 审核引擎 ─────────────────────────
@@ -106,7 +114,7 @@ services:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
     ports:
-      - "${MYSQL_PORT:-3306}:3306"
+      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
@@ -115,6 +123,8 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    mem_limit: 2g
+    mem_reservation: 1g
     networks: [default]
 
   # ───────────────────────── Redis ─────────────────────────

@@ -27,6 +27,13 @@ public class RustApiProperties {
     /** 异步审核等待超时（分钟），默认 30 */
     private int reviewTimeoutMinutes = 30;
 
+    /**
+     * 启动审核（POST /review）请求的整体超时（毫秒），默认 30000。
+     * 独立于 connectTimeoutMs：审核启动虽然返回 202 很快，但引擎忙碌时
+     * 可能超过 5s，不能拿连接超时当请求超时。
+     */
+    private int reviewStartTimeoutMs = 30_000;
+
     /** 招标文件云端审核前脱敏模式。当前生产默认 low，可显式设为 off。 */
     private String desensitizationMode = "low";
 
@@ -73,6 +80,14 @@ public class RustApiProperties {
 
     public void setReviewTimeoutMinutes(int reviewTimeoutMinutes) {
         this.reviewTimeoutMinutes = reviewTimeoutMinutes;
+    }
+
+    public int getReviewStartTimeoutMs() {
+        return reviewStartTimeoutMs;
+    }
+
+    public void setReviewStartTimeoutMs(int reviewStartTimeoutMs) {
+        this.reviewStartTimeoutMs = reviewStartTimeoutMs;
     }
 
     public String getDesensitizationMode() {

@@ -925,6 +925,19 @@ pub async fn review_document(
         active.insert(key.clone());
     }
 
+    // 落盘"审核进行中"状态：进程重启后 get_review_result 可据此识别中断，
+    // 让 Java 侧快速失败而不是盲等超时。
+    if let Some(findings_dir) = tenant_output_path(&key.tenant_id, "findings") {
+        let _ = std::fs::create_dir_all(&findings_dir);
+        if let Err(e) = crate::api::review_state::write_running(
+            &findings_dir,
+            &doc_id,
+            || chrono::Utc::now().to_rfc3339(),
+        ) {
+            eprintln!("[WARN] 审核状态落盘失败: doc_id={}, {}", doc_id, e);
+        }
+    }
+
     // 创建或获取 ReviewEventBus（SSE 客户端可能已提前连接）。
     let review_events = {
         let mut buses = state.review_event_buses.lock().await;
@@ -1336,6 +1349,8 @@ let max_blocks = 5usize;
                     let _ = std::fs::write(&result_path, json);
                     println!("[DISK] result → {}", result_path.display());
                 }
+                // 结果已落盘，清除"进行中"状态文件
+                crate::api::review_state::remove(&dir, &doc_id);
             }
 
             if output.execution_summary.status
@@ -1368,6 +1383,17 @@ let max_blocks = 5usize;
             {
                 let mut errors = state.review_errors.lock().await;
                 errors.insert(document_key.clone(), msg.clone());
+            }
+
+            // 落盘失败状态：重启后 get_review_result 可透传原始失败原因
+            if let Some(dir) = tenant_output_path(&tenant_id, "findings") {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = crate::api::review_state::write_failed(
+                    &dir,
+                    &doc_id,
+                    &msg,
+                    || chrono::Utc::now().to_rfc3339(),
+                );
             }
 
             // 发送 Error 事件
@@ -1560,27 +1586,63 @@ if let Some(output) = results.get(&key) {
         }
     }
 
-    // 4. 磁盘 fallback — 重启后内存为空，从 JSON 文件恢复
+    // 4. 磁盘 fallback — 重启后内存为空：
+    //    已完成结果(_result.json) → 恢复；中断状态(_review_state.json) → 明确失败。
     {
-        let result_path =
-            tenant_document_path(&context.tenant_id, "findings", &doc_id, "_result.json")
-                .ok_or_else(document_not_found)?;
-        if let Ok(json) = std::fs::read_to_string(&result_path)
-            && let Ok(result) = serde_json::from_str::<ReviewResultResponse>(&json)
-        {
-            let belongs_to_document = result
-                .result
-                .as_ref()
-                .map(|review| review.document_id == doc_id)
-                .unwrap_or(true);
-            if belongs_to_document {
-                println!("[DISK] result loaded from disk: {}", result_path.display());
-                return Ok(Json(result));
-            }
+        let Some(findings_dir) = tenant_output_path(&context.tenant_id, "findings") else {
+            return Err(document_not_found());
+        };
+        if let Some(recovered) = disk_recovery(&context.tenant_id, &doc_id, &findings_dir) {
+            println!("[DISK] review recovered from disk: doc_id={}", doc_id);
+            return Ok(Json(recovered));
         }
     }
 
     Err(document_not_found())
+}
+
+/// 磁盘兜底恢复（纯函数，便于单测）：
+/// 1. `{doc_id}_result.json` 存在且归属正确 → 返回已完成结果；
+/// 2. `{doc_id}_review_state.json` 存在：
+///    - running → 引擎重启导致中断 → failed + 中断文案
+///    - failed → 透传原始失败原因
+/// 3. 均无 → None（调用方返回 404）。
+fn disk_recovery(
+    tenant_id: &str,
+    doc_id: &str,
+    findings_dir: &std::path::Path,
+) -> Option<ReviewResultResponse> {
+    // 1. 已完成结果优先（完成写盘后、删状态文件前崩溃的窗口）
+    let result_path = findings_dir.join(format!("{}_result.json", doc_id));
+    if let Ok(json) = std::fs::read_to_string(&result_path)
+        && let Ok(result) = serde_json::from_str::<ReviewResultResponse>(&json)
+    {
+        let belongs_to_document = result
+            .result
+            .as_ref()
+            .map(|review| review.document_id == doc_id)
+            .unwrap_or(true);
+        if belongs_to_document {
+            return Some(result);
+        }
+    }
+
+    // 2. 中断/失败状态文件
+    let state = crate::api::review_state::read(findings_dir, doc_id)?;
+    let (status, error) = if state.is_running() {
+        (
+            "failed".to_string(),
+            Some(crate::api::review_state::INTERRUPTED_ERROR_MSG.to_string()),
+        )
+    } else {
+        ("failed".to_string(), state.error)
+    };
+    Some(ReviewResultResponse {
+        status,
+        result: None,
+        usage: None,
+        error,
+    })
 }
 
 /// POST /api/v1/documents/:id/chat
@@ -2686,6 +2748,100 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    // ── 重启中断检测（disk_recovery 纯函数）──────────────────────────
+
+    #[test]
+    fn disk_recovery_returns_interrupted_failed_for_running_state_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::api::review_state::write_running(
+            dir.path(),
+            "doc-interrupted",
+            || "2026-08-27T00:00:00Z".to_string(),
+        )
+        .expect("write running state");
+
+        let recovered = disk_recovery("1", "doc-interrupted", dir.path())
+            .expect("running 状态文件应被识别为中断");
+
+        assert_eq!(recovered.status, "failed");
+        assert!(recovered.result.is_none(), "中断审核不得返回结果");
+        assert_eq!(
+            recovered.error.as_deref(),
+            Some(crate::api::review_state::INTERRUPTED_ERROR_MSG),
+            "应返回明确的中断文案"
+        );
+    }
+
+    #[test]
+    fn disk_recovery_returns_original_error_for_failed_state_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::api::review_state::write_failed(
+            dir.path(),
+            "doc-failed-before-restart",
+            "审核引擎执行失败: LLM 超时",
+            || "2026-08-27T00:00:00Z".to_string(),
+        )
+        .expect("write failed state");
+
+        let recovered = disk_recovery("1", "doc-failed-before-restart", dir.path())
+            .expect("failed 状态文件应被识别");
+
+        assert_eq!(recovered.status, "failed");
+        assert_eq!(
+            recovered.error.as_deref(),
+            Some("审核引擎执行失败: LLM 超时"),
+            "应透传原始失败原因"
+        );
+    }
+
+    #[test]
+    fn disk_recovery_returns_none_without_any_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            disk_recovery("1", "doc-nothing", dir.path()).is_none(),
+            "无结果文件也无状态文件时应返回 None（404）"
+        );
+    }
+
+    #[test]
+    fn disk_recovery_prefers_completed_result_over_state_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let completed: ReviewResultResponse = ReviewResultResponse {
+            status: "completed".to_string(),
+            result: Some(ReviewResponse {
+                document_id: "doc-done".to_string(),
+                findings: Vec::new(),
+                routing_summary: crate::agents::types::RoutingSummary {
+                    total_clauses: 1,
+                    agent_clause_counts: HashMap::new(),
+                    high_risk_count: 0,
+                    legal_verify_count: 0,
+                    blind_spot_findings: 0,
+                },
+                execution_summary: crate::agents::types::ExecutionSummary::default(),
+                graph_snapshot: None,
+            }),
+            error: None,
+            usage: None,
+        };
+        std::fs::write(
+            dir.path().join("doc-done_result.json"),
+            serde_json::to_string(&completed).expect("serialize result"),
+        )
+        .expect("write result.json");
+        // 陈旧 running 状态文件（模拟完成写盘后、删状态文件前崩溃）
+        crate::api::review_state::write_running(
+            dir.path(),
+            "doc-done",
+            || "2026-08-27T00:00:00Z".to_string(),
+        )
+        .expect("write stale running state");
+
+        let recovered = disk_recovery("1", "doc-done", dir.path())
+            .expect("completed 结果优先于状态文件");
+        assert_eq!(recovered.status, "completed", "已完成结果必须优先");
     }
 }
 

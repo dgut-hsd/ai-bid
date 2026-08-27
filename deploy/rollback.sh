@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 回滚：把代码切回上一个「成功部署」的版本，重新构建并上线。
-# 用法：./rollback.sh               回退到上一个成功部署版本
-#       ./rollback.sh <commit-hash> 回退到指定 commit
+# 用法：./rollback.sh                   回退到上一个成功部署版本
+#       ./rollback.sh <commit-hash>     回退到指定 commit
+#       ./rollback.sh <commit-hash> --force  存在在途审核时强制回滚（会中断审核！）
 
 set -euo pipefail
 
@@ -28,6 +29,16 @@ fi
 # 校验目标存在
 if ! git cat-file -e "$TARGET^{commit}" 2>/dev/null; then
     echo "❌ 目标版本不存在：$TARGET"
+    exit 1
+fi
+
+# ── 发布护栏：回滚同样会重建 Rust，存在在途审核时需明确 --force ──
+# 必须在 git checkout 之前拦截，避免中止后工作区已切换。
+# rollback.sh 的参数 1 是 commit，--force 在参数 2
+source "$DEPLOY_DIR/lib/audit-guard.sh"
+if ! audit_guard_ensure_idle "${2:-}"; then
+    echo ""
+    echo "❌ 回滚已中止（存在进行中的审核任务）。"
     exit 1
 fi
 

@@ -26,13 +26,21 @@ RUN cargo build --release --bin server
 FROM debian:bookworm-slim
 
 # 运行时依赖：ca-certificates（HTTPS）+ libssl3 + libgomp1（ONNX 动态库的 OpenMP）
+# LibreOffice 用于 DOCX/DOC → PDF 转换（fonts-noto-cjk 避免中文标书转 PDF 乱码/豆腐块）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 libgomp1 \
+    libreoffice-core libreoffice-writer fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
+
+# 专用非 root 系统用户：供 docx_convert_service 以非 root 身份运行 soffice（安全加固）
+RUN useradd -r -s /usr/sbin/nologin -m -d /home/soffice soffice
 
 WORKDIR /app
 
 COPY --from=build /app/target/release/server /usr/local/bin/server
+
+# 规则库数据（conditions.yaml / catalog.yaml）—— 引擎按 CARGO_MANIFEST_DIR=/app 定位 /app/src/rules/data，必须拷入
+COPY src/rules/data /app/src/rules/data
 
 # 数据目录（中间产物、.env 等），宿主机挂卷
 VOLUME /data
