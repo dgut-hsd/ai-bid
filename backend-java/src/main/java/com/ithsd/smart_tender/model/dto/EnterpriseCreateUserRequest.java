@@ -23,7 +23,6 @@ public class EnterpriseCreateUserRequest implements Serializable {
     @JsonProperty("real_name")
     @NotBlank
     @Size(min = 1, max = 50)
-    @JsonProperty("real_name")
     private String realName;
 
     /** 角色：ADMIN / MEMBER（不允许 OWNER，OWNER 只能平台分配/转移） */
