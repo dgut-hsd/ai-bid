@@ -30,7 +30,7 @@ interface ChangePasswordFormValues {
 }
 
 export const HeaderToolbar: React.FC<HeaderToolbarProps> = ({ isMobile }) => {
-  const { theme: antdTheme } = useHeaderStyle();
+  const { styles, theme: antdTheme } = useHeaderStyle();
   const dispatch = useDispatch();
   const navigate = useNavigate();
   const { theme, setTheme } = useTheme();
@@ -93,6 +93,10 @@ export const HeaderToolbar: React.FC<HeaderToolbarProps> = ({ isMobile }) => {
     },
   ];
 
+  // 优先展示真实姓名，缺失时回退到登录账号
+  const displayName = userInfo?.realName || userInfo?.username || '未知用户';
+  const avatarChar = displayName.charAt(0).toUpperCase();
+
   return (
     <Space size='small' align='center'>
       {/* ── 主题切换 ───────────────────────────────────────────── */}
@@ -111,25 +115,17 @@ export const HeaderToolbar: React.FC<HeaderToolbarProps> = ({ isMobile }) => {
         placement='bottomRight'
         arrow
       >
-        <Space style={{ cursor: 'pointer', padding: '0 4px' }}>
+        <Space size={8} align='center' className={styles.userTrigger}>
           <Avatar
             size={isMobile ? 'default' : 'small'}
             style={{ backgroundColor: antdTheme.colorPrimary }}
           >
-            {userInfo?.username?.charAt(0)?.toUpperCase() || <User size={14} />}
+            {userInfo ? avatarChar : <User size={14} />}
           </Avatar>
 
           {!isMobile && (
-            <span
-              style={{
-                fontSize: 12,
-                color: antdTheme.colorTextBase,
-                lineHeight: 1,
-                display: 'inline-flex',
-                alignItems: 'center',
-              }}
-            >
-              {userInfo?.username || '未知用户'}
+            <span style={{ fontSize: 13, color: antdTheme.colorTextBase, lineHeight: 1 }}>
+              {displayName}
             </span>
           )}
         </Space>

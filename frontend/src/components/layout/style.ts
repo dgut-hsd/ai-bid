@@ -12,6 +12,8 @@ export const useHeaderStyle = createStyles(({ token, css }) => ({
       height: 6vh;
       min-height: 50px !important;
       max-height: 60px !important;
+      /* 覆盖 antd Header 默认 line-height:64px，避免头像与左侧信息不在同一水平线 */
+      line-height: normal;
       top: 0;
       z-index: 999;
    `,
@@ -27,6 +29,17 @@ export const useHeaderStyle = createStyles(({ token, css }) => ({
       &:hover {
          color: ${token.colorPrimary}; /* Hover 时变为主题绿 */
          background-color: ${token.colorFillTertiary}; /* Hover 时加一点极浅的底色反馈 */
+      }
+   `,
+   userTrigger: css`
+      cursor: pointer;
+      padding: 4px 8px;
+      line-height: 1;
+      border-radius: 6px;
+      transition: background-color 0.2s ease;
+
+      &:hover {
+         background-color: ${token.colorFillTertiary};
       }
    `,
 }));
