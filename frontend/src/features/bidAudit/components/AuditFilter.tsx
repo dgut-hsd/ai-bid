@@ -4,14 +4,18 @@ import { useDebounce } from '@/hooks/useDebounce';
 
 import { ResponsiveRangePicker } from '@/components/ResponsiveRangePicker/ResponsiveRangePicker';
 
-import type { AuditListQueryParams, FileCategory } from '../types';
+import type {
+   AuditListQueryParams,
+   FileCategory,
+   FileCategoryCode,
+} from '../types';
 import { Form, Row, Col, Input, Select, Button, Space } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import dayjs from 'dayjs';
 
-const FILE_CATEGORY_CONFIG: { value: FileCategory; label: FileCategory }[] = [
-   { value: '标书', label: '标书' },
-   { value: '合同', label: '合同' },
+const FILE_CATEGORY_CONFIG: { value: FileCategoryCode; label: FileCategory }[] = [
+   { value: 'bid', label: '标书' },
+   { value: 'contract', label: '合同' },
 ];
 
 interface AuditFilterProps {
@@ -47,7 +51,7 @@ export const AuditFilter: React.FC<AuditFilterProps> = ({
 
    interface FormValues {
       bidName?: string;
-      fileCategory?: FileCategory;
+      fileCategory?: FileCategoryCode;
       uploadDateRange?: [dayjs.Dayjs, dayjs.Dayjs];
    }
 

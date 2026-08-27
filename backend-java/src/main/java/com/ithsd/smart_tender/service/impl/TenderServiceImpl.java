@@ -69,7 +69,7 @@ public class TenderServiceImpl implements TenderService {
         wrapper.eq("tenant_id", tenantId);
         // 动态查询条件，与page接口保持一致（除status外）
         wrapper.like(StringUtils.hasText(dto.getBidName()), "bid_name", dto.getBidName());
-        wrapper.eq(StringUtils.hasText(dto.getFileCategory()), "bid_type", dto.getFileCategory());
+        wrapper.eq(StringUtils.hasText(dto.getFileCategory()), "file_category", dto.getFileCategory());
         // 统计时不能根据 status 过滤，否则只能统计到单一状态的数量
 
         // 加上当前用户的限制
