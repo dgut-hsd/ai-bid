@@ -7,14 +7,16 @@ import {
    Descriptions,
    Button,
    List,
-   Tag,
+   Popconfirm,
+   Space,
    type DescriptionsProps,
 } from 'antd';
 
 import { useNavigate } from 'react-router-dom';
 
-import type { ParseStatusType, ProjectItem } from '@/features/bidAudit/types';
-import { CloseOutlined } from '@ant-design/icons';
+import { StatusTag } from '@/features/bidAudit/components/StatusTag';
+import type { ProjectItem } from '@/features/bidAudit/types';
+import { CloseOutlined, PlusOutlined } from '@ant-design/icons';
 import { useIsMobile } from '@/hooks/useMediaQuery';
 import { EllipsisTooltip } from '@/components/EllipsisTooltip/EllipsisTooltip';
 import dayjs from 'dayjs';
@@ -24,20 +26,22 @@ interface VersionDrawerProps {
    onClose: () => void;
    versions: ProjectItem[];
    isFetching: boolean;
+   /** 所属项目 ID（用于「上传新版本」跳转）；老调用方可省略 */
+   projectId?: number | null;
+   onDeleteVersion?: (versionId: number) => void;
+   deletingVersionId?: number | null;
+   isDeletingVersion?: boolean;
 }
-
-const parseStatusMap: Record<ParseStatusType, { text: string; color: string }> = {
-   0: { text: '待审核', color: 'blue' },
-   1: { text: '审核中', color: 'orange' },
-   2: { text: '审核完成', color: 'green' },
-   3: { text: '审核失败', color: 'red' },
-};
 
 export const VersionDrawer = ({
    open,
    onClose,
    versions,
    isFetching,
+   projectId,
+   onDeleteVersion,
+   deletingVersionId,
+   isDeletingVersion,
 }: VersionDrawerProps) => {
    const cardRefs = useRef<(HTMLDivElement | null)[]>([]);
    const navigate = useNavigate();
@@ -50,36 +54,6 @@ export const VersionDrawer = ({
          behavior: 'smooth',
          block: 'start',
       });
-   };
-
-   const parseStatusTag = (
-      parseStatus: ParseStatusType,
-      auditResult?: string | null
-   ) => {
-      if (parseStatus === 2) {
-         if (auditResult === 'pass') {
-            return (
-               <Tag color='green'>
-                  审核完成-通过
-               </Tag>
-            );
-         }
-         return (
-            <Tag color='gold'>
-               审核完成-需修改
-            </Tag>
-         );
-      }
-      const config = parseStatusMap[parseStatus] || {
-         text: '未知',
-         color: 'default',
-      };
-
-      return (
-         <Tag color={config.color}>
-            {config.text}
-         </Tag>
-      );
    };
 
    const getDescriptionsItems = (
@@ -103,7 +77,12 @@ export const VersionDrawer = ({
       {
          key: 'parseStatus',
          label: '审核状态',
-         children: parseStatusTag(item.parseStatus, item.auditResult),
+         children: (
+            <StatusTag
+               parseStatus={item.parseStatus}
+               auditResult={item.auditResult}
+            />
+         ),
       },
       { key: 'auditorName', label: '审核人', children: item.auditorName },
    ];
@@ -114,6 +93,17 @@ export const VersionDrawer = ({
          open={open}
          onClose={onClose}
          placement={isMobile ? 'top' : 'right'}
+         extra={
+            projectId != null ? (
+               <Button
+                  type='primary'
+                  icon={<PlusOutlined />}
+                  onClick={() => navigate(`/upload/${projectId}`)}
+               >
+                  上传新版本
+               </Button>
+            ) : null
+         }
          closeIcon={
             <CloseOutlined
                style={{
@@ -168,16 +158,41 @@ export const VersionDrawer = ({
                            <Card
                               title={`V${item.version}`}
                               extra={
-                                 <Button
-                                    style={{ fontSize: '1.2rem' }}
-                                    onClick={() =>
-                                       navigate(`/bidReview/detail/${item.id}`)
-                                    }
-                                 >
-                                    {index === 0 && item.parseStatus === 0
-                                       ? '进入审核'
-                                       : '查看审核详情'}
-                                 </Button>
+                                 <Space size='small'>
+                                    <Button
+                                       style={{ fontSize: '1.2rem' }}
+                                       onClick={() =>
+                                          navigate(`/bidReview/detail/${item.id}`)
+                                       }
+                                    >
+                                       {index === 0 && item.parseStatus === 0
+                                          ? '进入审核'
+                                          : '查看审核详情'}
+                                    </Button>
+
+                                    {onDeleteVersion && (
+                                       <Popconfirm
+                                          title='确定删除该版本吗？'
+                                          description='删除后不可恢复。'
+                                          okText='删除'
+                                          cancelText='取消'
+                                          okButtonProps={{ danger: true }}
+                                          onConfirm={() =>
+                                             onDeleteVersion(item.id)
+                                          }
+                                       >
+                                          <Button
+                                             danger
+                                             loading={
+                                                isDeletingVersion &&
+                                                deletingVersionId === item.id
+                                             }
+                                          >
+                                             删除版本
+                                          </Button>
+                                       </Popconfirm>
+                                    )}
+                                 </Space>
                               }
                               styles={{
                                  header: { padding: '1rem 1.25rem' },

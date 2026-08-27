@@ -7,6 +7,7 @@ import {
   ExportOutlined,
   EyeOutlined,
   LoadingOutlined,
+  UploadOutlined,
 } from '@ant-design/icons';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useStyles } from '../../style';
@@ -258,6 +259,15 @@ const BidAnalysis: React.FC<BidAnalysisProps> = ({
         items={tabItems}
         style={{ width: '100%', height: '100%' }}
         tabBarStyle={{ width: '100%' }}
+        tabBarExtraContent={
+          <Button
+            size='small'
+            icon={<UploadOutlined />}
+            onClick={() => navigate(`/upload/${projectId}`)}
+          >
+            上传新版本
+          </Button>
+        }
       />
 
       <ReasoningDrawer

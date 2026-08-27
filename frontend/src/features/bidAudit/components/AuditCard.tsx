@@ -1,7 +1,9 @@
 import React from 'react';
 import { Tag, Button, Popconfirm } from 'antd';
-import { EyeOutlined, DeleteOutlined } from '@ant-design/icons';
+import { EyeOutlined, DeleteOutlined, UploadOutlined } from '@ant-design/icons';
+import { useNavigate } from 'react-router-dom';
 import dayjs from 'dayjs';
+import { StatusTag } from './StatusTag';
 import type { ProjectItem } from '../types';
 
 interface AuditCardProps {
@@ -19,6 +21,7 @@ export const AuditCard: React.FC<AuditCardProps> = ({
    onDelete,
    styles,
 }) => {
+   const navigate = useNavigate();
    const uploadDate = record.uploadTime
       ? dayjs(record.uploadTime).format('YYYY-MM-DD HH:mm')
       : '-';
@@ -28,15 +31,15 @@ export const AuditCard: React.FC<AuditCardProps> = ({
          <div className={styles.auditCardHeader}>
             <span className={styles.auditCardName}>{record.bidName || '-'}</span>
             <div className={styles.auditCardBadges}>
-               <Tag color='green' style={{ margin: 0 }}>
-                  {record.fileCategory ?? '-'}
-               </Tag>
-               <Tag style={{ margin: 0 }}>v{record.version}</Tag>
+               <StatusTag
+                  parseStatus={record.parseStatus}
+                  auditResult={record.auditResult}
+               />
+               <Tag style={{ margin: 0 }}>V{record.version}</Tag>
             </div>
          </div>
 
          <div className={styles.auditCardMeta}>
-            <span>供应商：{record.supplierName || '-'}</span>
             <span>审核人：{record.auditorName || '-'}</span>
             <span>上传：{uploadDate}</span>
          </div>
@@ -52,6 +55,18 @@ export const AuditCard: React.FC<AuditCardProps> = ({
                }}
             >
                查看
+            </Button>
+
+            <Button
+               type='link'
+               size='small'
+               icon={<UploadOutlined />}
+               onClick={(e) => {
+                  e.stopPropagation();
+                  navigate(`/upload/${record.projectId}`);
+               }}
+            >
+               上传新版本
             </Button>
 
             <Popconfirm

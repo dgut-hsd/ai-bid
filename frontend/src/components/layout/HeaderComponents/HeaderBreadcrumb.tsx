@@ -5,9 +5,8 @@ import { useQuery } from '@tanstack/react-query';
 import { bidOptions } from '@/api/bid';
 
 const breadcrumbNameMap: Record<string, string> = {
-   '/dashboard': '工作台',
    '/upload': '文件上传',
-   '/bidReview': '审核列表',
+   '/bidReview': '招标文件',
    '/library': '标准库管理',
 };
 
@@ -28,11 +27,9 @@ export const HeaderBreadcrumb: React.FC = () => {
    const { data: bidDetail, isLoading } = useQuery(bidOptions.detail(safeBidId));
 
    const breadcrumbItems = useMemo(() => {
-      const crumbs = [{ label: '工作台', path: '/dashboard' }];
+      const crumbs = [{ label: '招标文件', path: '/bidReview' }];
 
       if (location.pathname.startsWith('/bidReview')) {
-         crumbs.push({ label: '审核列表', path: '/bidReview' });
-
          if (safeBidId) {
             const label = isLoading
                ? '加载中...'
@@ -60,7 +57,7 @@ export const HeaderBreadcrumb: React.FC = () => {
 
          pathSnippets.forEach((_, index) => {
             const url = `/${pathSnippets.slice(0, index + 1).join('/')}`;
-            if (breadcrumbNameMap[url] && url !== '/dashboard') {
+            if (breadcrumbNameMap[url] && url !== '/bidReview') {
                crumbs.push({ label: breadcrumbNameMap[url], path: url });
             }
          });

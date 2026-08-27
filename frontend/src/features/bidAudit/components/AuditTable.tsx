@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Table, Pagination, Spin, Empty, Skeleton } from 'antd';
+import { Table, Pagination, Spin, Empty, Skeleton, App } from 'antd';
 import { useQuery } from '@tanstack/react-query';
 
 import { VersionDrawer } from '@/components/VersionDrawer/VersionDrawer';
@@ -7,7 +7,7 @@ import { useIsMobile } from '@/hooks/useMediaQuery';
 
 import { useAuditListTableColumns } from '../hooks/useAuditListTableColumns';
 import { AuditCard } from './AuditCard';
-import { auditListOptions } from '../api/auditList';
+import { auditListOptions, useDeleteTenderVersion } from '../api/auditList';
 import type { ProjectItem } from '../types';
 
 interface AuditTableProps {
@@ -34,18 +34,40 @@ export const AuditTable: React.FC<AuditTableProps> = ({
    isDeletingProject,
 }) => {
    const isMobile = useIsMobile();
+   const { message } = App.useApp();
    const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
    const [selectedProject, setSelectedProject] = useState<number | null>(null);
+   const [deletingVersionId, setDeletingVersionId] = useState<number | null>(
+      null
+   );
 
    const { data: versions, isFetching: isVersionsFetching } = useQuery({
       ...auditListOptions.detail(selectedProject),
       enabled: !!selectedProject,
    });
 
+   const { mutate: deleteVersionMutation, isPending: isDeletingVersion } =
+      useDeleteTenderVersion();
+
+   const handleDeleteVersion = (versionId: number) => {
+      setDeletingVersionId(versionId);
+      deleteVersionMutation(versionId, {
+         onSuccess: () => {
+            message.success('版本删除成功');
+         },
+         onError: (error) => {
+            message.error(
+               error instanceof Error ? error.message : '版本删除失败，请稍后重试'
+            );
+         },
+         onSettled: () => {
+            setDeletingVersionId(null);
+         },
+      });
+   };
+
    const columns = useAuditListTableColumns({
       styles,
-      setIsDrawerOpen,
-      setSelectedProject,
       handleDeleteProject,
       deletingProjectId,
       isDeletingProject,
@@ -62,6 +84,10 @@ export const AuditTable: React.FC<AuditTableProps> = ({
          onClose={() => setIsDrawerOpen(false)}
          versions={versions ?? []}
          isFetching={isVersionsFetching}
+         projectId={selectedProject}
+         onDeleteVersion={handleDeleteVersion}
+         deletingVersionId={deletingVersionId}
+         isDeletingVersion={isDeletingVersion}
       />
    );
 

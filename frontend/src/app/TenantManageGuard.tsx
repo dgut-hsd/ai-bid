@@ -11,7 +11,7 @@ export function TenantManageGuard() {
    const tenantList = useSelector((state: RootState) => state.auth.tenantList);
 
    if (!canAccessTenantManage(tenantList)) {
-      return <Navigate to='/dashboard' replace />;
+      return <Navigate to='/bidReview' replace />;
    }
 
    return <Outlet />;
