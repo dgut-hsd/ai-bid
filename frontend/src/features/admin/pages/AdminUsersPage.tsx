@@ -11,11 +11,12 @@ import {
   App,
   Card,
   Typography,
-  Popconfirm,
+  Dropdown,
 } from 'antd';
-import { PlusOutlined, KeyOutlined, UserDeleteOutlined, EditOutlined } from '@ant-design/icons';
+import { PlusOutlined, KeyOutlined, UserDeleteOutlined, EditOutlined, MoreOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useIsMobile } from '@/hooks/useMediaQuery';
 import { adminApi } from '../api/admin';
 import type { AdminUser, AdminRole, CreateUserParams } from '../types';
 
@@ -27,7 +28,7 @@ const ROLE_LABEL: Record<AdminRole, { text: string; color: string }> = {
 };
 
 export const AdminUsersPage: React.FC = () => {
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const queryClient = useQueryClient();
 
   const [createModalOpen, setCreateModalOpen] = React.useState(false);
@@ -36,6 +37,7 @@ export const AdminUsersPage: React.FC = () => {
   const [createForm] = Form.useForm<CreateUserParams>();
   const [resetForm] = Form.useForm<{ password: string }>();
   const [editForm] = Form.useForm<{ username: string; real_name: string }>();
+  const isMobile = useIsMobile();
 
   const usersQuery = useQuery({
     queryKey: ['admin-users'],
@@ -150,53 +152,75 @@ export const AdminUsersPage: React.FC = () => {
       title: '创建时间',
       dataIndex: 'created_at',
       key: 'created_at',
+      responsive: ['md', 'lg', 'xl', 'xxl'],
       render: (t?: string) => (t ? new Date(t).toLocaleString('zh-CN') : '-'),
     },
     {
       title: '操作',
       key: 'action',
-      width: 180,
-      render: (_: unknown, record: AdminUser) => (
-        <Space>
-          <Button
-            size='small'
-            type='link'
-            icon={<EditOutlined />}
-            onClick={() => {
-              setEditTarget(record);
-              editForm.setFieldsValue({
-                username: record.username,
-                real_name: record.real_name ?? '',
-              });
-            }}
-          >
-            编辑
-          </Button>
-          <Button
-            size='small'
-            type='link'
-            icon={<KeyOutlined />}
-            onClick={() => {
-              setResetTarget(record);
-              resetForm.resetFields();
-            }}
-          >
-            重置密码
-          </Button>
-          <Popconfirm
-            title={`确定移除「${record.real_name || record.username}」吗？`}
-            description='移除后该账号将被停用，无法再登录。'
-            okText='移除'
-            cancelText='取消'
-            okButtonProps={{ danger: true }}
-            onConfirm={() => removeMutation.mutate(record.user_id)}
-          >
-            <Button size='small' type='link' danger icon={<UserDeleteOutlined />}>
+      width: isMobile ? 76 : 180,
+      fixed: 'right',
+      render: (_: unknown, record: AdminUser) => {
+        const editAction = () => {
+          setEditTarget(record);
+          editForm.setFieldsValue({
+            username: record.username,
+            real_name: record.real_name ?? '',
+          });
+        };
+        const resetAction = () => {
+          setResetTarget(record);
+          resetForm.resetFields();
+        };
+        const removeAction = () => {
+          modal.confirm({
+            title: `确定移除「${record.real_name || record.username}」吗？`,
+            content: '移除后该账号将被停用，无法再登录。',
+            okText: '移除',
+            cancelText: '取消',
+            okButtonProps: { danger: true },
+            onOk: () => removeMutation.mutate(record.user_id),
+          });
+        };
+
+        // 手机端：三个操作合并进「更多」下拉，点击展开
+        if (isMobile) {
+          return (
+            <Dropdown
+              trigger={['click']}
+              menu={{
+                items: [
+                  { key: 'edit', icon: <EditOutlined />, label: '编辑', onClick: editAction },
+                  { key: 'reset', icon: <KeyOutlined />, label: '重置密码', onClick: resetAction },
+                  {
+                    key: 'remove',
+                    icon: <UserDeleteOutlined />,
+                    danger: true,
+                    label: '移除',
+                    onClick: removeAction,
+                  },
+                ],
+              }}
+            >
+              <Button size='small' aria-label='更多操作' icon={<MoreOutlined />} />
+            </Dropdown>
+          );
+        }
+
+        return (
+          <Space>
+            <Button size='small' type='link' icon={<EditOutlined />} onClick={editAction}>
+              编辑
+            </Button>
+            <Button size='small' type='link' icon={<KeyOutlined />} onClick={resetAction}>
+              重置密码
+            </Button>
+            <Button size='small' type='link' danger icon={<UserDeleteOutlined />} onClick={removeAction}>
               移除
             </Button>
-          </Popconfirm>
-        </Space>
-      ),
+          </Space>
+        );
+      },
     },
   ];
 
@@ -228,6 +252,7 @@ export const AdminUsersPage: React.FC = () => {
           loading={usersQuery.isLoading}
           pagination={false}
           size='middle'
+          scroll={{ x: 'max-content' }}
         />
       </Card>
 
