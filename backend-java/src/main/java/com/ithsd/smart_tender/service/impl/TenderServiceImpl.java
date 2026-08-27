@@ -5,8 +5,10 @@ import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.ithsd.smart_tender.common.BaseContext;
 import com.ithsd.smart_tender.common.BizException;
+import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
 import com.ithsd.smart_tender.mapper.TenderMapper;
+import com.ithsd.smart_tender.model.entity.AuditIssue;
 import com.ithsd.smart_tender.model.entity.AuditTask;
 import com.ithsd.smart_tender.model.enums.AuditTaskStatusEnum;
 import com.ithsd.smart_tender.mapper.UserMapper;
@@ -46,14 +48,16 @@ public class TenderServiceImpl implements TenderService {
 
     private final TenderMapper tenderMapper;
     private final AuditTaskMapper auditTaskMapper;
+    private final AuditIssueMapper auditIssueMapper;
     private final UserMapper userMapper;
     private final com.ithsd.smart_tender.mapper.ProjectMapper projectMapper;
     private final AuditTaskService auditTaskService;
     private final StoragePathService storagePathService;
 
-    public TenderServiceImpl(TenderMapper tenderMapper, AuditTaskMapper auditTaskMapper, UserMapper userMapper, com.ithsd.smart_tender.mapper.ProjectMapper projectMapper, @Lazy AuditTaskService auditTaskService, StoragePathService storagePathService) {
+    public TenderServiceImpl(TenderMapper tenderMapper, AuditTaskMapper auditTaskMapper, AuditIssueMapper auditIssueMapper, UserMapper userMapper, com.ithsd.smart_tender.mapper.ProjectMapper projectMapper, @Lazy AuditTaskService auditTaskService, StoragePathService storagePathService) {
         this.tenderMapper = tenderMapper;
         this.auditTaskMapper = auditTaskMapper;
+        this.auditIssueMapper = auditIssueMapper;
         this.userMapper = userMapper;
         this.projectMapper = projectMapper;
         this.auditTaskService = auditTaskService;
@@ -173,13 +177,14 @@ public class TenderServiceImpl implements TenderService {
             tender.setUploadUserId(1L);
         }
         tender.setUploadTime(LocalDateTime.now());
-        if (tender.getVersion() == null) {
-            tender.setVersion(1); // 默认版本号为1
-        }
+        // 版本号由系统自动递增：同项目已有最大版本 + 1（首个版本为 V1）。
+        // 前端不再参与版本编号，避免用户手填版本号导致重复或乱序。
+        tender.setVersion(nextVersionForProject(tenderDTO.getProjectId(), tenantId));
         if(tenderDTO.getFileCategory() != null && !tenderDTO.getFileCategory().isEmpty()) {
-            tender.setFileCategory(tenderDTO.getFileCategory().equals("标书")?"bid":"contract");
+            // 文件角色：招标文件/标书 → bid；合同 → contract（本期以招标文件为主）
+            tender.setFileCategory("合同".equals(tenderDTO.getFileCategory()) || "contract".equals(tenderDTO.getFileCategory()) ? "contract" : "bid");
         } else {
-            tender.setFileCategory("bid"); // 默认类型
+            tender.setFileCategory("bid"); // 默认类型：招标文件
         }
 
         tender.setProjectId(tenderDTO.getProjectId());
@@ -212,6 +217,23 @@ public class TenderServiceImpl implements TenderService {
                     .eq(Project::getId, projectId)
                     .eq(Project::getTenantId, tenantId));
         }
+    }
+
+    /**
+     * 计算项目下一个可用版本号：同项目已有最大版本 + 1（没有则首版 V1）。
+     * 版本由服务端统一自动生成，前端不参与编号。
+     */
+    private Integer nextVersionForProject(Long projectId, Long tenantId) {
+        if (projectId == null) {
+            return 1;
+        }
+        LambdaQueryWrapper<Tender> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(Tender::getProjectId, projectId)
+               .eq(Tender::getTenantId, tenantId)
+               .orderByDesc(Tender::getVersion)
+               .last("LIMIT 1");
+        Tender latestTender = tenderMapper.selectOne(wrapper);
+        return (latestTender != null && latestTender.getVersion() != null ? latestTender.getVersion() : 0) + 1;
     }
 
     @Override
@@ -274,9 +296,19 @@ public class TenderServiceImpl implements TenderService {
         }).collect(Collectors.toList());
 
         if (dto.getStatus() != null) {
-            final Integer targetStatus = dto.getStatus();
+            final Integer s = dto.getStatus();
             vos = vos.stream()
-                    .filter(vo -> targetStatus.equals(vo.getParseStatus()))
+                    .filter(vo -> {
+                        int ps = vo.getParseStatus() == null ? 0 : vo.getParseStatus();
+                        switch (s) {
+                            case 1: return ps == 1;                                                 // 审核中
+                            case 2: return ps == 2 && "pass".equals(vo.getAuditResult());          // 已通过
+                            case 3: return ps == 3;                                                 // 审核失败
+                            case 4: return ps == 2 && !"pass".equals(vo.getAuditResult());          // 需修改
+                            case 0:
+                            default: return ps == 0;                                                // 待审核
+                        }
+                    })
                     .collect(Collectors.toList());
         }
 
@@ -414,11 +446,24 @@ public class TenderServiceImpl implements TenderService {
         if (task == null) {
             return null;
         }
-        // auditResult 已废弃，基于 taskStatus 映射结果
+        // 基于 taskStatus + 是否发现风险点映射结果：
+        // 完成且无风险点 → 已通过(pass)；完成但有风险点 → 需修改(reject)
         Integer status = task.getTaskStatus();
-        if (AuditTaskStatusEnum.COMPLETED.getCode().equals(status)) return "pass";
+        if (AuditTaskStatusEnum.COMPLETED.getCode().equals(status)) {
+            return hasIssues(task.getId()) ? "reject" : "pass";
+        }
         if (AuditTaskStatusEnum.FAILED.getCode().equals(status)) return "reject";
         return "pending";
+    }
+
+    /** 审核完成后是否产生过风险点（audit_issue 存在记录即视为「需修改」） */
+    private boolean hasIssues(Long auditId) {
+        if (auditId == null) {
+            return false;
+        }
+        Long count = auditIssueMapper.selectCount(new LambdaQueryWrapper<AuditIssue>()
+                .eq(AuditIssue::getAuditId, auditId));
+        return count != null && count > 0;
     }
 
     @Override
