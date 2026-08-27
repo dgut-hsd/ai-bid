@@ -3,7 +3,7 @@ package com.ithsd.smart_tender.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ithsd.smart_tender.common.TenantAuthException;
 import com.ithsd.smart_tender.common.TenantRequestContext;
-import com.ithsd.smart_tender.common.util.MD5Util;
+import com.ithsd.smart_tender.common.util.PasswordService;
 import com.ithsd.smart_tender.mapper.TenantMemberMapper;
 import com.ithsd.smart_tender.mapper.UserMapper;
 import com.ithsd.smart_tender.model.dto.AdminCreateUserRequest;
@@ -36,6 +36,7 @@ public class AdminUserServiceImpl implements AdminUserService {
     private final TenantMemberMapper tenantMemberMapper;
     private final TenantAuthorizationService authorization;
     private final TenantSessionStore tenantSessionStore;
+    private final PasswordService passwordService;
 
     /** 只有企业 OWNER 能进入系统管理并操作用户。 */
     private TenantRequestContext requireOwner() {
@@ -77,7 +78,7 @@ public class AdminUserServiceImpl implements AdminUserService {
         LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
         User user = User.builder()
                 .username(username)
-                .password(MD5Util.encrypt(request.getPassword()))
+                .password(passwordService.encode(request.getPassword()))
                 .realName(request.getRealName().trim())
                 .status(1)
                 .createTime(now)
@@ -150,7 +151,7 @@ public class AdminUserServiceImpl implements AdminUserService {
     public void resetPassword(Long userId, String newPassword) {
         TenantRequestContext context = requireOwner();
         User user = requireMemberUser(userId, context);
-        user.setPassword(MD5Util.encrypt(newPassword));
+        user.setPassword(passwordService.encode(newPassword));
         user.setUpdateTime(LocalDateTime.now(ZoneOffset.UTC));
         userMapper.updateById(user);
         tenantSessionStore.deleteByUserId(user.getId());

@@ -1,7 +1,7 @@
 package com.ithsd.smart_tender.config;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.ithsd.smart_tender.common.util.MD5Util;
+import com.ithsd.smart_tender.common.util.PasswordService;
 import com.ithsd.smart_tender.mapper.TenantMapper;
 import com.ithsd.smart_tender.mapper.TenantMemberMapper;
 import com.ithsd.smart_tender.mapper.UserMapper;
@@ -37,6 +37,7 @@ public class EnterpriseBootstrap implements ApplicationRunner {
     private final TenantMapper tenantMapper;
     private final TenantMemberMapper tenantMemberMapper;
     private final UserMapper userMapper;
+    private final PasswordService passwordService;
 
     @Value("${app.bootstrap.enabled:true}")
     private boolean enabled;
@@ -71,7 +72,7 @@ public class EnterpriseBootstrap implements ApplicationRunner {
             LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
             admin = User.builder()
                     .username(adminUsername)
-                    .password(MD5Util.encrypt(adminPassword))
+                    .password(passwordService.encode(adminPassword))
                     .realName(adminRealName)
                     .status(1)
                     .createTime(now)
