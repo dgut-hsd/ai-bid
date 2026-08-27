@@ -545,7 +545,7 @@ interface AnalysisListProps {
    /** 审核任务 ID（用于 bbox API 调用） */
    taskId?: string | null;
    /** BBox-based 精确高亮回调（优先于文本匹配） */
-   onLocateBboxes?: (page: number, bboxes: BBoxData[]) => void;
+   onLocateBboxes?: (page: number, bboxes: BBoxData[], highlightText?: string, fallbackTokens?: string[]) => void;
 }
 
 /** 高亮模式配置：auto=优先BBox失败回落 | bbox=仅BBox | text=仅文本匹配 */
@@ -663,22 +663,23 @@ export const AnalysisList: React.FC<AnalysisListProps> = React.memo(
                target.blockIds.length > 0 &&
                taskId &&
                onLocateBboxes;
+            // 文本定位素材提前计算：bbox 路径也要用作「文本层精确收敛」的 source_quote
+            const parsedDesc = parseIssueText(target.description);
+            const hl = buildHighlightText(
+               target,
+               buildIssueExplanation(target, parsedDesc?.rationale || sanitizeDisplayText(target.description)),
+               target.category || '审查问题'
+            );
+            const tokens = Array.isArray(target.anchorTokens)
+               ? target.anchorTokens.map((t) => String(t || '').trim()).filter(Boolean).slice(0, 5)
+               : [];
             const fallback = () => {
-               const p = parseIssueText(target.description);
-               const hl = buildHighlightText(
-                  target,
-                  buildIssueExplanation(target, p?.rationale || sanitizeDisplayText(target.description)),
-                  target.category || '审查问题'
-               );
-               const tokens = Array.isArray(target.anchorTokens)
-                  ? target.anchorTokens.map((t) => String(t || '').trim()).filter(Boolean).slice(0, 5)
-                  : [];
                onLocateIssuePage(normalizedPage, hl, tokens);
             };
             if (useBbox) {
                fetchBlockBboxes(taskId!, target.blockIds!)
                   .then((bboxes) => {
-                     if (bboxes.length > 0) onLocateBboxes!(normalizedPage, bboxes);
+                     if (bboxes.length > 0) onLocateBboxes!(normalizedPage, bboxes, hl, tokens);
                      else if (HIGHLIGHT_MODE === 'auto') fallback();
                   })
                   .catch(() => {

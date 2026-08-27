@@ -34,7 +34,7 @@ services:
         condition: service_started
     environment:
       # MySQL（覆盖 application.yml 的 localhost 连接）
-      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-smart_tender_system}?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8&useSSL=false&allowPublicKeyRetrieval=true&socketTimeout=30000&connectTimeout=5000"
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-smart_tender_system}?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8&useSSL=false&allowPublicKeyRetrieval=true&socketTimeout=60000&connectTimeout=5000"
       SPRING_DATASOURCE_USERNAME: ${MYSQL_USER:-root}
       SPRING_DATASOURCE_PASSWORD: ${MYSQL_ROOT_PASSWORD:-1234}
       # Redis（覆盖 localhost）
@@ -119,6 +119,13 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
+      # 降低落盘频次：写突发时 InnoDB 每秒一次 fsync 而非每次提交都 fsync，
+      # 避免瞬时卡顿（极端断电最多丢最近 ~1s 已提交事务，数据文件不损坏）
+      - --innodb-flush-log-at-trx-commit=2
+      - --sync-binlog=0
+      # 打开慢查询日志，便于下次定位具体是哪条 SQL 卡住
+      - --slow-query-log=1
+      - --long-query-time=2
     ports:
       - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
     volumes:

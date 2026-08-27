@@ -42,7 +42,7 @@ interface BidAnalysisProps {
   currentFileName?: string;
   currentFileId?: number;
   /** BBox-based 精确高亮回调（AnalysisList → DetailPage → PdfPreview） */
-  onLocateBboxes?: (page: number, bboxes: import('../../components/PDFPreview/PdfPreview').BBoxData[]) => void;
+  onLocateBboxes?: (page: number, bboxes: import('../../components/PDFPreview/PdfPreview').BBoxData[], highlightText?: string, fallbackTokens?: string[]) => void;
   agentProgresses?: Map<string, AgentProgress>;
   liveFeedEvents?: TraceEventType[];
   phaseEvent?: PhaseEvent | null;

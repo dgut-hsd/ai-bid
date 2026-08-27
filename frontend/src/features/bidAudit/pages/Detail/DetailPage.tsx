@@ -62,8 +62,8 @@ export const DetailPage: React.FC = () => {
       if (isMobile) setMobileView('pdf');
    }, [isMobile]);
 
-   const handleLocateBboxes = React.useCallback((page: number, bboxes: BBoxData[]) => {
-      pdfPreviewRef.current?.highlightBboxes(page, bboxes);
+   const handleLocateBboxes = React.useCallback((page: number, bboxes: BBoxData[], highlightText?: string, fallbackTokens?: string[]) => {
+      pdfPreviewRef.current?.highlightBboxes(page, bboxes, highlightText, fallbackTokens);
       if (isMobile) setMobileView('pdf');
    }, [isMobile]);
 
