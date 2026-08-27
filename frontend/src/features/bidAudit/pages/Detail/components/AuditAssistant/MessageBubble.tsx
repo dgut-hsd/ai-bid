@@ -284,7 +284,10 @@ export const MessageBubble: React.FC<{ message: ChatMessage }> = React.memo(
           >
             {/* ── Reasoning chain (AI messages only) ── */}
             {!isUser && message.reasoning && message.reasoning.length > 0 && (
-              <details open style={{ marginBottom: 12 }}>
+              <details
+                open={message.status === 'streaming' && !message.content}
+                style={{ marginBottom: 12 }}
+              >
                 <summary style={{
                   fontSize: 12,
                   color: token.colorTextSecondary,
