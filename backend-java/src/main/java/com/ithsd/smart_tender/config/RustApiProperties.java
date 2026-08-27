@@ -24,8 +24,8 @@ public class RustApiProperties {
     /** 启动时是否校验 Rust 健康检查，默认 true */
     private boolean healthCheckEnabled = true;
 
-    /** 异步审核等待超时（分钟），默认 30 */
-    private int reviewTimeoutMinutes = 30;
+    /** 异步审核等待超时（分钟），默认 60；可由环境变量 RUST_REVIEW_TIMEOUT_MINUTES 覆盖 */
+    private int reviewTimeoutMinutes = 60;
 
     /**
      * 启动审核（POST /review）请求的整体超时（毫秒），默认 30000。

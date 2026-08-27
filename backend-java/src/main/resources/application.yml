@@ -147,5 +147,7 @@ rust:
     read-timeout-ms: 900000
     # 启动审核（POST /review）的整体请求超时，独立于连接超时
     review-start-timeout-ms: 30000
+    # 异步审核总超时（分钟），大标书可调大；未配置回退默认 60
+    review-timeout-minutes: ${RUST_REVIEW_TIMEOUT_MINUTES:60}
     health-check-enabled: true
     internal-secret: ${RUST_API_INTERNAL_SECRET:dev-internal-secret-key-2024}

@@ -44,6 +44,8 @@ services:
       # Rust 引擎（覆盖 127.0.0.1 → 容器服务名）
       RUST_API_BASE_URL: http://backend-rust:3001
       RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
+      # Rust 审核总超时（分钟），大标书（如 92 页）需 >30；不设则回退 60
+      RUST_REVIEW_TIMEOUT_MINUTES: "${RUST_REVIEW_TIMEOUT_MINUTES:-60}"
       # JWT 密钥
       ST_JWT_SECRET: ${ST_JWT_SECRET:-local-test-only-jwt-secret-change-me}
       # 初始管理员密码（仅新装首次建号时使用；已存在的 admin 手动在 DB 改）
