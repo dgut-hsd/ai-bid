@@ -81,6 +81,8 @@ services:
       # 必须监听 0.0.0.0，否则 Java 容器访问不到（默认是 127.0.0.1）
       AIBID_RUST_BIND: 0.0.0.0:3001
       AIBID_DATA_DIR: /data
+      # Python pdfplumber 兜底脚本的可执行文件（容器只有 python3，没有 python 软链）
+      AI_BID_PYTHON_EXECUTABLE: python3
       # LLM
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       DASHSCOPE_MODEL: ${DASHSCOPE_MODEL:-qwen-turbo}
