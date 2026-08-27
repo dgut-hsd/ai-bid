@@ -175,7 +175,9 @@ public class ProjectServiceImpl implements ProjectService {
             );
 
             if (!tenders.isEmpty()) {
-                pVO.setFileCategory(tenders.get(0).getFileCategory());
+                // 文件类型：DB 存英文码(bid/contract)，前端要中文标签(标书/合同)
+                String rawCategory = tenders.get(0).getFileCategory();
+                pVO.setFileCategory("bid".equals(rawCategory) ? "标书" : "合同");
             }
 
             List<TenderWithAuditVO> tenderWithAuditVOs = new ArrayList<>();

@@ -455,8 +455,9 @@ public class TenderServiceImpl implements TenderService {
             Tender latestTender = tenderMapper.selectOne(tenderWrapper);
 
             if (latestTender != null) {
-                // 找到标书，设置标书类型
-                vo.setFileCategory(latestTender.getFileCategory());
+                // 找到标书，设置标书类型（DB 存英文码 bid/contract → 前端中文标签 标书/合同）
+                String rawCategory = latestTender.getFileCategory();
+                vo.setFileCategory("bid".equals(rawCategory) ? "标书" : "合同");
                 
                 // 3. 查最新版本标书的审核人
                 LambdaQueryWrapper<AuditTask> taskWrapper = new LambdaQueryWrapper<>();
