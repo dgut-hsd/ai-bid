@@ -429,6 +429,9 @@ export const useAuditTask = (bidId?: number) => {
          try {
             const status = await getAuditStatus(taskId);
             if (stopped) return;
+            // 防御：后端异常/响应缺失 data 时 getAuditStatus 返回 undefined，
+            // 仅跳过本轮，不计入「连续轮询失败」，避免错误停止整个轮询。
+            if (!status) return;
 
             setProgress(status.progress || 0);
             if (status.stage) setCurrentStage(status.stage);
