@@ -1,6 +1,7 @@
-# 依赖服务 Compose：MySQL + Redis + doc-converter + Qdrant（原 Milvus 4 服务已删除）
+# 依赖服务 Compose：MySQL + Redis + Qdrant + Neo4j
+# 向量检索统一走 Qdrant；Milvus/etcd/MinIO/Attu 已彻底移除（历史遗留，与代码不符）。
 services:
-  # MySQL（保留原配置，供 Spring Boot 使用）
+  # MySQL（供 Spring Boot 使用）
   mysql:
     container_name: ${ST_MYSQL_CONTAINER:-smart-mysql}
     image: ${ST_MYSQL_IMAGE:-mysql:8.0}
@@ -16,88 +17,6 @@ services:
     networks:
       - qdrant-network
 
-  # Redis（保留原配置，供 Spring Boot 使用）
-
-  # Etcd 配置中心（Milvus 依赖）
-  etcd:
-    container_name: milvus-etcd
-    image: milvusdb/etcd:3.5.5-r2
-    volumes:
-      - ${ST_DATA_ROOT:-/opt/smart-tender/data}/milvus/etcd:/etcd
-    environment:
-      - ETCD_AUTO_COMPACTION_MODE=revision
-      - ETCD_AUTO_COMPACTION_RETENTION=1000
-      - ETCD_QUOTA_BACKEND_BYTES=4294967296
-      - ETCD_SNAPSHOT_COUNT=50000
-      - ALLOW_NONE_AUTHENTICATION=yes
-      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
-      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
-    healthcheck:
-      test: ["CMD", "etcdctl", "endpoint", "health"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-    networks:
-      - milvus-network
-
-  # MinIO 存储服务（Milvus 依赖）
-  minio:
-    container_name: milvus-minio
-    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
-    environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-    ports:
-      - "9001:9001"
-      - "9000:9000"
-    volumes:
-      - ${ST_DATA_ROOT:-/opt/smart-tender/data}/milvus/minio:/minio_data
-    command: minio server /minio_data --console-address ":9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-    networks:
-      - milvus-network
-
-  # Milvus 核心服务
-  milvus-standalone:
-    container_name: milvus-standalone
-    image: milvusdb/milvus:v2.6.11
-    command: ["milvus", "run", "standalone"]
-    environment:
-      ETCD_ENDPOINTS: milvus-etcd:2379
-      MINIO_ADDRESS: milvus-minio:9000
-    volumes:
-      - ${ST_DATA_ROOT:-/opt/smart-tender/data}/milvus/data:/var/lib/milvus
-    ports:
-      - "19530:19530"
-      - "9091:9091"
-    depends_on:
-      etcd:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-    networks:
-      - milvus-network
-
-  # Attu 可视化控制台（Milvus Web UI）
-  attu:
-    container_name: milvus-attu
-    image: zilliz/attu:v2.3.8
-    ports:
-      - "3002:3000"
-    environment:
-      MILVUS_URL: milvus-standalone:19530
-      MILVUS_USERNAME: ""
-      MILVUS_PASSWORD: ""
-    depends_on:
-      milvus-standalone:
-        condition: service_started
-    networks:
-      - milvus-network
-
   # Redis（供 Spring Boot 使用）
   redis:
     container_name: smart-redis
@@ -110,9 +29,8 @@ services:
     networks:
       - qdrant-network
 
-  # 文档转换服务（保留原配置，JODConverter + LibreOffice）
+  # 文档转换服务（JODConverter + LibreOffice）
   # 注：ghcr.io/jodconverter 镜像国内拉取困难，暂时注释；docx 转换走 Rust 侧
-  # doc-converter 已停用期间，docx/doc 上传可依赖 Rust docx_convert_service 直接转换
   # doc-converter:
   #   container_name: doc-converter
   #   image: ghcr.io/jodconverter/jodconverter-examples:rest
@@ -141,7 +59,7 @@ services:
     container_name: my-neo4j
     image: neo4j:5.21
     environment:
-      NEO4J_AUTH: neo4j/b1234567
+      NEO4J_AUTH: ${ST_NEO4J_AUTH:-neo4j/b1234567}
       NEO4J_apoc_export_file_enabled: "true"
       NEO4J_apoc_import_file_enabled: "true"
       NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
@@ -153,12 +71,9 @@ services:
       - ${ST_DATA_ROOT:-/opt/smart-tender/data}/neo4j/logs:/logs
       - ${ST_DATA_ROOT:-/opt/smart-tender/data}/neo4j/plugins:/plugins
     networks:
-      - milvus-network
+      - qdrant-network
 
 networks:
   qdrant-network:
     name: qdrant-network
-    driver: bridge
-  milvus-network:
-    name: milvus-network
     driver: bridge

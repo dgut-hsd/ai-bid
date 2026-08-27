@@ -63,18 +63,17 @@ security:
     ttl-millis: ${ST_JWT_TTL_MILLIS:86400000}
     accept-legacy-user-id: false
 
-# 私有化单企业部署初始化：首次启动自动创建「财务部门」租户和初始管理员。
-# 默认账号 admin / 密码 123456（与历史种子 sql/test_data.sql 一致；仅在新装且
-# admin 不存在时创建，不会覆盖已存在账号的密码）。生产安装务必通过
-# AIBID_BOOTSTRAP_ADMIN_PASSWORD 覆盖默认密码，并在首次登录后修改。
+# 平台管理员（系统管理者）初始化：首次启动只播种 is_platform_admin=1 的系统管理者
+# 账号，供其登录后进入「系统管理」页管理所有企业；企业不再由启动器自动创建。
+# 默认账号 platform-admin / 密码 123456（仅在新装且该账号不存在时创建，不会覆盖
+# 已存在账号）。生产安装务必通过 AIBID_PLATFORM_ADMIN_PASSWORD 覆盖默认密码，
+# 并在首次登录后立即修改。
 app:
   bootstrap:
     enabled: ${AIBID_BOOTSTRAP_ENABLED:true}
-    tenant-code: ${AIBID_BOOTSTRAP_TENANT_CODE:finance}
-    tenant-name: ${AIBID_BOOTSTRAP_TENANT_NAME:财务部门}
-    admin-username: ${AIBID_BOOTSTRAP_ADMIN_USERNAME:admin}
-    admin-password: ${AIBID_BOOTSTRAP_ADMIN_PASSWORD:123456}
-    admin-realname: ${AIBID_BOOTSTRAP_ADMIN_REALNAME:系统管理员}
+    platform-username: ${AIBID_PLATFORM_ADMIN_USERNAME:platform-admin}
+    platform-password: ${AIBID_PLATFORM_ADMIN_PASSWORD:123456}
+    platform-realname: ${AIBID_PLATFORM_ADMIN_REALNAME:系统管理员}
 
 # 文件存储配置
 file:

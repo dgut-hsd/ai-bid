@@ -19,8 +19,8 @@ const STATUS_TAB_ITEMS = [
    { key: 'all', label: '全部' },
    { key: '0', label: '待审核' },
    { key: '1', label: '审核中' },
-   { key: '2', label: '已完成' },
-   { key: '3', label: '审核失败' },
+   { key: '2', label: '已通过' },
+   { key: '4', label: '需修改' },
 ];
 
 interface NewProjectFormValues {

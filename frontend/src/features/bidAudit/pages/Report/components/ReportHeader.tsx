@@ -1,7 +1,6 @@
 import React from 'react';
-import { Button, Slider, Tooltip, Space, Typography } from 'antd';
+import { Button, Slider, Space, Typography } from 'antd';
 import {
-   PrinterOutlined,
    FileWordOutlined,
    ArrowLeftOutlined,
    ZoomInOutlined,
@@ -39,18 +38,8 @@ export const ReportHeader: React.FC<ReportHeaderProps> = ({
 
    return (
       <header className={styles.headerContainer}>
-         {/* 左侧：打印与缩放 */}
+         {/* 左侧：缩放 */}
          <Space size='large'>
-            <Tooltip title='打印报告 (Ctrl+P)'>
-               <Button
-                  icon={<PrinterOutlined />}
-                  onClick={() => window.print()}
-                  aria-label='打印'
-               >
-                  打印
-               </Button>
-            </Tooltip>
-
             <div className={styles.zoomControl}>
                <ZoomOutOutlined
                   style={{ cursor: 'pointer' }}

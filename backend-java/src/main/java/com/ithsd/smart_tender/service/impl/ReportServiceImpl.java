@@ -101,11 +101,13 @@ public class ReportServiceImpl implements ReportService {
         wrapper.eq("audit_id", auditId)
                 .eq("tenant_id", tenantId);
         AuditReport report = auditReportMapper.selectOne(wrapper);
-        
+
+        // 报告尚未生成（任务存在但无 audit_report 记录）时返回 null，
+        // 由前端据此触发 generateReport；不要抛 404 阻断首次生成流程。
         if (report == null) {
-            throw TenantScope.resourceNotFound();
+            return null;
         }
-        
+
         return report.getDocContent();
     }
 

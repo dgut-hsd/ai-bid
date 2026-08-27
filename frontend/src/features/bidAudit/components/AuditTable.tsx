@@ -1,12 +1,9 @@
 import React, { useState } from 'react';
-import { Table, Pagination, Spin, Empty, Skeleton, App } from 'antd';
+import { Table, App } from 'antd';
 import { useQuery } from '@tanstack/react-query';
 
 import { VersionDrawer } from '@/components/VersionDrawer/VersionDrawer';
-import { useIsMobile } from '@/hooks/useMediaQuery';
-
 import { useAuditListTableColumns } from '../hooks/useAuditListTableColumns';
-import { AuditCard } from './AuditCard';
 import { auditListOptions, useDeleteTenderVersion } from '../api/auditList';
 import type { ProjectItem } from '../types';
 
@@ -33,7 +30,6 @@ export const AuditTable: React.FC<AuditTableProps> = ({
    deletingProjectId,
    isDeletingProject,
 }) => {
-   const isMobile = useIsMobile();
    const { message } = App.useApp();
    const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
    const [selectedProject, setSelectedProject] = useState<number | null>(null);
@@ -173,7 +169,16 @@ export const AuditTable: React.FC<AuditTableProps> = ({
             }}
          />
 
-         {versionsDrawer}
+         <VersionDrawer
+            open={isDrawerOpen}
+            onClose={() => setIsDrawerOpen(false)}
+            versions={versions ?? []}
+            isFetching={isVersionsFetching}
+            projectId={selectedProject}
+            onDeleteVersion={handleDeleteVersion}
+            deletingVersionId={deletingVersionId}
+            isDeletingVersion={isDeletingVersion}
+         />
       </div>
    );
 };

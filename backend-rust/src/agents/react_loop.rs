@@ -2617,6 +2617,7 @@ mod multi_finding_tests {
             page_end: 0,
             tier: RiskTier::Low,
             tier_max_turns: 1,
+            source_block_ids: vec![],
         }];
 
         let report = review_clauses_parallel_report(
@@ -2697,6 +2698,7 @@ mod multi_finding_tests {
                 page_end: 0,
                 tier: RiskTier::Low,
                 tier_max_turns: 1,
+                source_block_ids: vec![],
             },
             ReviewClause {
                 chunk_id: "ch_002".to_string(),
@@ -2706,6 +2708,7 @@ mod multi_finding_tests {
                 page_end: 0,
                 tier: RiskTier::Low,
                 tier_max_turns: 1,
+                source_block_ids: vec![],
             },
         ];
         let factory = {
@@ -2772,6 +2775,7 @@ mod multi_finding_tests {
                 page_end: 0,
                 tier: RiskTier::Low,
                 tier_max_turns: 1,
+                source_block_ids: vec![],
             },
             ReviewClause {
                 chunk_id: "ch_timeout".to_string(),
@@ -2781,6 +2785,7 @@ mod multi_finding_tests {
                 page_end: 0,
                 tier: RiskTier::Low,
                 tier_max_turns: 1,
+                source_block_ids: vec![],
             },
         ];
         let limiter = Arc::new(

@@ -118,6 +118,10 @@ pub enum ReviewEvent {
         page_number: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         section_path: Option<Vec<String>>,
+        /// 关联的原始 block_id（框架从 clause.source_block_ids 聚合），
+        /// 供前端流式阶段直接查 bbox 画高亮框；空 Vec 表示无坐标可回退。
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        block_ids: Vec<String>,
     },
 
     /// Finding 被更新
@@ -351,12 +355,14 @@ mod tests {
             lifecycle: FindingLifecycle::Verified,
             page_number: Some(3),
             section_path: Some(vec!["技术要求".to_string()]),
+            block_ids: vec!["b_3_1".to_string(), "b_3_2".to_string()],
         });
 
         let msg = rx.try_recv().expect("应收到消息");
         assert!(msg.contains("finding_added"));
         assert!(msg.contains("R_001"));
         assert!(msg.contains("high"));
+        assert!(msg.contains("b_3_1"));
     }
 
     #[test]

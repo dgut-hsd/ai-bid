@@ -9,6 +9,8 @@ export interface AuthUserInfo {
   user_id: string;
   username: string;
   real_name: string;
+  /** 是否平台管理员（系统管理者），用于门控「系统管理」入口。 */
+  is_platform_admin?: boolean;
 }
 
 export interface TenantSummary {

@@ -2,9 +2,11 @@ import { describe, it, expect } from 'vitest';
 import {
   mapBackendFinding,
   mapBackendFindings,
+  mapFindingAddedEvent,
   isBackendFormat,
   ensureAuditIssue,
 } from './mapFinding';
+import type { FindingAddedEvent } from '@/types/audit';
 
 // ─── 样本数据 ───
 
@@ -293,5 +295,47 @@ describe('ensureAuditIssue', () => {
     const result = ensureAuditIssue(hybrid as any);
     // isBackendFormat returns false because issueNo exists, so returned as-is
     expect(result).toBe(hybrid);
+  });
+});
+
+describe('mapFindingAddedEvent', () => {
+  it('maps block_ids to blockIds for live bbox highlight', () => {
+    const event: FindingAddedEvent = {
+      risk_id: 'R1',
+      severity: 'high',
+      risk_type: '品牌指定',
+      agent: 'FactCheckAgent',
+      confidence: 0.9,
+      clause_ids: ['ch_001'],
+      source_quote: '须选用华为',
+      legal_basis: [],
+      reason: '构成品牌指定',
+      suggestion: '改为参数要求',
+      lifecycle: 'verified',
+      page_number: 3,
+      section_path: ['第三章'],
+      block_ids: ['b_3_1', 'b_3_2'],
+    };
+    const result = mapFindingAddedEvent(event);
+    expect(result.blockIds).toEqual(['b_3_1', 'b_3_2']);
+    expect(result.anchorPage).toBe(3);
+  });
+
+  it('falls back to empty blockIds when block_ids absent', () => {
+    const event = {
+      risk_id: 'R2',
+      severity: 'low',
+      risk_type: '格式',
+      agent: 'A',
+      confidence: 0.5,
+      clause_ids: ['ch_002'],
+      source_quote: 'x',
+      legal_basis: [],
+      reason: 'r',
+      suggestion: 's',
+      lifecycle: 'verified',
+    } as FindingAddedEvent;
+    const result = mapFindingAddedEvent(event);
+    expect(result.blockIds).toEqual([]);
   });
 });

@@ -6,11 +6,12 @@ import {
    FileSearch,
    BookOpen,
    Users,
+   Building2,
 } from 'lucide-react';
 
 import { useSidebarStyle } from './style';
 import type { RootState } from '../../store';
-import { isCurrentTenantOwner } from '../../features/admin/access';
+import { isCurrentTenantOwner } from '../../features/enterprise/access';
 import bidAuditLogo from '../../assets/bid-audit.svg';
 
 const { Sider } = Layout;
@@ -20,22 +21,37 @@ const BASE_NAV_ITEMS = [
    { key: '/library', icon: <BookOpen size={18} />, label: '标准库管理' },
 ];
 
-const ADMIN_ITEM = {
-   key: '/admin/users',
-   icon: <Users size={18} />,
+const PLATFORM_ITEM = {
+   key: '/platform/enterprises',
+   icon: <Building2 size={18} />,
    label: '系统管理',
 };
 
+const ENTERPRISE_ITEM = {
+   key: '/enterprise/users',
+   icon: <Users size={18} />,
+   label: '企业管理',
+};
+
 /**
- * 只有企业 OWNER 才能看到「系统管理」入口；普通 MEMBER 隐藏。
+ * 平台管理员看到「系统管理」，企业 OWNER 看到「企业管理」；两者可同时出现，普通成员都不显示。
  */
 function useNavItems() {
-   const { tenantList, currentTenantId } = useSelector(
+   const { tenantList, currentTenantId, isPlatformAdmin } = useSelector(
       (state: RootState) => state.auth
    );
-   return isCurrentTenantOwner(tenantList, currentTenantId)
-      ? [...BASE_NAV_ITEMS, ADMIN_ITEM]
-      : BASE_NAV_ITEMS;
+   const items = [];
+   if (isPlatformAdmin) {
+      items.push(PLATFORM_ITEM);
+   }
+   // 业务菜单依赖租户上下文：无任何租户的系统管理者只看「系统管理」。
+   if (tenantList.length > 0) {
+      items.push(...BASE_NAV_ITEMS);
+      if (isCurrentTenantOwner(tenantList, currentTenantId)) {
+         items.push(ENTERPRISE_ITEM);
+      }
+   }
+   return items;
 }
 
 export const Sidebar: React.FC<{ collapsed: boolean }> = ({ collapsed }) => {
@@ -50,8 +66,11 @@ export const Sidebar: React.FC<{ collapsed: boolean }> = ({ collapsed }) => {
       if (pathname.startsWith('/bidReview')) {
          return ['/bidReview'];
       }
-      if (pathname.startsWith('/admin')) {
-         return ['/admin/users'];
+      if (pathname.startsWith('/platform')) {
+         return ['/platform/enterprises'];
+      }
+      if (pathname.startsWith('/enterprise')) {
+         return ['/enterprise/users'];
       }
       return [pathname];
    };

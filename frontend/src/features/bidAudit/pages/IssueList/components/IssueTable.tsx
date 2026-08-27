@@ -56,28 +56,13 @@ export const IssueTable: React.FC<IssueTableProps> = ({
             onReset={handleReset}
          />
 
-         {isMobile ? (
-            issues.length > 0 ? (
-               <div className={styles.issueCardList}>
-                  {issues.map((issue) => (
-                     <IssueCard key={issue.issueNo} issue={issue} />
-                  ))}
-               </div>
-            ) : (
-               <Empty
-                  description='暂无符合条件的审核问题'
-                  style={{ padding: '32px 0' }}
-               />
-            )
-         ) : (
-            <Table<AuditIssue>
-               columns={columns}
-               dataSource={issues}
-               rowKey='issueNo'
-               pagination={false}
-               scroll={{ x: 'max-content' }}
-            />
-         )}
+         <Table<AuditIssue>
+            columns={columns}
+            dataSource={issues}
+            rowKey='issueNo'
+            pagination={false}
+            scroll={{ x: 'max-content' }}
+         />
 
          <div className={styles.paginationArea}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>

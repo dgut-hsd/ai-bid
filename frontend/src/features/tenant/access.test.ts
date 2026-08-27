@@ -15,10 +15,10 @@ describe('canAccessTenantManage', () => {
       expect(canAccessTenantManage(tenants)).toBe(true);
    });
 
-   it('拒绝仅担任 MEMBER / AUDITOR / VIEWER 的用户', () => {
+   it('拒绝仅担任 MEMBER 的用户', () => {
       const tenants: TenantSummary[] = [
          { tenant_id: '20001', name: 'A', role: 'MEMBER' },
-         { tenant_id: '20002', name: 'B', role: 'VIEWER' },
+         { tenant_id: '20002', name: 'B', role: 'MEMBER' },
       ];
       expect(canAccessTenantManage(tenants)).toBe(false);
    });

@@ -23,18 +23,10 @@ public class ReportController {
     public Result<ReportVO> getReport(@PathVariable String taskIdOrAuditId) {
         String content = reportService.getReportContent(taskIdOrAuditId);
         if (content == null) {
-            return Result.error("报告不存在");
+            // 报告尚未生成：返回空数据，前端据此触发 generateReport
+            return Result.success(null);
         }
-        Long resolvedAuditId;
-        try {
-            resolvedAuditId = Long.parseLong(taskIdOrAuditId);
-        } catch (NumberFormatException ex) {
-            resolvedAuditId = null;
-        }
-        ReportVO vo = ReportVO.builder()
-                .auditId(resolvedAuditId)
-                .docContent(content)
-                .build();
+        ReportVO vo = ReportVO.builder().docContent(content).build();
         return Result.success(vo);
     }
 }

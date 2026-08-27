@@ -3,12 +3,11 @@ package com.ithsd.smart_tender.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ithsd.smart_tender.mapper.UserMapper;
 import com.ithsd.smart_tender.model.dto.UserLoginDTO;
-import com.ithsd.smart_tender.model.dto.UserRegisterDTO;
 import com.ithsd.smart_tender.model.entity.User;
 import com.ithsd.smart_tender.service.UserService;
 import com.ithsd.smart_tender.service.TenantSessionStore;
 import com.ithsd.smart_tender.common.BizException;
-import com.ithsd.smart_tender.common.util.MD5Util;
+import com.ithsd.smart_tender.common.util.PasswordService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import java.time.LocalDateTime;
@@ -19,6 +18,7 @@ public class UserServiceImpl implements UserService {
 
     private final UserMapper userMapper;
     private final TenantSessionStore tenantSessionStore;
+    private final PasswordService passwordService;
 
     @Override
     public User login(UserLoginDTO userLoginDTO) {
@@ -31,48 +31,18 @@ public class UserServiceImpl implements UserService {
         }
         
         String password = userLoginDTO.getPassword();
-        password = MD5Util.encrypt(password);
-
-        if (!user.getPassword().equals(password)) {
+        if (!passwordService.matches(password, user.getPassword())) {
             throw new RuntimeException("账号或密码错误");
         }
         if (user.getStatus() == 0) {
             throw new RuntimeException("账户已被禁用");
         }
+        // 历史无盐 MD5 哈希在首次成功登录后透明升级为 BCrypt（S2）
+        if (passwordService.requiresRehash(user.getPassword())) {
+            user.setPassword(passwordService.encode(password));
+            userMapper.updateById(user);
+        }
         return user;
-    }
-
-    @Override
-    public void register(UserRegisterDTO userRegisterDTO) {
-        LambdaQueryWrapper<User> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(User::getUsername, userRegisterDTO.getUsername());
-        User existUser = userMapper.selectOne(wrapper);
-        
-        if (existUser != null) {
-            throw new BizException("用户名已存在");
-        }
-
-        LambdaQueryWrapper<User> phoneWrapper = new LambdaQueryWrapper<>();
-        phoneWrapper.eq(User::getPhone, userRegisterDTO.getPhone());
-        User existPhone = userMapper.selectOne(phoneWrapper);
-        if (existPhone != null) {
-             throw new BizException("手机号已存在");
-        }
-
-        String password = userRegisterDTO.getPassword();
-        password = MD5Util.encrypt(password);
-
-        User user = User.builder()
-                .username(userRegisterDTO.getUsername())
-                .password(password)
-                .realName(userRegisterDTO.getRealName())
-                .email(userRegisterDTO.getEmail())
-                .phone(userRegisterDTO.getPhone())
-                .status(1)
-                .createTime(LocalDateTime.now())
-                .updateTime(LocalDateTime.now())
-                .build();
-        userMapper.insert(user);
     }
 
     @Override
@@ -81,10 +51,10 @@ public class UserServiceImpl implements UserService {
         if (user == null) {
             throw new BizException(404, "用户不存在");
         }
-        if (!user.getPassword().equals(MD5Util.encrypt(oldPassword))) {
+        if (!passwordService.matches(oldPassword, user.getPassword())) {
             throw new BizException(400, "原密码错误");
         }
-        user.setPassword(MD5Util.encrypt(newPassword));
+        user.setPassword(passwordService.encode(newPassword));
         user.setUpdateTime(LocalDateTime.now());
         userMapper.updateById(user);
         // 使旧会话失效，改密后需重新登录

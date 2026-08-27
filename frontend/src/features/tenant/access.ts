@@ -9,7 +9,7 @@ const MANAGEMENT_ROLES = new Set(['OWNER', 'ADMIN']);
  * 规则：
  * - 尚未加入任何租户 → 允许（用于创建首个租户的引导）。
  * - 至少在一个租户中担任 OWNER / ADMIN → 允许。
- * - 其它（仅 MEMBER / AUDITOR / VIEWER）→ 不允许。
+ * - 其它（仅 MEMBER）→ 不允许。
  */
 export function canAccessTenantManage(tenantList: TenantSummary[]): boolean {
    if (!tenantList || tenantList.length === 0) {

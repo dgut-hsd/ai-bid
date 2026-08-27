@@ -229,11 +229,6 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
    // ── PDF 懒渲染：只挂载可视区附近及被标记的页，避免 120 页一次性全量渲染 ──
    const [renderedPages, setRenderedPages] = React.useState<Set<number>>(() => new Set([1]));
 
-   // ── 容器宽度：手机端 PDF 按屏幕取合适比例，桌面端仍以 800px 作为 100% 基准 ──
-   const [containerWidth, setContainerWidth] = React.useState(0);
-   const fitWidth = containerWidth > 0 ? Math.min(containerWidth, 800) : 800;
-   const pageWidth = fitWidth * scale;
-
    const markPageRendered = React.useCallback((page: number) => {
       setRenderedPages((prev) => {
          if (!page || prev.has(page)) return prev;
@@ -790,17 +785,6 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
       container.querySelectorAll('[data-page-num]').forEach((el) => observer.observe(el));
       return () => observer.disconnect();
    }, [numPages, isPdf, containerRef, markPageRendered]);
-
-   // 容器宽度自适应：监听 pdfScrollArea 尺寸，旋转/缩放窗口时重排 PDF 页宽
-   React.useLayoutEffect(() => {
-      const container = containerRef.current;
-      if (!container) return;
-      const update = () => setContainerWidth(container.clientWidth);
-      update();
-      const ro = new ResizeObserver(update);
-      ro.observe(container);
-      return () => ro.disconnect();
-   }, [containerRef, isPdf]);
 
    React.useImperativeHandle(
       ref,

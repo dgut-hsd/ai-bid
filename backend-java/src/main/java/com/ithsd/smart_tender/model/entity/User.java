@@ -1,6 +1,7 @@
 package com.ithsd.smart_tender.model.entity;
 
 import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import lombok.AllArgsConstructor;
@@ -24,6 +25,8 @@ public class User implements Serializable {
     private String email;
     private String phone;
     private Integer status; // 1: Enable, 0: Disable
+    @TableField("is_platform_admin")
+    private Boolean isPlatformAdmin;
     private LocalDateTime createTime;
     private LocalDateTime updateTime;
 }

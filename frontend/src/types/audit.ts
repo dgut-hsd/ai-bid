@@ -396,6 +396,8 @@ export interface FindingAddedEvent {
   lifecycle: FindingLifecycle;
   page_number?: number;
   section_path?: string[];
+  /** 关联的原始 block_id（Rust 流式补发，用于直接查 bbox 画高亮框） */
+  block_ids?: string[];
 }
 
 /** 对齐 Rust ReviewEvent::FindingUpdated */
