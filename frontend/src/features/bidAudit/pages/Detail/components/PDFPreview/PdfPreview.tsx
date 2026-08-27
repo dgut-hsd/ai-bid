@@ -51,8 +51,13 @@ type PageTextIndex = {
 
 export interface PdfPreviewRef {
    jumpToPage: (page: number, highlightText?: string, fallbackTokens?: string[]) => void;
-   /** BBox-based 精确高亮：直接按坐标渲染高亮矩形（PDF points → DOM 像素） */
-   highlightBboxes: (page: number, bboxes: BBoxData[]) => void;
+   /** BBox-based 高亮：先按坐标渲染整段框，再用文本层把框精确收敛到 source_quote 那一句 */
+   highlightBboxes: (
+      page: number,
+      bboxes: BBoxData[],
+      highlightText?: string,
+      fallbackTokens?: string[]
+   ) => void;
 }
 
 const normalizeHighlightText = (value?: string): string => {
@@ -880,8 +885,13 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
                scrollFirstHitIntoView(page);
             }, 140);
          },
-         /** BBox-based 精确高亮：跳过文本搜索，直接按坐标渲染矩形 overlay。 */
-         highlightBboxes: (page: number, bboxes: BBoxData[]) => {
+         /** BBox-based 高亮：先按坐标渲染整段框，再用文本层把框精确收敛到 source_quote 那一句。 */
+         highlightBboxes: (
+            page: number,
+            bboxes: BBoxData[],
+            highlightText?: string,
+            fallbackTokens?: string[]
+         ) => {
             if (!bboxes.length || page == null || page < 0) return;
 
             // 1. 跳到"主"目标页用于滚动定位；【不再清空】其它页已有高亮
@@ -938,6 +948,24 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
                setHighlightStatus('exact_hit');
                const total = Object.values(newBoxesByPage).reduce((s, a) => s + a.length, 0);
                console.info('[pdf-highlight] engine=bbox groups=%s boxes=%s', groups.size, total);
+
+                // 2d. ★ 文本层精确收敛：block 是段落级，整段框太大。
+                //     用 source_quote 在文本层定位具体字符 span，把框缩到那一句；失败则保留整段框兜底。
+                const narrowedText = normalizeHighlightText(highlightText);
+                if (narrowedText) {
+                   const narrowedTokens = normalizeTokenList(fallbackTokens);
+                   window.setTimeout(async () => {
+                      const ok = await applyPdfJsHighlights(
+                         page,
+                         narrowedText,
+                         narrowedTokens,
+                         { silent: true, maxMatches: 6 }
+                      );
+                      if (ok) {
+                         console.info('[pdf-highlight] bbox → 文本层精确收敛命中');
+                      }
+                   }, 30);
+                }
 
                // 3. 滚动到主目标页第一个高亮
                window.setTimeout(() => {
