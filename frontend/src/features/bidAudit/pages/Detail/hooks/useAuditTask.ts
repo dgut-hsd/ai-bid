@@ -5,10 +5,11 @@ import {
    connectStream,
    getAuditResult,
    getAuditStatus,
+   getAuditStatusByBid,
 } from '../api/auditDetail';
 import type {
   AuditIssue, AgentProgress, TraceEvent,
-  PhaseEvent, StatsEvent,
+  PhaseEvent, StatsEvent, AuditStatus,
   FindingAddedEvent, FindingUpdatedEvent, FindingRemovedEvent,
 } from '@/types/audit';
 import { ensureAuditIssue, mapFindingAddedEvent } from '../../../utils/mapFinding';
@@ -167,21 +168,53 @@ export const useAuditTask = (bidId?: number) => {
             setHydrated(true);
             return;
          }
-         if (!taskId) {
-            setHydrated(true);
-            return;
-         }
          if (shouldConnectStream) {
             setHydrated(true);
             return;
          }
+
          try {
-            const status = await getAuditStatus(taskId);
-            if (cancelled) return;
-            const completed = status.status === 'completed';
+            // P1: 服务端裁决当前任务（优先 bidId），localStorage 仅作缓存提示。
+            let status: AuditStatus | null = null;
+            if (typeof bidId === 'number' && !Number.isNaN(bidId)) {
+               status = await getAuditStatusByBid(bidId);
+               if (cancelled) return;
+               if (status?.taskId) {
+                  setTaskId(status.taskId);
+                  if (storageKey) {
+                     try {
+                        localStorage.setItem(storageKey, JSON.stringify({
+                           taskId: status.taskId,
+                           startedAt: Date.now(),
+                        }));
+                     } catch { /* ignore */ }
+                  }
+               } else {
+                  // 该文档从未发起审核 → 准备审核
+                  setTaskId(null);
+                  setIssues([]);
+                  setProgress(0);
+                  setCurrentStage('准备开始审核...');
+                  setIsComplete(false);
+                  setShouldConnectStream(false);
+                  setHasStartedAudit(false);
+                  setError(null);
+                  setHydrated(true);
+                  return;
+               }
+            } else if (taskId) {
+               status = await getAuditStatus(taskId);
+               if (cancelled) return;
+            } else {
+               setHydrated(true);
+               return;
+            }
+
+            const currentTaskId = status?.taskId ?? taskId;
+            const completed = status?.status === 'completed';
             setIsComplete(completed);
-            if (completed) {
-               const result = await getAuditResult(taskId, { page: 1, size: 200 });
+            if (completed && currentTaskId) {
+               const result = await getAuditResult(currentTaskId, { page: 1, size: 200 });
                if (cancelled) return;
                setIssues((result.issues || []).map(withAnchorFallback));
                updateFinalElapsed();
@@ -189,11 +222,8 @@ export const useAuditTask = (bidId?: number) => {
                setCurrentStage('审核完成');
                setShouldConnectStream(false);
                setHasStartedAudit(false);
-            } else if (status.status === 'failed') {
-               if (storageKey) {
-                  localStorage.removeItem(storageKey);
-               }
-               setTaskId(null);
+            } else if (status?.status === 'failed') {
+               // 失败也保留 taskId 供排查，不再清 localStorage 指针
                setIssues([]);
                setProgress(0);
                setCurrentStage('审核失败');
@@ -201,27 +231,22 @@ export const useAuditTask = (bidId?: number) => {
                setShouldConnectStream(false);
                setHasStartedAudit(false);
                setError('审核任务执行失败，请点击重新审核');
-            } else {
+            } else if (currentTaskId) {
                setAuditStartedAt((prev) => prev || Date.now());
-               setProgress(status.progress || 0);
-               setCurrentStage(status.stage || '审核进行中...');
+               setProgress(status?.progress || 0);
+               setCurrentStage(status?.stage || '审核进行中...');
                setIsComplete(false);
                setShouldConnectStream(true);
                setHasStartedAudit(true);
             }
-            if (status.status !== 'failed') {
+            if (status?.status !== 'failed') {
                setError(null);
             }
          } catch {
-            // 清除 stale 数据，避免死循环
-            if (storageKey) {
-               try { localStorage.removeItem(storageKey); } catch { /* ignore */ }
-            }
-            setTaskId(null);
+            // P1: 网络/5xx 不再清除 localStorage 指针、不销毁 taskId，保留可恢复性；
+            // 后续 3s 轮询(syncStatus)会继续重试；真正 401/404 由下次按 bid 裁决兜底。
             setShouldConnectStream(false);
             setHasStartedAudit(false);
-            setIsComplete(false);
-            setError(null);
          } finally {
             if (!cancelled) setHydrated(true);
          }
@@ -233,7 +258,7 @@ export const useAuditTask = (bidId?: number) => {
       return () => {
          cancelled = true;
       };
-   }, [taskId, storageKey, shouldConnectStream, isStarting, lastStartAt, updateFinalElapsed]);
+   }, [taskId, storageKey, shouldConnectStream, isStarting, lastStartAt, updateFinalElapsed, bidId]);
 
    useEffect(() => {
       if (!taskId || isComplete || !hydrated || !shouldConnectStream) return;

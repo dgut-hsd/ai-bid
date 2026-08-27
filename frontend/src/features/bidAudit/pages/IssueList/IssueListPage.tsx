@@ -19,10 +19,14 @@ const { Title, Text } = Typography;
 export const IssueListPage: React.FC = () => {
    const { styles } = useStyles();
    const { id: bidId } = useParams<{ id: string }>();
-   const taskId = React.useMemo(() => {
-      if (!bidId) return '';
-      // 兼容旧链接：如果路由里本身就是 taskId，直接使用。
-      if (bidId.startsWith('task_')) return bidId;
+   const bidIdNum = Number(bidId);
+
+   // 兼容旧链接：路由里本身就是 taskId 时直接使用。
+   const routeTaskId = bidId && bidId.startsWith('task_') ? bidId : '';
+
+   // P1: 以服务端裁决为准；localStorage 仅作服务端返回前的临时提示。
+   const localStorageTaskId = React.useMemo(() => {
+      if (!bidId || routeTaskId) return '';
       try {
          const raw = localStorage.getItem(`auditTask:${bidId}`);
          if (!raw) return '';
@@ -31,7 +35,15 @@ export const IssueListPage: React.FC = () => {
       } catch {
          return '';
       }
-   }, [bidId]);
+   }, [bidId, routeTaskId]);
+
+   const { data: bidStatus } = useQuery({
+      ...auditIssuesListOptions.statusByBid(bidIdNum),
+      enabled: !!bidId && !isNaN(bidIdNum) && !routeTaskId,
+   });
+
+   const taskId =
+      routeTaskId || bidStatus?.taskId || localStorageTaskId || '';
 
    const [queryParams, setQueryParams] = useUrlState<IssueQueryParams>({
       page: 1,
@@ -42,8 +54,8 @@ export const IssueListPage: React.FC = () => {
    });
 
    const { data: bidData } = useQuery({
-      ...auditIssuesListOptions.bidDetail(Number(bidId)),
-      enabled: !!bidId && !isNaN(Number(bidId)),
+      ...auditIssuesListOptions.bidDetail(bidIdNum),
+      enabled: !!bidId && !isNaN(bidIdNum),
    });
 
    const { issues, total, summary, isLoading } = useAuditIssuesList(

@@ -130,6 +130,39 @@ public class AuditTaskServiceImpl implements AuditTaskService {
     @Transactional(readOnly = true)
     public AuditTaskStatusVO getStatus(String taskId) {
         AuditTask task = loadTask(taskId);
+        return buildStatusVO(task);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public AuditTaskStatusVO getStatusByBid(Long bidId) {
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, bidId)
+                .eq(Tender::getTenantId, TenantScope.requiredTenantId()));
+        if (tender == null) {
+            throw TenantScope.resourceNotFound();
+        }
+        AuditTask task = findLatestTaskByBidId(bidId);
+        if (task == null) {
+            // 该文档从未发起过审核：返回空任务标识，前端据此显示「准备审核」
+            AuditTaskStatusVO vo = new AuditTaskStatusVO();
+            vo.setStatus("pending");
+            vo.setStage(null);
+            vo.setProgress(0);
+            vo.setIssueCount(0);
+            vo.setFailedStages(List.of());
+            fillCounts(vo);
+            return vo;
+        }
+        // 复用 loadTask 的归属校验：任务创建者或标书上传者
+        Long currentUserId = BaseContext.getCurrentId();
+        if (currentUserId != null && !isTaskOwner(task, currentUserId)) {
+            throw new BizException(403, "无权访问该任务");
+        }
+        return buildStatusVO(task);
+    }
+
+    private AuditTaskStatusVO buildStatusVO(AuditTask task) {
         AuditTaskStatusVO vo = new AuditTaskStatusVO();
         vo.setTaskId(task.getTaskId());
         vo.setStatus(AuditTaskStatusEnum.fromCode(task.getTaskStatus()).getValue());
@@ -137,6 +170,11 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         vo.setProgress(task.getProgress());
         vo.setIssueCount(0); // 不再从 DB 读 issue count，前端从 /result 获取
         vo.setFailedStages(task.getFailedStages() == null ? List.of() : task.getFailedStages());
+        fillCounts(vo);
+        return vo;
+    }
+
+    private void fillCounts(AuditTaskStatusVO vo) {
         Long tenantId = TenantScope.requiredTenantId();
         vo.setTotalFileCount(auditTaskMapper.selectCount(new LambdaQueryWrapper<AuditTask>()
                 .eq(AuditTask::getTenantId, tenantId)));
@@ -149,7 +187,14 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         vo.setFailedFileCount(defLong(auditTaskMapper.selectCount(new LambdaQueryWrapper<AuditTask>()
                 .eq(AuditTask::getTenantId, tenantId)
                 .eq(AuditTask::getTaskStatus, AuditTaskStatusEnum.FAILED.getCode()))));
-        return vo;
+    }
+
+    private AuditTask findLatestTaskByBidId(Long bidId) {
+        return auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getBidId, bidId)
+                .eq(AuditTask::getTenantId, TenantScope.requiredTenantId())
+                .orderByDesc(AuditTask::getCreateTime)
+                .last("LIMIT 1"));
     }
 
     @Override
