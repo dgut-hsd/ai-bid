@@ -13,6 +13,9 @@ export type ParseStatusType = (typeof ParseStatus)[keyof typeof ParseStatus];
 
 export type FileCategory = '标书' | '合同';
 
+/** 文件类型的存储码：DB 存英文码(bid/contract)，前端筛选传码、展示时用中文标签 */
+export type FileCategoryCode = 'bid' | 'contract';
+
 /** 审核列表项（项目+版本聚合视图） */
 export interface AuditListItem {
   projectId: number;
@@ -27,7 +30,7 @@ export interface AuditListItem {
 /** 审核列表查询参数 */
 export interface AuditListQueryParams extends PageParams {
   bidName?: string;
-  fileCategory?: FileCategory;
+  fileCategory?: FileCategoryCode;
   status?: number;
   uploadStartTime?: string;
   uploadEndTime?: string;
@@ -51,5 +54,4 @@ export interface ProjectItem {
   version: number;
   projectId: number;
   auditorName: string;
-  auditResult?: string | null;
 }

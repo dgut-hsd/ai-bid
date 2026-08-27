@@ -103,6 +103,18 @@ export const useStyles = createStyles(({ css, token }) => ({
       padding: 24px 16px;
       transition: background-color 0.3s ease;
 
+      /* 手机端保留浅绿渐变背景：左侧品牌面板在移动端隐藏，这里承接渐变观感 */
+      @media (max-width: 767px) {
+         background: linear-gradient(180deg, #e8f5e9 0%, #ffffff 100%);
+         .dark & {
+            background: linear-gradient(
+               180deg,
+               rgba(46, 125, 50, 0.1) 0%,
+               ${token.colorBgLayout} 100%
+            );
+         }
+      }
+
       @media (min-width: 768px) {
          width: 45%;
          min-height: 100vh;

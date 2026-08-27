@@ -229,6 +229,11 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
    // ── PDF 懒渲染：只挂载可视区附近及被标记的页，避免 120 页一次性全量渲染 ──
    const [renderedPages, setRenderedPages] = React.useState<Set<number>>(() => new Set([1]));
 
+   // ── 容器宽度：手机端 PDF 按屏幕取合适比例，桌面端仍以 800px 作为 100% 基准 ──
+   const [containerWidth, setContainerWidth] = React.useState(0);
+   const fitWidth = containerWidth > 0 ? Math.min(containerWidth, 800) : 800;
+   const pageWidth = fitWidth * scale;
+
    const markPageRendered = React.useCallback((page: number) => {
       setRenderedPages((prev) => {
          if (!page || prev.has(page)) return prev;
@@ -254,7 +259,7 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
 
    React.useEffect(() => {
       pageTextIndexCacheRef.current = {};
-   }, [scale, fileUrl]);
+   }, [scale, fileUrl, fitWidth]);
 
    // 纯 overlay 高亮：不再直接改 react-pdf 文本层 DOM，避免与 React 重渲染（SSE 实时进度）冲突产生 insertBefore
    const clearSpanHighlights = React.useCallback((page: number) => {
@@ -271,13 +276,13 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
       async (page: number): Promise<PageTextIndex | null> => {
          const doc = pdfDocRef.current;
          if (!doc || !page || page < 1) return null;
-         const cacheKey = `${page}@${scale.toFixed(3)}`;
+         const cacheKey = `${page}@${fitWidth.toFixed(0)}@${scale.toFixed(3)}`;
          const cached = pageTextIndexCacheRef.current[cacheKey];
          if (cached) return cached;
          try {
             const pdfPage = await doc.getPage(page);
             const baseViewport = pdfPage.getViewport({ scale: 1 });
-            const renderWidth = 800 * scale;
+            const renderWidth = pageWidth;
             const renderScale = renderWidth / Math.max(baseViewport.width || 1, 1);
             const textContent = await pdfPage.getTextContent();
             const compactChars: string[] = [];
@@ -321,7 +326,7 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
             return null;
          }
       },
-      [scale]
+      [scale, fitWidth]
    );
 
    const applyPdfJsHighlights = React.useCallback(
@@ -621,8 +626,6 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
    const renderPages = () => {
       if (!numPages) return null;
 
-      const pageWidth = 800 * scale;
-
       return Array.from(new Array(numPages), (_, index) => {
          const pageNum = index + 1;
          const pageKey = `page_${pageNum}`;
@@ -787,6 +790,17 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
       container.querySelectorAll('[data-page-num]').forEach((el) => observer.observe(el));
       return () => observer.disconnect();
    }, [numPages, isPdf, containerRef, markPageRendered]);
+
+   // 容器宽度自适应：监听 pdfScrollArea 尺寸，旋转/缩放窗口时重排 PDF 页宽
+   React.useLayoutEffect(() => {
+      const container = containerRef.current;
+      if (!container) return;
+      const update = () => setContainerWidth(container.clientWidth);
+      update();
+      const ro = new ResizeObserver(update);
+      ro.observe(container);
+      return () => ro.disconnect();
+   }, [containerRef, isPdf]);
 
    React.useImperativeHandle(
       ref,

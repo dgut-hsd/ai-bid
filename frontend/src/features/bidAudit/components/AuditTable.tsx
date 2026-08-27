@@ -1,9 +1,12 @@
 import React, { useState } from 'react';
-import { Table, App } from 'antd';
+import { Table, Pagination, Spin, Empty, Skeleton, App } from 'antd';
 import { useQuery } from '@tanstack/react-query';
 
 import { VersionDrawer } from '@/components/VersionDrawer/VersionDrawer';
+import { useIsMobile } from '@/hooks/useMediaQuery';
+
 import { useAuditListTableColumns } from '../hooks/useAuditListTableColumns';
+import { AuditCard } from './AuditCard';
 import { auditListOptions, useDeleteTenderVersion } from '../api/auditList';
 import type { ProjectItem } from '../types';
 
@@ -30,6 +33,7 @@ export const AuditTable: React.FC<AuditTableProps> = ({
    deletingProjectId,
    isDeletingProject,
 }) => {
+   const isMobile = useIsMobile();
    const { message } = App.useApp();
    const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
    const [selectedProject, setSelectedProject] = useState<number | null>(null);
@@ -69,20 +73,94 @@ export const AuditTable: React.FC<AuditTableProps> = ({
       isDeletingProject,
    });
 
+   const openVersionsDrawer = (projectId: number) => {
+      setSelectedProject(projectId);
+      setIsDrawerOpen(true);
+   };
+
+   const versionsDrawer = (
+      <VersionDrawer
+         open={isDrawerOpen}
+         onClose={() => setIsDrawerOpen(false)}
+         versions={versions ?? []}
+         isFetching={isVersionsFetching}
+         projectId={selectedProject}
+         onDeleteVersion={handleDeleteVersion}
+         deletingVersionId={deletingVersionId}
+         isDeletingVersion={isDeletingVersion}
+      />
+   );
+
+   // 移动端：卡片式列表
+   if (isMobile) {
+      return (
+         <div className={styles.mobileListContainer}>
+            {data.length === 0 ? (
+               isFetching ? (
+                  <Skeleton
+                     active
+                     paragraph={{ rows: 5 }}
+                     style={{ padding: 12 }}
+                  />
+               ) : (
+                  <Empty
+                     description='暂无审核项目'
+                     style={{ padding: '32px 0' }}
+                  />
+               )
+            ) : (
+               <Spin spinning={isFetching}>
+                  <div className={styles.mobileCardList}>
+                     {data.map((record) => (
+                        <AuditCard
+                           key={record.projectId}
+                           record={record}
+                           deleting={
+                              isDeletingProject &&
+                              deletingProjectId === record.projectId
+                           }
+                           onView={openVersionsDrawer}
+                           onDelete={handleDeleteProject}
+                           styles={styles}
+                        />
+                     ))}
+                  </div>
+               </Spin>
+            )}
+
+            {data.length > 0 && (
+               <div
+                  style={{
+                     display: 'flex',
+                     justifyContent: 'center',
+                     marginTop: 12,
+                  }}
+               >
+                  <Pagination
+                     current={page}
+                     pageSize={10}
+                     total={total}
+                     size='small'
+                     showSizeChanger={false}
+                     onChange={onPageChange}
+                  />
+               </div>
+            )}
+
+            {versionsDrawer}
+         </div>
+      );
+   }
+
    return (
       <div className={styles.tableContainer}>
          <Table
             columns={columns}
             dataSource={data ?? []}
             rowKey='projectId'
-            onRow={(record) => {
-               return {
-                  onClick: () => {
-                     setIsDrawerOpen(true);
-                     setSelectedProject(record.projectId);
-                  },
-               };
-            }}
+            onRow={(record) => ({
+               onClick: () => openVersionsDrawer(record.projectId),
+            })}
             loading={isFetching}
             scroll={{ x: 'max-content' }}
             pagination={{
@@ -95,16 +173,7 @@ export const AuditTable: React.FC<AuditTableProps> = ({
             }}
          />
 
-         <VersionDrawer
-            open={isDrawerOpen}
-            onClose={() => setIsDrawerOpen(false)}
-            versions={versions ?? []}
-            isFetching={isVersionsFetching}
-            projectId={selectedProject}
-            onDeleteVersion={handleDeleteVersion}
-            deletingVersionId={deletingVersionId}
-            isDeletingVersion={isDeletingVersion}
-         />
+         {versionsDrawer}
       </div>
    );
 };

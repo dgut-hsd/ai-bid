@@ -78,10 +78,7 @@ export const VersionDrawer = ({
          key: 'parseStatus',
          label: '审核状态',
          children: (
-            <StatusTag
-               parseStatus={item.parseStatus}
-               auditResult={item.auditResult}
-            />
+            <StatusTag parseStatus={item.parseStatus} />
          ),
       },
       { key: 'auditorName', label: '审核人', children: item.auditorName },
