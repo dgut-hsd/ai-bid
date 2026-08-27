@@ -144,16 +144,3 @@ export const useDeleteTenderVersion = () => {
       },
    });
 };
-
-export const useDeleteTenderVersion = () => {
-   const queryClient = useQueryClient();
-
-   return useMutation({
-      mutationFn: (id: number) => deleteTenderVersion(id),
-      onSuccess: () => {
-         queryClient.invalidateQueries({ queryKey: ['auditList'] });
-         queryClient.invalidateQueries({ queryKey: ['auditListWithParams'] });
-         queryClient.invalidateQueries({ queryKey: ['projectVersions'] });
-      },
-   });
-};

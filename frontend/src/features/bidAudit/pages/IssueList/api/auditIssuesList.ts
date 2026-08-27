@@ -11,17 +11,6 @@ export const getAuditStatus = async (taskId: string): Promise<AuditStatus> => {
    return res.data;
 };
 
-/** 按标书(bid)取服务端裁决的「当前任务」状态；无任务时 taskId=null。 */
-export const getAuditStatusByBid = async (
-   bidId: number
-): Promise<AuditStatus> => {
-   const res = await request.get<unknown, BaseResponse<AuditStatus>>(
-      `/api/audit-tasks/by-bid/${bidId}`
-   );
-
-   return res.data;
-};
-
 export const getAuditResult = async (
    taskId: string,
    params?: { page?: number; size?: number; sinceIssueNo?: string }
@@ -51,13 +40,6 @@ export const auditIssuesListOptions = {
          queryFn: () => getAuditStatus(taskId),
          enabled: !!taskId,
          refetchInterval: 3000,
-      }),
-
-   statusByBid: (bidId: number) =>
-      queryOptions({
-         queryKey: ['auditStatusByBid', bidId],
-         queryFn: () => getAuditStatusByBid(bidId),
-         enabled: !!bidId && !Number.isNaN(bidId),
       }),
 
    result: (

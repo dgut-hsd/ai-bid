@@ -94,7 +94,7 @@ export const usePdfFlow = (isComplete: boolean) => {
    }, [numPages, scale, queryParams.page, setQueryParams]);
 
    const zoomIn = useCallback(() => {
-      setQueryParams({ scale: Math.min((scale || 1) + 0.1, 3.0) });
+      setQueryParams({ scale: Math.min((scale || 1) + 0.1, 1.0) });
    }, [scale, setQueryParams]);
 
    const zoomOut = useCallback(() => {

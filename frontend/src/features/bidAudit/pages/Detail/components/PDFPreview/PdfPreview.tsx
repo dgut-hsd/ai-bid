@@ -254,7 +254,7 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
 
    React.useEffect(() => {
       pageTextIndexCacheRef.current = {};
-   }, [scale, fileUrl, fitWidth]);
+   }, [scale, fileUrl]);
 
    // 纯 overlay 高亮：不再直接改 react-pdf 文本层 DOM，避免与 React 重渲染（SSE 实时进度）冲突产生 insertBefore
    const clearSpanHighlights = React.useCallback((page: number) => {
@@ -271,13 +271,13 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
       async (page: number): Promise<PageTextIndex | null> => {
          const doc = pdfDocRef.current;
          if (!doc || !page || page < 1) return null;
-         const cacheKey = `${page}@${fitWidth.toFixed(0)}@${scale.toFixed(3)}`;
+         const cacheKey = `${page}@${scale.toFixed(3)}`;
          const cached = pageTextIndexCacheRef.current[cacheKey];
          if (cached) return cached;
          try {
             const pdfPage = await doc.getPage(page);
             const baseViewport = pdfPage.getViewport({ scale: 1 });
-            const renderWidth = pageWidth;
+            const renderWidth = 800 * scale;
             const renderScale = renderWidth / Math.max(baseViewport.width || 1, 1);
             const textContent = await pdfPage.getTextContent();
             const compactChars: string[] = [];
@@ -321,7 +321,7 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
             return null;
          }
       },
-      [scale, fitWidth]
+      [scale]
    );
 
    const applyPdfJsHighlights = React.useCallback(
@@ -620,6 +620,8 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
 
    const renderPages = () => {
       if (!numPages) return null;
+
+      const pageWidth = 800 * scale;
 
       return Array.from(new Array(numPages), (_, index) => {
          const pageNum = index + 1;

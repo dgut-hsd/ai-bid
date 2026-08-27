@@ -1,18 +1,9 @@
-import {
-   Table,
-   Pagination,
-   Tag,
-   Popconfirm,
-   Spin,
-   Empty,
-   Skeleton,
-} from 'antd';
+import { Table, Pagination, Tag, Popconfirm } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useStyles } from '../style';
 import { CategoryMap, ApplicableScopeMap, type KnowledgeFile } from '../types';
 import { EllipsisTooltip } from '@/components/EllipsisTooltip/EllipsisTooltip';
 import { useIsMobile } from '@/hooks/useMediaQuery';
-import { MobileFileCard } from './MobileFileCard';
 
 interface FileTableProps {
    files: KnowledgeFile[]; // 文件列表数据
@@ -110,7 +101,6 @@ export function FileTable({
          dataIndex: 'applicableScope',
          key: 'applicableScope',
          width: 110,
-         responsive: ['md', 'lg', 'xl', 'xxl'],
          align: 'center',
          render: (scope: string) => {
              // 如果后端返回了真正的 scope，就进行映射
@@ -128,7 +118,6 @@ export function FileTable({
          dataIndex: 'uploadUserName', // 后端现在返回了 uploadUserName
          key: 'uploadUserName',
          width: 110,
-         responsive: ['md', 'lg', 'xl', 'xxl'],
          align: 'center',
          render: (userName: string) => {
             return userName || '-';
@@ -204,52 +193,6 @@ export function FileTable({
          ),
       },
    ];
-
-   // 移动端：卡片式列表
-   if (isMobile) {
-      return (
-         <div className={styles.mobileListContainer}>
-            {files.length === 0 ? (
-               loading ? (
-                  <Skeleton active paragraph={{ rows: 5 }} />
-               ) : (
-                  <Empty
-                     description='暂无符合条件的标准库文件'
-                     style={{ padding: '32px 0' }}
-                  />
-               )
-            ) : (
-               <Spin spinning={loading}>
-                  <div className={styles.mobileCardList}>
-                     {files.map((file) => (
-                        <MobileFileCard
-                           key={file.id}
-                           file={file}
-                           onView={onView}
-                           onDownload={onDownload}
-                           onEdit={onEdit}
-                           onDelete={onDelete}
-                        />
-                     ))}
-                  </div>
-               </Spin>
-            )}
-
-            {files.length > 0 && (
-               <div className={styles.paginationRow}>
-                  <Pagination
-                     current={currentPage}
-                     pageSize={pageSize}
-                     total={total}
-                     size='small'
-                     showSizeChanger={false}
-                     onChange={onPageChange}
-                  />
-               </div>
-            )}
-         </div>
-      );
-   }
 
    return (
       <div className={styles.tableContainer}>

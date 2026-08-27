@@ -65,7 +65,7 @@ export const PdfToolbar: React.FC<PdfToolbarProps> = React.memo((props) => {
                />
             </Tooltip>
 
-            <Tooltip title='单击恢复适配宽度'>
+            <Tooltip title='单击返回 100% 比例'>
                <Button
                   className={styles.actionBtn}
                   size='small'
@@ -76,7 +76,7 @@ export const PdfToolbar: React.FC<PdfToolbarProps> = React.memo((props) => {
                </Button>
             </Tooltip>
 
-            <Tooltip title='最大300%'>
+            <Tooltip title='最大100%'>
                <Button
                   className={styles.actionBtn}
                   size='small'

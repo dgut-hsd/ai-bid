@@ -73,10 +73,9 @@ const fetchAuditList = async (
       );
    }
 
-   // 2. 过滤：文件类型（筛选值现为存储码 bid/contract，换算成中文标签比对）
+   // 2. 过滤：文件类型
    if (fileCategory) {
-      const categoryLabel = fileCategory === 'bid' ? '标书' : '合同';
-      result = result.filter((item) => item.fileCategory === categoryLabel);
+      result = result.filter((item) => item.fileCategory === fileCategory);
    }
 
    // 3. 过滤：时间范围

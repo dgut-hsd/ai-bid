@@ -1,0 +1,218 @@
+/* 移动端卡片列表样式 */
+.mobile-file-list {
+  height: 100%;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  background-color: #f5f5f5;
+}
+
+.mobile-file-list.dark {
+  background-color: #141414;
+}
+
+.mobile-file-list-pull {
+  text-align: center;
+  padding: 12px;
+  color: #999;
+  font-size: 12px;
+  transform: translateY(-40px);
+  opacity: 0;
+  transition: all 0.3s ease;
+}
+
+.mobile-file-list-pull.active {
+  transform: translateY(0);
+  opacity: 1;
+}
+
+.mobile-file-list-tabs {
+  padding: 0 12px;
+}
+
+.mobile-file-list-tabs .ant-tabs-nav {
+  margin-bottom: 12px;
+}
+
+.mobile-file-list-tabs .ant-tabs-tab {
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+.mobile-file-list-content {
+  padding-bottom: 80px;
+}
+
+.mobile-file-list-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  color: #999;
+  font-size: 12px;
+  gap: 8px;
+}
+
+.mobile-file-list-end {
+  text-align: center;
+  padding: 16px;
+  color: #999;
+  font-size: 12px;
+}
+
+/* 移动端卡片样式 */
+.mobile-file-card {
+  background-color: #fff;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 8px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  transition: all 0.2s ease;
+}
+
+.mobile-file-card.dark {
+  background-color: #1f1f1f;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+
+.mobile-file-card:active {
+  transform: scale(0.98);
+  background-color: #fafafa;
+}
+
+.mobile-file-card.dark:active {
+  background-color: #2a2a2a;
+}
+
+.mobile-file-card-header {
+  margin-bottom: 8px;
+}
+
+.mobile-file-card-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.mobile-file-card-name {
+  flex: 1;
+  font-size: 14px;
+  font-weight: 600;
+  color: #333;
+  line-height: 1.4;
+  word-break: break-all;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.mobile-file-card.dark .mobile-file-card-name {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.mobile-file-card-badges {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.mobile-file-card-category {
+  font-size: 11px;
+  padding: 2px 6px;
+  margin: 0;
+  line-height: 1.2;
+}
+
+.mobile-file-card-status {
+  font-size: 11px;
+  padding: 2px 6px;
+  margin: 0;
+  line-height: 1.2;
+}
+
+.mobile-file-card-info {
+  margin-bottom: 8px;
+}
+
+.mobile-file-card-meta {
+  font-size: 12px;
+  color: #999;
+  line-height: 1.4;
+}
+
+.mobile-file-card.dark .mobile-file-card-meta {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.mobile-file-card-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 8px;
+  border-top: 1px solid #f0f0f0;
+}
+
+.mobile-file-card.dark .mobile-file-card-actions {
+  border-top-color: rgba(255, 255, 255, 0.1);
+}
+
+.mobile-file-card-view-btn {
+  color: #2E7D32 !important;
+  padding: 4px 8px !important;
+  font-size: 13px;
+}
+
+.mobile-file-card.dark .mobile-file-card-view-btn {
+  color: #43A047 !important;
+}
+
+.mobile-file-card-more-btn {
+  color: #666;
+  padding: 4px 8px !important;
+}
+
+.mobile-file-card.dark .mobile-file-card-more-btn {
+  color: rgba(255, 255, 255, 0.65);
+}
+
+/* 移动端筛选栏样式优化 */
+.mobile-filter-bar {
+  padding: 12px;
+  background-color: #fff;
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+
+.mobile-filter-bar.dark {
+  background-color: #1f1f1f;
+}
+
+.mobile-filter-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.mobile-filter-row:last-child {
+  margin-bottom: 0;
+}
+
+.mobile-filter-row .ant-select {
+  flex: 1;
+}
+
+.mobile-filter-row .ant-picker {
+  flex: 1;
+}
+
+.mobile-filter-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.mobile-filter-buttons .ant-btn {
+  min-width: 60px;
+}

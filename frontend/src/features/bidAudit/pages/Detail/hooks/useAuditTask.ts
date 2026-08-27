@@ -5,11 +5,10 @@ import {
    connectStream,
    getAuditResult,
    getAuditStatus,
-   getAuditStatusByBid,
 } from '../api/auditDetail';
 import type {
   AuditIssue, AgentProgress, TraceEvent,
-  PhaseEvent, StatsEvent, AuditStatus,
+  PhaseEvent, StatsEvent,
   FindingAddedEvent, FindingUpdatedEvent, FindingRemovedEvent,
 } from '@/types/audit';
 import { ensureAuditIssue, mapFindingAddedEvent } from '../../../utils/mapFinding';
@@ -168,53 +167,21 @@ export const useAuditTask = (bidId?: number) => {
             setHydrated(true);
             return;
          }
+         if (!taskId) {
+            setHydrated(true);
+            return;
+         }
          if (shouldConnectStream) {
             setHydrated(true);
             return;
          }
-
          try {
-            // P1: 服务端裁决当前任务（优先 bidId），localStorage 仅作缓存提示。
-            let status: AuditStatus | null = null;
-            if (typeof bidId === 'number' && !Number.isNaN(bidId)) {
-               status = await getAuditStatusByBid(bidId);
-               if (cancelled) return;
-               if (status?.taskId) {
-                  setTaskId(status.taskId);
-                  if (storageKey) {
-                     try {
-                        localStorage.setItem(storageKey, JSON.stringify({
-                           taskId: status.taskId,
-                           startedAt: Date.now(),
-                        }));
-                     } catch { /* ignore */ }
-                  }
-               } else {
-                  // 该文档从未发起审核 → 准备审核
-                  setTaskId(null);
-                  setIssues([]);
-                  setProgress(0);
-                  setCurrentStage('准备开始审核...');
-                  setIsComplete(false);
-                  setShouldConnectStream(false);
-                  setHasStartedAudit(false);
-                  setError(null);
-                  setHydrated(true);
-                  return;
-               }
-            } else if (taskId) {
-               status = await getAuditStatus(taskId);
-               if (cancelled) return;
-            } else {
-               setHydrated(true);
-               return;
-            }
-
-            const currentTaskId = status?.taskId ?? taskId;
-            const completed = status?.status === 'completed';
+            const status = await getAuditStatus(taskId);
+            if (cancelled) return;
+            const completed = status.status === 'completed';
             setIsComplete(completed);
-            if (completed && currentTaskId) {
-               const result = await getAuditResult(currentTaskId, { page: 1, size: 200 });
+            if (completed) {
+               const result = await getAuditResult(taskId, { page: 1, size: 200 });
                if (cancelled) return;
                setIssues((result.issues || []).map(withAnchorFallback));
                updateFinalElapsed();
@@ -222,8 +189,11 @@ export const useAuditTask = (bidId?: number) => {
                setCurrentStage('审核完成');
                setShouldConnectStream(false);
                setHasStartedAudit(false);
-            } else if (status?.status === 'failed') {
-               // 失败也保留 taskId 供排查，不再清 localStorage 指针
+            } else if (status.status === 'failed') {
+               if (storageKey) {
+                  localStorage.removeItem(storageKey);
+               }
+               setTaskId(null);
                setIssues([]);
                setProgress(0);
                setCurrentStage('审核失败');
@@ -231,28 +201,27 @@ export const useAuditTask = (bidId?: number) => {
                setShouldConnectStream(false);
                setHasStartedAudit(false);
                setError('审核任务执行失败，请点击重新审核');
-            } else if (currentTaskId) {
+            } else {
                setAuditStartedAt((prev) => prev || Date.now());
-               setProgress(status?.progress || 0);
-               setCurrentStage(status?.stage || '审核进行中...');
+               setProgress(status.progress || 0);
+               setCurrentStage(status.stage || '审核进行中...');
                setIsComplete(false);
                setShouldConnectStream(true);
                setHasStartedAudit(true);
-               // P2: 拉取已落库的增量 findings，刷新/重连后立即看到进行中的结果
-               getAuditResult(currentTaskId, { page: 1, size: 200 })
-                  .then((result) => {
-                     if (!cancelled) setIssues((result.issues || []).map(withAnchorFallback));
-                  })
-                  .catch(() => { /* 忽略：SSE 仍会兜底 */ });
             }
-            if (status?.status !== 'failed') {
+            if (status.status !== 'failed') {
                setError(null);
             }
          } catch {
-            // P1: 网络/5xx 不再清除 localStorage 指针、不销毁 taskId，保留可恢复性；
-            // 后续 3s 轮询(syncStatus)会继续重试；真正 401/404 由下次按 bid 裁决兜底。
+            // 清除 stale 数据，避免死循环
+            if (storageKey) {
+               try { localStorage.removeItem(storageKey); } catch { /* ignore */ }
+            }
+            setTaskId(null);
             setShouldConnectStream(false);
             setHasStartedAudit(false);
+            setIsComplete(false);
+            setError(null);
          } finally {
             if (!cancelled) setHydrated(true);
          }
@@ -264,7 +233,7 @@ export const useAuditTask = (bidId?: number) => {
       return () => {
          cancelled = true;
       };
-   }, [taskId, storageKey, shouldConnectStream, isStarting, lastStartAt, updateFinalElapsed, bidId]);
+   }, [taskId, storageKey, shouldConnectStream, isStarting, lastStartAt, updateFinalElapsed]);
 
    useEffect(() => {
       if (!taskId || isComplete || !hydrated || !shouldConnectStream) return;
@@ -429,9 +398,6 @@ export const useAuditTask = (bidId?: number) => {
          try {
             const status = await getAuditStatus(taskId);
             if (stopped) return;
-            // 防御：后端异常/响应缺失 data 时 getAuditStatus 返回 undefined，
-            // 仅跳过本轮，不计入「连续轮询失败」，避免错误停止整个轮询。
-            if (!status) return;
 
             setProgress(status.progress || 0);
             if (status.stage) setCurrentStage(status.stage);
@@ -456,11 +422,10 @@ export const useAuditTask = (bidId?: number) => {
                size: 200,
             });
             if (stopped) return;
-            // P2 后 getResult 在「进行中」也会返回增量 issues，不能因「有 finding」就判完成；
-            // 完成必须以 auditResult 离开 pending（revise/pass）为准。
-            const done = !!fallbackResult.auditResult
-               && fallbackResult.auditResult !== 'pending';
-            if (done) {
+            const hasResult =
+               (fallbackResult.issues?.length || 0) > 0 ||
+               (status.status === 'completed' && !!fallbackResult.auditResult);
+            if (hasResult) {
                setIssues((fallbackResult.issues || []).map(withAnchorFallback));
                updateFinalElapsed();
                setIsComplete(true);
@@ -470,10 +435,6 @@ export const useAuditTask = (bidId?: number) => {
                setHasStartedAudit(false);
                setError(null);
                return;
-            }
-            // 进行中：仅用增量结果刷新展示，绝不切完成态、不关流。
-            if ((fallbackResult.issues?.length || 0) > 0) {
-               setIssues((fallbackResult.issues || []).map(withAnchorFallback));
             }
 
             if (status.status === 'failed') {

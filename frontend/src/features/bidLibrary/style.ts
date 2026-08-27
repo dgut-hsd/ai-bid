@@ -262,10 +262,6 @@ export const useStyles = createStyles(({ css, token }) => ({
       box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
       overflow: hidden;
 
-      @media (max-width: 768px) {
-         margin: 8px 12px;
-      }
-
       .ant-table {
          font-size: 1.2rem;
       }
@@ -329,79 +325,9 @@ export const useStyles = createStyles(({ css, token }) => ({
       background: ${token.colorBgContainer};
       border-top: 1px solid ${token.colorBorderSecondary};
       flex-wrap: wrap;
-
-      @media (max-width: 768px) {
-         justify-content: center;
-         padding: 12px;
-      }
    `,
    totalText: css`
       font-size: 14px;
       color: ${token.colorTextSecondary};
-   `,
-
-   // 6. 移动端：卡片式文件列表
-   mobileListContainer: css`
-      padding: 12px;
-      padding-bottom: 24px;
-   `,
-   mobileCardList: css`
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-   `,
-   mobileCard: css`
-      background: ${token.colorBgContainer};
-      border: 1px solid ${token.colorBorderSecondary};
-      border-radius: ${token.borderRadiusLG}px;
-      padding: 12px;
-      transition: box-shadow 0.2s ease;
-
-      &:active {
-         transform: scale(0.98);
-      }
-   `,
-   mobileCardHeader: css`
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 8px;
-      margin-bottom: 8px;
-   `,
-   mobileCardName: css`
-      flex: 1;
-      font-size: 14px;
-      font-weight: 600;
-      color: ${token.colorText};
-      line-height: 1.4;
-      word-break: break-all;
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
-   `,
-   mobileCardBadges: css`
-      display: flex;
-      gap: 4px;
-      flex-shrink: 0;
-   `,
-   mobileCardMeta: css`
-      font-size: 12px;
-      color: ${token.colorTextSecondary};
-      line-height: 1.5;
-      margin-bottom: 8px;
-   `,
-   mobileCardActions: css`
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding-top: 8px;
-      border-top: 1px solid ${token.colorBorderSecondary};
-
-      .ant-btn-link {
-         color: ${token.colorPrimary};
-         padding: 0 8px;
-         font-size: 13px;
-      }
    `,
 }));

@@ -159,7 +159,7 @@ export interface AuditSummary {
 }
 
 export interface AuditStatus {
-  taskId: string | null;
+  taskId: string;
   status: string;
   stage: string;
   progress: number;

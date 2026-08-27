@@ -1,15 +1,13 @@
 import React from 'react';
-import { Table, Button, Pagination, Tooltip, Empty } from 'antd';
+import { Table, Button, Pagination, Tooltip } from 'antd';
 import { ExportOutlined } from '@ant-design/icons';
 import { useStyles } from '../style';
 import type { AuditIssue, IssueQueryParams } from '../types';
 
 import { IssueTableFilter } from './IssueTableFilter';
-import { IssueCard } from './IssueCard';
 import { useTableColumns } from '../hooks/useTableColumns';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Loading } from '@/components/Loading/Loading';
-import { useIsMobile } from '@/hooks/useMediaQuery';
 
 interface IssueTableProps {
    issues: AuditIssue[];
@@ -27,7 +25,6 @@ export const IssueTable: React.FC<IssueTableProps> = ({
    onFilterChange,
 }) => {
    const { styles, theme } = useStyles();
-   const isMobile = useIsMobile();
    const navigate = useNavigate();
    const { id: bidId } = useParams<{ id: string }>();
 
@@ -72,8 +69,7 @@ export const IssueTable: React.FC<IssueTableProps> = ({
                         current={queryParams.page}
                         pageSize={queryParams.size}
                         total={total}
-                        showQuickJumper={!isMobile}
-                        size={isMobile ? 'small' : undefined}
+                        showQuickJumper
                         onChange={(page) => onFilterChange({ page })}
                         style={{ fontSize: '1.2rem' }}
                      />
