@@ -285,23 +285,36 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                         case "finding_added" -> {
                             // 1. 透传原始数据给前端的 liveFindings（增量更新）
                             emitTransient(taskId, SseEventTypeEnum.FINDING_ADDED, data);
-                            // 2. 同时映射为 ISSUE（兼容 AnalysisList 实时显示）
+                            // 2. 同时映射为 ISSUE（兼容 AnalysisList 实时显示）+ 增量落库（P2）
                             try {
                                 RustRiskFinding rf = objectMapper.convertValue(data, RustRiskFinding.class);
                                 if (!rf.shouldSkip()) {
                                     emitTransient(taskId, SseEventTypeEnum.ISSUE, toIssueVO(rf));
+                                    persistFindingIncremental(task, rf);
                                 }
                             } catch (Exception ignored) {
                                 log.debug("SSE finding_added map failed: {}", ignored.getMessage());
                             }
                         }
                         case "finding_removed" -> {
-                            // 去重合并时移除 → 前端从 liveFindings 中删除
+                            // 去重合并时移除 → 前端从 liveFindings 中删除 + 增量删除（P2）
                             emitTransient(taskId, SseEventTypeEnum.FINDING_REMOVED, data);
+                            try {
+                                RustRiskFinding rf = objectMapper.convertValue(data, RustRiskFinding.class);
+                                deleteFindingIncremental(task, rf);
+                            } catch (Exception ignored) {
+                                log.debug("SSE finding_removed map failed: {}", ignored.getMessage());
+                            }
                         }
                         case "finding_updated" -> {
-                            // 字段变更（降级/辩论） → 前端就地更新 liveFindings
+                            // 字段变更（降级/辩论） → 前端就地更新 liveFindings + 增量更新（P2）
                             emitTransient(taskId, SseEventTypeEnum.FINDING_UPDATED, data);
+                            try {
+                                RustRiskFinding rf = objectMapper.convertValue(data, RustRiskFinding.class);
+                                persistFindingIncremental(task, rf);
+                            } catch (Exception ignored) {
+                                log.debug("SSE finding_updated map failed: {}", ignored.getMessage());
+                            }
                         }
                         case "done" -> {
                             log.info("Rust SSE done received: docId={}", rustDocId);
@@ -433,29 +446,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                 if (finding.shouldSkip()) continue;
                 activeFindings.add(finding);
                 try {
-                    AuditIssue issue = AuditIssue.builder()
-                            .auditId(task.getId())
-                            .tenantId(task.getTenantId())
-                            .issueNo("ISSUE-" + (finding.getRiskId() != null
-                                    ? finding.getRiskId() : String.valueOf(++seq)))
-                            .severity(finding.mappedSeverity())
-                            .isCritical(finding.isCritical())
-                            .criticalReason(finding.getCriticalReason())
-                            .category(finding.getRiskType())
-                            .description(finding.getReason() != null
-                                    ? finding.getReason() : finding.getRiskType())
-                            .suggestion(finding.getSuggestion())
-                            .pageNumber(finding.getPageNumber())
-                            .sectionName(finding.getSectionPath() != null
-                                    ? String.join(" > ", finding.getSectionPath()) : null)
-                            .context(finding.getContext() != null
-                                    ? finding.getContext() : finding.getSourceQuote())
-                            .reference(finding.getLegalBasis() != null
-                                    && !finding.getLegalBasis().isEmpty()
-                                    ? String.join("; ", finding.getLegalBasis()) : null)
-                            .createTime(LocalDateTime.now())
-                            .build();
-                    auditIssueMapper.insert(issue);
+                    auditIssueMapper.insert(toIssue(task, finding, ++seq));
                 } catch (Exception e) {
                     log.warn("Failed to persist finding {}: {}", finding.getRiskId(), e.getMessage());
                 }
@@ -477,6 +468,55 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                 activeFindings.stream().filter(i -> "medium".equals(i.mappedSeverity())).count(),
                 activeFindings.stream().filter(i -> "low".equals(i.mappedSeverity())).count(),
                 activeFindings.stream().filter(i -> "info".equals(i.mappedSeverity())).count());
+    }
+
+    // ── P2 增量落库：RustRiskFinding → AuditIssue（统一映射 + 进行中 upsert/删除） ──
+
+    private AuditIssue toIssue(AuditTask task, RustRiskFinding finding, int seq) {
+        String riskId = finding.getRiskId() != null
+                ? finding.getRiskId() : String.valueOf(seq);
+        return AuditIssue.builder()
+                .tenantId(task.getTenantId())
+                .auditId(task.getId())
+                .issueNo("ISSUE-" + riskId)
+                .riskId(riskId)
+                .severity(finding.mappedSeverity())
+                .isCritical(finding.isCritical())
+                .criticalReason(finding.getCriticalReason())
+                .category(finding.getRiskType())
+                .description(finding.getReason() != null ? finding.getReason() : finding.getRiskType())
+                .suggestion(finding.getSuggestion())
+                .pageNumber(finding.getPageNumber())
+                .sectionName(finding.getSectionPath() != null
+                        ? String.join(" > ", finding.getSectionPath()) : null)
+                .context(finding.getContext() != null ? finding.getContext() : finding.getSourceQuote())
+                .reference(finding.getLegalBasis() != null && !finding.getLegalBasis().isEmpty()
+                        ? String.join("; ", finding.getLegalBasis()) : null)
+                .createTime(LocalDateTime.now())
+                .build();
+    }
+
+    private void persistFindingIncremental(AuditTask task, RustRiskFinding finding) {
+        if (finding.shouldSkip()) return;
+        try {
+            auditIssueMapper.upsert(toIssue(task, finding, 0));
+        } catch (Exception e) {
+            log.warn("persist finding incremental failed: taskId={}, riskId={}, {}",
+                    task.getTaskId(), finding.getRiskId(), e.getMessage());
+        }
+    }
+
+    private void deleteFindingIncremental(AuditTask task, RustRiskFinding finding) {
+        if (finding.getRiskId() == null) return;
+        try {
+            auditIssueMapper.delete(new LambdaQueryWrapper<AuditIssue>()
+                    .eq(AuditIssue::getTenantId, task.getTenantId())
+                    .eq(AuditIssue::getAuditId, task.getId())
+                    .eq(AuditIssue::getRiskId, finding.getRiskId()));
+        } catch (Exception e) {
+            log.warn("delete finding incremental failed: taskId={}, riskId={}, {}",
+                    task.getTaskId(), finding.getRiskId(), e.getMessage());
+        }
     }
 
     // ── 映射：RustRiskFinding → IssueVO（SSE 推送用） ────────────────

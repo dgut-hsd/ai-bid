@@ -238,6 +238,12 @@ export const useAuditTask = (bidId?: number) => {
                setIsComplete(false);
                setShouldConnectStream(true);
                setHasStartedAudit(true);
+               // P2: 拉取已落库的增量 findings，刷新/重连后立即看到进行中的结果
+               getAuditResult(currentTaskId, { page: 1, size: 200 })
+                  .then((result) => {
+                     if (!cancelled) setIssues((result.issues || []).map(withAnchorFallback));
+                  })
+                  .catch(() => { /* 忽略：SSE 仍会兜底 */ });
             }
             if (status?.status !== 'failed') {
                setError(null);

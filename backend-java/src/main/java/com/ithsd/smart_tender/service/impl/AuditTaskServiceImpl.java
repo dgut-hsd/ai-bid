@@ -201,42 +201,26 @@ public class AuditTaskServiceImpl implements AuditTaskService {
     @Transactional(readOnly = true)
     public ResultVO getResult(String taskId, Integer page, Integer size, String sinceIssueNo) {
         AuditTask task = loadTask(taskId);
+        boolean completed = AuditTaskStatusEnum.COMPLETED.getCode().equals(task.getTaskStatus());
 
-        // 任务未完成 → 返回空结果，由前端 polling 刷新
-        if (!AuditTaskStatusEnum.COMPLETED.getCode().equals(task.getTaskStatus())) {
-            ResultVO vo = new ResultVO();
-            vo.setTaskId(task.getTaskId());
-            vo.setAuditResult("pending");
-            vo.setSummary(new SummaryVO());
-            vo.setIssues(List.of());
-            return vo;
-        }
-
-        // 获取 Rust 侧 document_id
-        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
-                .eq(Tender::getId, task.getBidId())
-                .eq(Tender::getTenantId, TenantScope.requiredTenantId()));
-        if (tender == null || !StringUtils.hasText(tender.getRustDocumentId())) {
-            log.warn("getResult: no rustDocumentId for taskId={}, bidId={}", taskId, task.getBidId());
-            ResultVO vo = new ResultVO();
-            vo.setTaskId(task.getTaskId());
-            vo.setAuditResult("pending");
-            vo.setSummary(new SummaryVO());
-            vo.setIssues(List.of());
-            return vo;
-        }
-
-        // 尝试从 Rust 获取结果（内存缓存），失败则回退到 DB
+        // Rust 内存结果仅对「已完成」任务有意义；进行中任务直接走 DB 增量结果（P2）
         RustReviewResponse review = null;
-        try {
-            RustReviewResultResponse rustResult =
-                rustApiClient.getReviewResult(tender.getRustDocumentId());
-            if (rustResult != null && rustResult.isCompleted()) {
-                review = rustResult.getResult();
+        if (completed) {
+            Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                    .eq(Tender::getId, task.getBidId())
+                    .eq(Tender::getTenantId, TenantScope.requiredTenantId()));
+            if (tender != null && StringUtils.hasText(tender.getRustDocumentId())) {
+                try {
+                    RustReviewResultResponse rustResult =
+                        rustApiClient.getReviewResult(tender.getRustDocumentId());
+                    if (rustResult != null && rustResult.isCompleted()) {
+                        review = rustResult.getResult();
+                    }
+                } catch (Exception e) {
+                    log.info("getResult: Rust unavailable (may have restarted), falling back to DB: {}",
+                            e.getMessage());
+                }
             }
-        } catch (Exception e) {
-            log.info("getResult: Rust unavailable (may have restarted), falling back to DB: {}",
-                    e.getMessage());
         }
 
         // 构建 ResultVO
@@ -249,14 +233,14 @@ public class AuditTaskServiceImpl implements AuditTaskService {
             allFindings = review.getFindings().stream()
                     .filter(f -> !f.shouldSkip()).collect(Collectors.toList());
         } else {
-            // Rust 重启了 → 从 audit_issue 表重建
+            // P2: 统一从 audit_issue 读（含进行中的增量结果 + 完成后的最终结果）
             List<AuditIssue> dbIssues = auditIssueMapper.selectList(
                     new LambdaQueryWrapper<AuditIssue>()
                             .eq(AuditIssue::getAuditId, task.getId())
                             .eq(AuditIssue::getTenantId, task.getTenantId()));
             allFindings = dbIssues.stream().map(i -> {
                 RustRiskFinding f = new RustRiskFinding();
-                f.setRiskId(i.getIssueNo());
+                f.setRiskId(i.getRiskId() != null ? i.getRiskId() : i.getIssueNo());
                 f.setRiskType(i.getCategory());
                 f.setSeverity(i.getSeverity());
                 f.setCritical(Boolean.TRUE.equals(i.getIsCritical()));
@@ -272,10 +256,10 @@ public class AuditTaskServiceImpl implements AuditTaskService {
                         ? java.util.List.of(i.getSectionName().split(" > ")) : null);
                 return f;
             }).collect(Collectors.toList());
-            log.info("getResult: restored {} findings from DB for taskId={}", allFindings.size(), taskId);
+            log.info("getResult: {} findings from DB for taskId={} (completed={})", allFindings.size(), taskId, completed);
         }
 
-        vo.setAuditResult(allFindings.isEmpty() ? "pass" : "revise");
+        vo.setAuditResult(!completed ? "pending" : (allFindings.isEmpty() ? "pass" : "revise"));
 
         // 4 级统计
         SummaryVO summary = buildSummary(allFindings);

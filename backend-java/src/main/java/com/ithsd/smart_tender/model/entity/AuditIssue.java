@@ -28,6 +28,9 @@ public class AuditIssue implements Serializable {
 
     private String issueNo;
 
+    @TableField("risk_id")
+    private String riskId;
+
     private String severity;
 
     @TableField("is_critical")
