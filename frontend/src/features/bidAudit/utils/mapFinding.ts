@@ -195,9 +195,9 @@ export const ensureAuditIssue = (item: Record<string, unknown>): AuditIssue =>
  * 与 mapBackendFinding 的区别：SSE 事件是「流式阶段的轻量快照」，
  * 字段比最终 result 少（无 case_refs / citations / suggested_agent / _tier 系列 / context）。
  *
- * 注意 blockIds 固定为空数组：Rust 的 ReviewEvent::FindingAdded 目前不下发 block_ids
- * （仅最终 /result 才带坐标），所以流式阶段的卡片只能走文本匹配定位，画不出 BBox 框；
- * 待审核完成、拉取 /result 后由 mapBackendFinding 覆盖为带 blockIds 的完整版。
+ * block_ids 由 Rust 在流式阶段从 clause.source_block_ids 聚合补发（coarse），
+ * 前端据此可直接查 bbox 画高亮框；审核完成后 /result 的 mapBackendFinding
+ * 会再用 source_quote 反查覆盖为更精确的 blockIds。
  */
 export const mapFindingAddedEvent = (event: FindingAddedEvent): AuditIssue => {
   const severity: Severity = isValidSeverity(event.severity)
@@ -237,6 +237,6 @@ export const mapFindingAddedEvent = (event: FindingAddedEvent): AuditIssue => {
       context: event.source_quote || '',
     },
     clauseIds: Array.isArray(event.clause_ids) ? event.clause_ids : [],
-    blockIds: [],
+    blockIds: Array.isArray(event.block_ids) ? event.block_ids : [],
   };
 };

@@ -16,4 +16,7 @@ public class UserInfoVO implements Serializable {
     private Long id;
     private String username;
     private String realName;
+    /** 是否平台管理员（系统管理者）。用于前端门控「系统管理」入口。 */
+    @JsonProperty("is_platform_admin")
+    private Boolean isPlatformAdmin;
 }

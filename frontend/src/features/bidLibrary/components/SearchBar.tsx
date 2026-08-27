@@ -1,21 +1,31 @@
 import { useState, useEffect } from 'react';
-import { Button, Input } from 'antd';
-import { SearchOutlined, UploadOutlined } from '@ant-design/icons';
+import { Button, Input, Badge } from 'antd';
+import {
+   SearchOutlined,
+   UploadOutlined,
+   FilterOutlined,
+} from '@ant-design/icons';
 import { useStyles } from '../style';
 import { useDebounce } from '@/hooks/useDebounce';
+import { useIsMobile } from '@/hooks/useMediaQuery';
 
 interface SearchBarProps {
    searchKeyword: string;
    onSearchChange: (value: string) => void;
    onUploadClick: () => void;
+   onFilterClick?: () => void;
+   activeFilterCount?: number;
 }
 
 export function SearchBar({
    searchKeyword,
    onSearchChange,
    onUploadClick,
+   onFilterClick,
+   activeFilterCount = 0,
 }: SearchBarProps) {
    const { styles } = useStyles();
+   const isMobile = useIsMobile();
 
    // 1. 本地状态管理输入值，保证输入框不卡顿
    const [localValue, setLocalValue] = useState(searchKeyword);
@@ -37,9 +47,7 @@ export function SearchBar({
    };
 
    return (
-      <div
-         className={`${styles.headerRow}`}
-      >
+      <div className={styles.headerRow}>
          <Input
             placeholder='搜索文件名或内容...'
             prefix={<SearchOutlined />}
@@ -47,14 +55,28 @@ export function SearchBar({
             value={localValue}
             onChange={handleChange}
             allowClear
+            style={{ height: 36 }}
          />
+
+         {isMobile && (
+            <Badge count={activeFilterCount} size='small' offset={[-6, 6]}>
+               <Button
+                  icon={<FilterOutlined />}
+                  onClick={onFilterClick}
+                  style={{ height: 36 }}
+               >
+                  筛选
+               </Button>
+            </Badge>
+         )}
+
          <Button
             type='primary'
             icon={<UploadOutlined />}
             className={styles.uploadBtn}
             onClick={onUploadClick}
          >
-            上传文件
+            {isMobile ? '上传' : '上传文件'}
          </Button>
       </div>
    );

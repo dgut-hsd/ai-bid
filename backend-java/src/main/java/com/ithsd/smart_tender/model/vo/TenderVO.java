@@ -29,5 +29,4 @@ public class TenderVO implements Serializable {
     private Integer version;
     private Long projectId;
     private String auditorName; // 审核人姓名
-    private String auditResult;
 }

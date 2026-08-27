@@ -16,7 +16,7 @@ export function RouteGuard({ children, requireAuth = true }: RouteGuardProps) {
    }
 
    if (!requireAuth && isAuthenticated) {
-      return <Navigate to='/dashboard' replace />;
+      return <Navigate to='/bidReview' replace />;
    }
 
    return <>{children}</>;

@@ -1,6 +1,8 @@
-import React from 'react';
+import React, { useState, useMemo } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useStyles } from './style';
-import { App, Result } from 'antd';
+import { App, Result, Button, Modal, Form, Input, Tabs } from 'antd';
+import { ProjectOutlined } from '@ant-design/icons';
 
 import { AuditFilter } from './components/AuditFilter';
 import { AuditTable } from './components/AuditTable';
@@ -9,21 +11,40 @@ import { Loading } from '@/components/Loading/Loading';
 import type { AuditListQueryParams } from './types';
 import { useUrlState } from '@/hooks/useUrlState';
 
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { auditListOptions, useDeleteProject } from './api/auditList';
+import { dashboardMutations } from '@/features/dashboard/api/dashboard';
+
+const STATUS_TABS = [
+   { key: 'all', label: '全部', countKey: 'allCount' },
+   { key: '0', label: '待审核', countKey: 'pendingCount' },
+   { key: '1', label: '审核中', countKey: 'processingCount' },
+   { key: '2', label: '已完成', countKey: 'completedCount' },
+   { key: '3', label: '审核失败', countKey: 'failedCount' },
+] as const;
+
+interface NewProjectFormValues {
+   projectName: string;
+}
 
 export const BidAuditList: React.FC = () => {
    const { styles } = useStyles();
    const { message } = App.useApp();
-   const [deletingProjectId, setDeletingProjectId] = React.useState<number | null>(
+   const navigate = useNavigate();
+   const queryClient = useQueryClient();
+
+   const [deletingProjectId, setDeletingProjectId] = useState<number | null>(
       null
    );
+   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+   const [createForm] = Form.useForm<NewProjectFormValues>();
 
    const [queryParams, setQueryParams] = useUrlState<AuditListQueryParams>({
       page: 1,
       size: 10,
       bidName: '',
       fileCategory: undefined,
+      status: undefined,
       uploadStartTime: '',
       uploadEndTime: '',
    });
@@ -36,8 +57,27 @@ export const BidAuditList: React.FC = () => {
       error: auditListError,
    } = useQuery(auditListOptions.queryList(queryParams));
 
+   // 顶部状态 Tab 的计数角标数据
+   const { data: statsData } = useQuery(auditListOptions.stats());
+
+   const tabItems = useMemo(
+      () =>
+         STATUS_TABS.map((item) => ({
+            key: item.key,
+            label: (
+               <span>
+                  {item.label}
+                  <span className={styles.tabCount}>
+                     {statsData?.[item.countKey] ?? 0}
+                  </span>
+               </span>
+            ),
+         })),
+      [statsData, styles]
+   );
+
    // 按上传时间倒序：刚上传的标书直接置顶，不用在列表里翻找
-   const sortedRecords = React.useMemo(() => {
+   const sortedRecords = useMemo(() => {
       const records = auditListData?.records;
       if (!records || records.length === 0) return records ?? [];
       return [...records].sort((a, b) => {
@@ -57,19 +97,27 @@ export const BidAuditList: React.FC = () => {
          size: 10,
          bidName: '',
          fileCategory: undefined,
+         status: undefined,
          uploadStartTime: '',
          uploadEndTime: '',
       });
    };
 
-   const { mutate: deleteProjectMutation, isPending: isDeletingProject } =
-      useDeleteProject();
+   const handleStatusChange = (key: string) => {
+      setQueryParams({
+         status: key === 'all' ? undefined : Number(key),
+         page: 1,
+      });
+   };
 
    const handlePageChange = (page: number) => {
       setQueryParams({ page });
    };
 
-   const handeleDeleteProject = (projectId: number) => {
+   const { mutate: deleteProjectMutation, isPending: isDeletingProject } =
+      useDeleteProject();
+
+   const handleDeleteProject = (projectId: number) => {
       setDeletingProjectId(projectId);
       deleteProjectMutation(projectId, {
          onSuccess: () => {
@@ -86,14 +134,58 @@ export const BidAuditList: React.FC = () => {
       });
    };
 
+   const { mutateAsync: submitCreateProject, isPending: isCreating } =
+      useMutation({
+         ...dashboardMutations.create(),
+      });
+
+   const handleCreateFinish = async (values: NewProjectFormValues) => {
+      try {
+         const created = await submitCreateProject({
+            id: 0,
+            projectName: values.projectName,
+         });
+         message.success('项目创建成功，请上传招标文件');
+         queryClient.invalidateQueries({ queryKey: ['dashboardList'] });
+         queryClient.invalidateQueries({ queryKey: ['auditListStats'] });
+         setIsCreateModalOpen(false);
+         createForm.resetFields();
+         navigate(`/upload/${created.id}`);
+      } catch (error) {
+         message.error(
+            error instanceof Error ? error.message : '项目创建失败，请重试'
+         );
+      }
+   };
+
    return (
       <div className={styles.pageContainer}>
+         <Tabs
+            activeKey={
+               queryParams.status === undefined
+                  ? 'all'
+                  : String(queryParams.status)
+            }
+            onChange={handleStatusChange}
+            items={tabItems}
+            style={{ marginBottom: 8 }}
+         />
+
          <AuditFilter
             styles={styles}
             queryParams={queryParams}
             onSearch={handleSearch}
             onReset={handleReset}
+            extra={
+               <Button
+                  type='primary'
+                  onClick={() => setIsCreateModalOpen(true)}
+               >
+                  +新建项目
+               </Button>
+            }
          />
+
          {isAuditListLoading && !auditListData && (
             <Loading loading={true} fullScreen={true} />
          )}
@@ -116,11 +208,59 @@ export const BidAuditList: React.FC = () => {
                isFetching={isAuditListFetching}
                page={queryParams.page}
                onPageChange={handlePageChange}
-               handleDeleteProject={handeleDeleteProject}
+               handleDeleteProject={handleDeleteProject}
                deletingProjectId={deletingProjectId}
                isDeletingProject={isDeletingProject}
             />
          )}
+
+         {/* 新建项目模态框 */}
+         <Modal
+            title='新建项目'
+            open={isCreateModalOpen}
+            onCancel={() => setIsCreateModalOpen(false)}
+            footer={null}
+            width={500}
+         >
+            <Form
+               form={createForm}
+               layout='vertical'
+               onFinish={handleCreateFinish}
+            >
+               <Form.Item
+                  label='项目名称'
+                  name='projectName'
+                  rules={[{ required: true, message: '请输入项目名称' }]}
+               >
+                  <Input
+                     prefix={<ProjectOutlined />}
+                     placeholder='请输入项目名称'
+                  />
+               </Form.Item>
+
+               <Form.Item style={{ marginBottom: 0 }}>
+                  <div
+                     style={{
+                        display: 'flex',
+                        gap: '8px',
+                        justifyContent: 'flex-end',
+                     }}
+                  >
+                     <Button onClick={() => setIsCreateModalOpen(false)}>
+                        取消
+                     </Button>
+
+                     <Button
+                        type='primary'
+                        htmlType='submit'
+                        loading={isCreating}
+                     >
+                        创建项目
+                     </Button>
+                  </div>
+               </Form.Item>
+            </Form>
+         </Modal>
       </div>
    );
 };

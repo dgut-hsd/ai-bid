@@ -63,43 +63,33 @@ public class TenderServiceImpl implements TenderService {
     @Override
     public TenderStatsVO getStats(TenderPageQueryDTO dto) {
         Long tenantId = TenantScope.requiredTenantId();
-        // 使用 QueryWrapper 分组统计
-        QueryWrapper<Tender> wrapper = new QueryWrapper<>();
-        wrapper.select("parse_status", "count(*) as count");
-        wrapper.eq("tenant_id", tenantId);
-        // 动态查询条件，与page接口保持一致（除status外）
-        wrapper.like(StringUtils.hasText(dto.getBidName()), "bid_name", dto.getBidName());
-        wrapper.eq(StringUtils.hasText(dto.getFileCategory()), "bid_type", dto.getFileCategory());
-        // 统计时不能根据 status 过滤，否则只能统计到单一状态的数量
+        Long userId = BaseContext.getCurrentId();
 
-        // 加上当前用户的限制
-        wrapper.eq("upload_user_id", BaseContext.getCurrentId());
-
-        wrapper.groupBy("parse_status");
-
-        List<Map<String, Object>> list = tenderMapper.selectMaps(wrapper);
-
-        long unreviewed = 0;
-        long completed = 0;
-
-        for (Map<String, Object> map : list) {
-            Integer status = (Integer) map.get("parse_status");
-            long count = ((Number) map.get("count")).longValue();
-
-            if (status != null) {
-                if (status == 0) { // 0:未审核
-                    unreviewed += count;
-                } else if (status == 1) { // 1:已审核
-                    completed += count;
-                }
-            }
+        // 复用审核列表的「最新版本标书 + 最新审核任务」口径，一次性统计各状态数量。
+        // 与 ProjectMapper#selectProjectPageWithStatus 完全一致：
+        //   待审核(0)=无任务；审核中(1)=PENDING/PROCESSING；已完成(2)=COMPLETED；审核失败(3)=FAILED。
+        Map<String, Object> counts = projectMapper.countByStatus(tenantId, userId);
+        if (counts == null || counts.isEmpty()) {
+            return TenderStatsVO.builder()
+                    .allCount(0L)
+                    .pendingCount(0L)
+                    .processingCount(0L)
+                    .completedCount(0L)
+                    .failedCount(0L)
+                    .build();
         }
 
         return TenderStatsVO.builder()
-                .allCount(unreviewed + completed)
-                .unreviewedCount(unreviewed)
-                .completedCount(completed)
+                .allCount(toLong(counts.get("total")))
+                .pendingCount(toLong(counts.get("pending")))
+                .processingCount(toLong(counts.get("processing")))
+                .completedCount(toLong(counts.get("completed")))
+                .failedCount(toLong(counts.get("failed")))
                 .build();
+    }
+
+    private static long toLong(Object value) {
+        return value == null ? 0L : ((Number) value).longValue();
     }
 
     @Override
@@ -173,13 +163,14 @@ public class TenderServiceImpl implements TenderService {
             tender.setUploadUserId(1L);
         }
         tender.setUploadTime(LocalDateTime.now());
-        if (tender.getVersion() == null) {
-            tender.setVersion(1); // 默认版本号为1
-        }
+        // 版本号由系统自动递增：同项目已有最大版本 + 1（首个版本为 V1）。
+        // 前端不再参与版本编号，避免用户手填版本号导致重复或乱序。
+        tender.setVersion(nextVersionForProject(tenderDTO.getProjectId(), tenantId));
         if(tenderDTO.getFileCategory() != null && !tenderDTO.getFileCategory().isEmpty()) {
-            tender.setFileCategory(tenderDTO.getFileCategory().equals("标书")?"bid":"contract");
+            // 文件角色：招标文件/标书 → bid；合同 → contract（本期以招标文件为主）
+            tender.setFileCategory("合同".equals(tenderDTO.getFileCategory()) || "contract".equals(tenderDTO.getFileCategory()) ? "contract" : "bid");
         } else {
-            tender.setFileCategory("bid"); // 默认类型
+            tender.setFileCategory("bid"); // 默认类型：招标文件
         }
 
         tender.setProjectId(tenderDTO.getProjectId());
@@ -214,22 +205,44 @@ public class TenderServiceImpl implements TenderService {
         }
     }
 
+    /**
+     * 计算项目下一个可用版本号：同项目已有最大版本 + 1（没有则首版 V1）。
+     * 版本由服务端统一自动生成，前端不参与编号。
+     */
+    private Integer nextVersionForProject(Long projectId, Long tenantId) {
+        if (projectId == null) {
+            return 1;
+        }
+        LambdaQueryWrapper<Tender> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(Tender::getProjectId, projectId)
+               .eq(Tender::getTenantId, tenantId)
+               .orderByDesc(Tender::getVersion)
+               .last("LIMIT 1");
+        Tender latestTender = tenderMapper.selectOne(wrapper);
+        return (latestTender != null && latestTender.getVersion() != null ? latestTender.getVersion() : 0) + 1;
+    }
+
     @Override
     public PageResult page(TenderPageQueryDTO dto) {
         Long tenantId = TenantScope.requiredTenantId();
         Page<Project> pageInfo = new Page<>(dto.getPage(), dto.getSize());
-        LambdaQueryWrapper<Project> wrapper = new LambdaQueryWrapper<>();
-        
-        wrapper.eq(Project::getTenantId, tenantId)
-               .eq(Project::getUserId, BaseContext.getCurrentId())
-               .like(StringUtils.hasText(dto.getBidName()), Project::getProjectName, dto.getBidName())
-               .ge(dto.getUploadStartTime() != null, Project::getCreateTime, dto.getUploadStartTime() != null ? dto.getUploadStartTime().atStartOfDay() : null)
-               .le(dto.getUploadEndTime() != null, Project::getCreateTime, dto.getUploadEndTime() != null ? dto.getUploadEndTime().atTime(java.time.LocalTime.MAX) : null)
-               // 按「改动时间」(updateTime) 倒序：每次上传新版本标书都会刷新 Project.updateTime，
-               // 因此刚上传完标书的项目会排在列表最前，便于在审核列表里快速定位。
-               .orderByDesc(Project::getUpdateTime);
 
-        Page<Project> p = projectMapper.selectPage(pageInfo, wrapper);
+        LocalDateTime uploadStart = dto.getUploadStartTime() != null
+                ? dto.getUploadStartTime().atStartOfDay() : null;
+        LocalDateTime uploadEnd = dto.getUploadEndTime() != null
+                ? dto.getUploadEndTime().atTime(java.time.LocalTime.MAX) : null;
+
+        // 状态与文件类型过滤下推到 SQL（见 ProjectMapper#selectProjectPageWithStatus），
+        // 保证分页 total 与当前页数据严格一致，修复「先分页再内存过滤导致 total 失配」问题。
+        Page<Project> p = projectMapper.selectProjectPageWithStatus(
+                pageInfo,
+                tenantId,
+                BaseContext.getCurrentId(),
+                dto.getBidName(),
+                dto.getFileCategory(),
+                dto.getStatus(),
+                uploadStart,
+                uploadEnd);
 
         List<TenderVO> vos = p.getRecords().stream().map(project -> {
             TenderVO vo = new TenderVO();
@@ -261,34 +274,15 @@ public class TenderServiceImpl implements TenderService {
                 // 文件类型英文转中文
                 vo.setFileCategory(latestTender.getFileCategory() != null && latestTender.getFileCategory().equals("bid") ? "标书" : "合同");
                 vo.setParseStatus(resolveParseStatusFromLatestTask(latestTender.getId()));
-                vo.setAuditResult(resolveAuditResultFromLatestTask(latestTender.getId()));
                 fillAuditorName(vo);
             } else {
                 vo.setFileCategory(null);
                 vo.setAuditorName(null);
                 vo.setParseStatus(0);
-                vo.setAuditResult(null);
             }
 
             return vo;
         }).collect(Collectors.toList());
-
-        if (dto.getStatus() != null) {
-            final Integer targetStatus = dto.getStatus();
-            vos = vos.stream()
-                    .filter(vo -> targetStatus.equals(vo.getParseStatus()))
-                    .collect(Collectors.toList());
-        }
-
-        // 根据 fileCategory 进行内存过滤 (如果前端传了 fileCategory 参数)
-        if (StringUtils.hasText(dto.getFileCategory())) {
-            String targetCategory = dto.getFileCategory().equals("bid") ? "标书" : "合同";
-            vos = vos.stream()
-                     .filter(vo -> targetCategory.equals(vo.getFileCategory()))
-                     .collect(Collectors.toList());
-            // 注意：内存过滤会导致返回的 total 和当前页的数量不匹配，最完美的做法是自定义 SQL，但为了简单这里做内存过滤
-            // 如果希望完全准确，需要在 mapper 层写关联查询 SQL
-        }
 
         return new PageResult(p.getTotal(), vos);
     }
@@ -310,7 +304,6 @@ public class TenderServiceImpl implements TenderService {
         TenderVO vo = new TenderVO();
         BeanUtils.copyProperties(tender, vo);
         vo.setParseStatus(resolveParseStatusFromLatestTask(tender.getId()));
-        vo.setAuditResult(resolveAuditResultFromLatestTask(tender.getId()));
 
         fillAuditorName(vo);
 
@@ -344,7 +337,6 @@ public class TenderServiceImpl implements TenderService {
             TenderVO vo = new TenderVO();
             BeanUtils.copyProperties(tender, vo);
             vo.setParseStatus(resolveParseStatusFromLatestTask(tender.getId()));
-            vo.setAuditResult(resolveAuditResultFromLatestTask(tender.getId()));
             fillAuditorName(vo);
 
             return vo;
@@ -409,18 +401,6 @@ public class TenderServiceImpl implements TenderService {
         return 0;
     }
 
-    private String resolveAuditResultFromLatestTask(Long bidId) {
-        AuditTask task = findLatestTaskByBidId(bidId);
-        if (task == null) {
-            return null;
-        }
-        // auditResult 已废弃，基于 taskStatus 映射结果
-        Integer status = task.getTaskStatus();
-        if (AuditTaskStatusEnum.COMPLETED.getCode().equals(status)) return "pass";
-        if (AuditTaskStatusEnum.FAILED.getCode().equals(status)) return "reject";
-        return "pending";
-    }
-
     @Override
     public List<TenderProjectVO> getProjects() {
         Long tenantId = TenantScope.requiredTenantId();
@@ -455,8 +435,9 @@ public class TenderServiceImpl implements TenderService {
             Tender latestTender = tenderMapper.selectOne(tenderWrapper);
 
             if (latestTender != null) {
-                // 找到标书，设置标书类型
-                vo.setFileCategory(latestTender.getFileCategory());
+                // 找到标书，设置标书类型（DB 存英文码 bid/contract → 前端中文标签 标书/合同）
+                String rawCategory = latestTender.getFileCategory();
+                vo.setFileCategory("bid".equals(rawCategory) ? "标书" : "合同");
                 
                 // 3. 查最新版本标书的审核人
                 LambdaQueryWrapper<AuditTask> taskWrapper = new LambdaQueryWrapper<>();

@@ -36,4 +36,11 @@ public interface TenantMemberMapper extends BaseMapper<TenantMember> {
              ORDER BY joined_at ASC, id ASC
             """)
     List<TenantMember> findByTenantId(@Param("tenantId") Long tenantId);
+
+    @Select("""
+            SELECT COUNT(*)
+              FROM tenant_member
+             WHERE tenant_id = #{tenantId} AND status <> 'REMOVED'
+            """)
+    long countActiveByTenantId(@Param("tenantId") Long tenantId);
 }

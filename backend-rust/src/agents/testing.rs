@@ -286,6 +286,7 @@ pub fn make_test_clause(id: &str, text: &str, section: &str) -> ReviewClause {
         page_end: 1,
         tier,
         tier_max_turns,
+        source_block_ids: vec![],
     }
 }
 
@@ -466,6 +467,7 @@ pub fn fault_test_clauses() -> Vec<ReviewClause> {
             page_end: 1,
             tier: RiskTier::Medium,
             tier_max_turns: 10,
+            source_block_ids: vec![],
         },
         // 超长文本（5000 字符）
         ReviewClause {
@@ -476,6 +478,7 @@ pub fn fault_test_clauses() -> Vec<ReviewClause> {
             page_end: 1,
             tier: RiskTier::Medium,
             tier_max_turns: 4, // 缩短 max_turns 加快测试
+            source_block_ids: vec![],
         },
     ]
 }

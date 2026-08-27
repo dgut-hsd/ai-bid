@@ -1,5 +1,9 @@
+import { lazy } from 'react';
 import type { RouteObject } from 'react-router-dom';
-import { BidUploadPage } from './BidUploadPage';
+
+const BidUploadPage = lazy(() =>
+   import('./BidUploadPage').then((m) => ({ default: m.BidUploadPage }))
+);
 
 export const uploadRoutes: RouteObject[] = [
    { path: '/upload/:projectId', element: <BidUploadPage /> },

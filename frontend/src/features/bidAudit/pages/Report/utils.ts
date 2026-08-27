@@ -153,6 +153,20 @@ export function parseReportSections(
    return parseMarkdownToSections(report.docContent);
 }
 
+/**
+ * 从 Markdown 报告内容中提取项目名称，用于推导默认导出文件名。
+ * 兼容两种格式：
+ *   - 后端生成："**项目名称：** 2026年度..."（冒号在星号内）
+ *   - Mock 数据："**项目名称**：2026年度..."（冒号在星号外）
+ */
+export function extractBidName(docContent: string): string | null {
+   if (!docContent) return null;
+   const match = docContent.match(/项目名称\**\s*[：:]\s*\**\s*([^\n\r]+)/);
+   if (!match) return null;
+   const value = match[1].trim().replace(/\*+$/, '').trim();
+   return value || null;
+}
+
 export async function generateWordDocument(
    htmlContent: string,
    fileName: string
@@ -170,6 +184,9 @@ export async function generateWordDocument(
              table { border-collapse: collapse; width: 100%; margin: 12pt 0; }
              th, td { border: 1px solid #000000; padding: 6pt; text-align: left; }
              th { background-color: #f2f2f2; font-weight: bold; }
+             /* 长 URL 在导出文档内换行，避免溢出页面宽度 */
+             body { overflow-wrap: break-word; }
+             a { word-break: break-all; overflow-wrap: anywhere; }
            </style>
          </head>
          <body>

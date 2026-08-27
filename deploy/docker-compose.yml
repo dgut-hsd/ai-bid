@@ -44,14 +44,18 @@ services:
       # Rust 引擎（覆盖 127.0.0.1 → 容器服务名）
       RUST_API_BASE_URL: http://backend-rust:3001
       RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
+      # Rust 审核总超时（分钟），大标书（如 92 页）需 >30；不设则回退 60
+      RUST_REVIEW_TIMEOUT_MINUTES: "${RUST_REVIEW_TIMEOUT_MINUTES:-60}"
       # JWT 密钥
       ST_JWT_SECRET: ${ST_JWT_SECRET:-local-test-only-jwt-secret-change-me}
+      # 初始管理员密码（仅新装首次建号时使用；已存在的 admin 手动在 DB 改）
+      AIBID_BOOTSTRAP_ADMIN_PASSWORD: "${AIBID_BOOTSTRAP_ADMIN_PASSWORD}"
       # JVM 堆上限（宿主机 7.7G 无 swap，避免 JVM+LibreOffice 撑爆触发 OOM）
       JAVA_TOOL_OPTIONS: "-Xmx1024m"
       # 孤儿任务守护（Spring relaxed binding：AUDIT_ORPHAN_* → audit.orphan.*）
       AUDIT_ORPHAN_ENABLED: "${AUDIT_ORPHAN_ENABLED:-true}"
       AUDIT_ORPHAN_SWEEP_INTERVAL_MS: "${AUDIT_ORPHAN_SWEEP_INTERVAL_MS:-60000}"
-      AUDIT_ORPHAN_STALE_AFTER_MS: "${AUDIT_ORPHAN_STALE_AFTER_MS:-180000}"
+      AUDIT_ORPHAN_STALE_AFTER_MS: "${AUDIT_ORPHAN_STALE_AFTER_MS:-600000}"
       # 文件存储（覆盖 prod profile 里硬编码的 /opt 路径）
       FILE_STORAGE_PATH: /data/uploads
       PREVIEW_CACHE_PATH: /data/preview-cache
@@ -77,6 +81,8 @@ services:
       # 必须监听 0.0.0.0，否则 Java 容器访问不到（默认是 127.0.0.1）
       AIBID_RUST_BIND: 0.0.0.0:3001
       AIBID_DATA_DIR: /data
+      # Python pdfplumber 兜底脚本的可执行文件（容器只有 python3，没有 python 软链）
+      AI_BID_PYTHON_EXECUTABLE: python3
       # LLM
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       DASHSCOPE_MODEL: ${DASHSCOPE_MODEL:-qwen-turbo}

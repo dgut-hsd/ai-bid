@@ -2,6 +2,7 @@ package com.ithsd.smart_tender.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ithsd.smart_tender.common.TenantContext;
+import com.ithsd.smart_tender.config.RustApiProperties;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
 import com.ithsd.smart_tender.model.entity.AuditTask;
 import com.ithsd.smart_tender.model.enums.AuditTaskStatusEnum;
@@ -37,6 +38,9 @@ class OrphanAuditTaskSweeperTest {
     @Mock
     private RunningTaskRegistry runningTaskRegistry;
 
+    @Mock
+    private RustApiProperties rustApiProperties;
+
     private OrphanAuditTaskSweeper sweeper;
 
     private static final long STALE_AFTER_MS = 180_000;
@@ -56,7 +60,7 @@ class OrphanAuditTaskSweeperTest {
         }
         sweeper = new OrphanAuditTaskSweeper(
                 auditTaskMapper, auditEngineService, runningTaskRegistry,
-                true, STALE_AFTER_MS);
+                rustApiProperties, true, STALE_AFTER_MS);
     }
 
     @AfterEach
@@ -167,7 +171,7 @@ class OrphanAuditTaskSweeperTest {
     void disabledSweeper_doesNothing() {
         sweeper = new OrphanAuditTaskSweeper(
                 auditTaskMapper, auditEngineService, runningTaskRegistry,
-                false, STALE_AFTER_MS);
+                rustApiProperties, false, STALE_AFTER_MS);
 
         sweeper.sweep();
 

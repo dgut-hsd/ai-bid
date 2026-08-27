@@ -89,12 +89,13 @@ fi
 echo "==> 冒烟测试: $SMOKE_URL"
 ok=0
 for _ in $(seq 1 "$SMOKE_RETRIES"); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' "$SMOKE_URL" 2>/dev/null || true)"
-    if [ "$code" = "200" ]; then ok=1; break; fi
+    body="$(curl -s "$SMOKE_URL" 2>/dev/null || true)"
+    # 校验响应体 code==200，避免「后端 404 被异常包装成 HTTP 200」造成的假通过。
+    if printf '%s' "$body" | grep -Eq '"code"[[:space:]]*:[[:space:]]*200'; then ok=1; break; fi
     sleep 3
 done
 if [ "$ok" != "1" ]; then
-    echo "❌ 冒烟测试未通过（$SMOKE_URL 未返回 200）。请查容器状态/日志，必要时 ./rollback.sh 回滚。"
+    echo "❌ 冒烟测试未通过（$SMOKE_URL 未返回 code==200）。请查容器状态/日志，必要时 ./rollback.sh 回滚。"
     docker compose ps
     exit 1
 fi

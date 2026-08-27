@@ -8,6 +8,11 @@ export const useStyles = createStyles(({ css, token }) => ({
       display: flex;
       flex-direction: column;
       gap: 1rem;
+
+      @media (max-width: 768px) {
+         padding: 0;
+         gap: 0;
+      }
    `,
 
    // 2. 上部分区：主布局 (分为左右)
@@ -20,6 +25,7 @@ export const useStyles = createStyles(({ css, token }) => ({
 
       @media (max-width: 768px) {
          flex-direction: column;
+         gap: 0;
       }
    `,
 
@@ -30,6 +36,10 @@ export const useStyles = createStyles(({ css, token }) => ({
       display: flex;
       flex-direction: column;
       gap: 2rem;
+
+      @media (max-width: 768px) {
+         gap: 0;
+      }
    `,
 
    // --- 右侧：统计卡片区 ---
@@ -39,8 +49,8 @@ export const useStyles = createStyles(({ css, token }) => ({
       display: flex;
 
       @media (max-width: 768px) {
-         flex: 0 0 100%;
-         min-width: 100%;
+         /* 移动端隐藏统计卡，聚焦列表 */
+         display: none;
       }
    `,
 
@@ -54,8 +64,14 @@ export const useStyles = createStyles(({ css, token }) => ({
       width: 100%;
 
       @media (max-width: 768px) {
-         flex-direction: column;
-         align-items: stretch;
+         /* 移动端：单行吸顶，搜索 + 筛选 + 上传 */
+         position: sticky;
+         top: 0;
+         z-index: 100;
+         gap: 8px;
+         padding: 8px 12px;
+         background: ${token.colorBgContainer};
+         border-bottom: 1px solid ${token.colorBorderSecondary};
       }
    `,
    searchInput: css`
@@ -79,6 +95,10 @@ export const useStyles = createStyles(({ css, token }) => ({
       display: flex;
       flex-direction: column;
       gap: 16px;
+
+      @media (max-width: 768px) {
+         gap: 0;
+      }
    `,
 
    // --- 第一行：分类标签 ---
@@ -87,6 +107,18 @@ export const useStyles = createStyles(({ css, token }) => ({
       gap: 1rem 1.5rem;
       flex-wrap: wrap;
       border-bottom: 1px solid ${token.colorBorderSecondary};
+
+      @media (max-width: 768px) {
+         /* 移动端：横向滚动单行，不再换行堆积 */
+         flex-wrap: nowrap;
+         overflow-x: auto;
+         padding: 8px 12px 0;
+         gap: 0.5rem 1.25rem;
+         scrollbar-width: none;
+         &::-webkit-scrollbar {
+            display: none;
+         }
+      }
    `,
    categoryTab: css`
       display: flex;
@@ -99,6 +131,7 @@ export const useStyles = createStyles(({ css, token }) => ({
       transition: all 0.2s ease-in;
       margin-bottom: -1px; // 盖住父元素的底边框
       border-bottom: 2px solid transparent;
+      white-space: nowrap;
 
       &:hover {
          color: ${token.colorPrimary};

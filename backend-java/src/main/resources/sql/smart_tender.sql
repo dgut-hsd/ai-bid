@@ -123,6 +123,7 @@ CREATE TABLE `knowledge_file` (
   `status` tinyint(4) DEFAULT 1 COMMENT '状态（0停用 1启用 2已删除）',
   `version` int(11) DEFAULT 1 COMMENT '版本号',
   `chunk_count` int(11) DEFAULT 0 COMMENT '分块数量',
+  `rust_document_id` varchar(64) DEFAULT NULL COMMENT 'Rust/Qdrant 文档ID（向量化入库成功后回填，删除时用于清理向量）',
   `upload_user_id` bigint(20) DEFAULT NULL COMMENT '上传用户ID',
   `upload_time` datetime DEFAULT NULL COMMENT '上传时间',
   `update_time` datetime DEFAULT NULL COMMENT '更新时间',
@@ -130,7 +131,8 @@ CREATE TABLE `knowledge_file` (
   KEY `idx_category` (`category`),
   KEY `idx_status` (`status`),
   KEY `idx_upload_user_id` (`upload_user_id`),
-  KEY `idx_upload_time` (`upload_time`)
+  KEY `idx_upload_time` (`upload_time`),
+  KEY `idx_rust_document_id` (`rust_document_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='标准库文件表';
 
 DROP TABLE IF EXISTS `knowledge_chunk`;

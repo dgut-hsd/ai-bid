@@ -92,10 +92,13 @@ function normalizeUserInfo(value: unknown): AuthUserInfo {
     optionalString(raw.realName) ??
     requireString(raw.username, 'user_info.username');
 
+  const isPlatformAdmin = raw.is_platform_admin === true;
+
   return {
     user_id: requireId(raw.user_id, 'user_info.user_id'),
     username: requireString(raw.username, 'user_info.username'),
     real_name: realName,
+    ...(isPlatformAdmin ? { is_platform_admin: true } : {}),
   };
 }
 

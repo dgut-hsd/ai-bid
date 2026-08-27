@@ -1,13 +1,15 @@
 import React from 'react';
-import { Table, Button, Pagination, Tooltip } from 'antd';
+import { Table, Button, Pagination, Tooltip, Empty } from 'antd';
 import { ExportOutlined } from '@ant-design/icons';
 import { useStyles } from '../style';
 import type { AuditIssue, IssueQueryParams } from '../types';
 
 import { IssueTableFilter } from './IssueTableFilter';
+import { IssueCard } from './IssueCard';
 import { useTableColumns } from '../hooks/useTableColumns';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Loading } from '@/components/Loading/Loading';
+import { useIsMobile } from '@/hooks/useMediaQuery';
 
 interface IssueTableProps {
    issues: AuditIssue[];
@@ -26,6 +28,7 @@ export const IssueTable: React.FC<IssueTableProps> = ({
 }) => {
    const { styles, theme } = useStyles();
    const navigate = useNavigate();
+   const isMobile = useIsMobile();
    const { id: bidId } = useParams<{ id: string }>();
 
    const columns = useTableColumns(queryParams.page, queryParams.size, theme);
@@ -43,6 +46,58 @@ export const IssueTable: React.FC<IssueTableProps> = ({
       return <Loading loading={loading} />;
    }
 
+   const handleExport = () => {
+      if (bidId) {
+         navigate(`/bidReview/report/${bidId}`);
+      }
+   };
+
+   // 移动端：卡片式问题列表
+   if (isMobile) {
+      return (
+         <div className={styles.tableArea}>
+            <IssueTableFilter
+               severity={queryParams.severity ?? 'all'}
+               category={queryParams.category ?? 'all'}
+               keyword={queryParams.keyword ?? ''}
+               onChange={(filters) => onFilterChange({ ...filters, page: 1 })}
+               onReset={handleReset}
+            />
+
+            {issues.length === 0 ? (
+               <Empty description='暂无问题' style={{ padding: '32px 0' }} />
+            ) : (
+               <div className={styles.mobileCardList}>
+                  {issues.map((issue) => (
+                     <IssueCard
+                        key={issue.issueNo || issue.id}
+                        issue={issue}
+                     />
+                  ))}
+               </div>
+            )}
+
+            <div className={styles.paginationArea}>
+               <Pagination
+                  current={queryParams.page}
+                  pageSize={queryParams.size}
+                  total={total}
+                  size='small'
+                  showSizeChanger={false}
+                  onChange={(page) => onFilterChange({ page })}
+               />
+               <Button
+                  type='primary'
+                  icon={<ExportOutlined />}
+                  onClick={handleExport}
+               >
+                  导出审核报告
+               </Button>
+            </div>
+         </div>
+      );
+   }
+
    return (
       <div className={styles.tableArea}>
          <IssueTableFilter
@@ -58,7 +113,7 @@ export const IssueTable: React.FC<IssueTableProps> = ({
             dataSource={issues}
             rowKey='issueNo'
             pagination={false}
-            scroll={{ x: 800 }}
+            scroll={{ x: 'max-content' }}
          />
 
          <div className={styles.paginationArea}>
@@ -80,11 +135,7 @@ export const IssueTable: React.FC<IssueTableProps> = ({
             <Button
                type='primary'
                icon={<ExportOutlined />}
-               onClick={() => {
-                  if (bidId) {
-                     navigate(`/bidReview/report/${bidId}`);
-                  }
-               }}
+               onClick={handleExport}
             >
                导出审核报告
             </Button>

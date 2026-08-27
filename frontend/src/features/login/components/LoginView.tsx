@@ -22,11 +22,11 @@ export function LoginView({
 
    return (
       <div className={styles.loginContainer}>
-         {/* --- 左侧面板：品牌与插图 --- */}
+         {/* --- 左侧面板：品牌与插图（仅桌面端显示，移动端隐藏以聚焦表单） --- */}
          <div className={styles.loginLeftPanel}>
             <div className={styles.loginBrandContent}>
                <h1 className={styles.loginBrandTitle}>
-                  {<LogoIcon />}智能标书审核系统
+                  <LogoIcon />智能标书审核系统
                </h1>
                <div className={styles.loginIllustration}>
                   <DocumentIllustration tokenTheme={tokenTheme} />
@@ -34,9 +34,6 @@ export function LoginView({
                <p className={styles.loginBrandSubtitle}>
                   AI赋能标书智能审核 助力财务合规管控
                </p>
-            </div>
-            <div className={styles.loginBrandFooter}>
-               东莞理工学院财务部·智能审核平台
             </div>
          </div>
 
@@ -47,6 +44,7 @@ export function LoginView({
                      <LogoIcon />
                      <h2 className={styles.loginCardTitle}>智能标书审核系统</h2>
                   </div>
+                  <p className={styles.loginCardSubtitle}>登录以继续使用</p>
                </div>
 
                <LoginForm

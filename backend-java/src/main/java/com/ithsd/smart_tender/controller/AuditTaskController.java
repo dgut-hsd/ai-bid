@@ -51,6 +51,16 @@ public class AuditTaskController {
     }
 
     /**
+     * 按标书(bid)取「当前任务」状态。服务端裁决 taskId，前端不再依赖 localStorage。
+     * 该文档从未发起审核时返回 taskId=null / status=pending（前端显示「准备审核」）。
+     */
+    @GetMapping("/by-bid/{bidId}")
+    public Result<AuditTaskStatusVO> getStatusByBid(
+            @PathVariable @Min(value = 1, message = "bidId必须大于0") Long bidId) {
+        return Result.success(auditTaskService.getStatusByBid(bidId));
+    }
+
+    /**
      * 恢复因 Java 重启、SSE 丢帧等原因遗留的审核中任务。
      * 先读取状态完成归属校验，再从 Rust 结果缓存恢复，不会重新调用模型。
      */

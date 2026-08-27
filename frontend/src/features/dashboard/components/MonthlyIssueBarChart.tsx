@@ -1,6 +1,16 @@
 import React, { useEffect, useMemo, useRef } from 'react';
-import * as echarts from 'echarts';
+import * as echarts from 'echarts/core';
+import { BarChart } from 'echarts/charts';
+import {
+   GridComponent,
+   GraphicComponent,
+   TooltipComponent,
+} from 'echarts/components';
+import { CanvasRenderer } from 'echarts/renderers';
+import type { EChartsOption } from 'echarts';
 import { COLORS } from '@/theme/constants';
+
+echarts.use([BarChart, GridComponent, GraphicComponent, TooltipComponent, CanvasRenderer]);
 import { Typography } from 'antd';
 import { useStyles } from '../style';
 import type { DailyIssueCountItem } from '../types';
@@ -18,7 +28,7 @@ export const MonthlyIssueBarChart: React.FC<MonthlyIssueBarChartProps> = ({
    const { styles } = useStyles();
    const chartData = Array.isArray(data) ? data : [];
 
-   const option: echarts.EChartsOption = useMemo(() => {
+   const option: EChartsOption = useMemo(() => {
       const counts = chartData.map((item) => item.count);
       const isEmpty = counts.length === 0 || counts.every((n) => n === 0);
 
@@ -36,7 +46,7 @@ export const MonthlyIssueBarChart: React.FC<MonthlyIssueBarChartProps> = ({
                   fontSize: 14,
                },
             },
-         } as echarts.EChartsOption;
+         } as EChartsOption;
       }
 
       return {

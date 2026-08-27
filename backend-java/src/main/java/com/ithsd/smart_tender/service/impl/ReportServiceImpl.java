@@ -101,11 +101,13 @@ public class ReportServiceImpl implements ReportService {
         wrapper.eq("audit_id", auditId)
                 .eq("tenant_id", tenantId);
         AuditReport report = auditReportMapper.selectOne(wrapper);
-        
+
+        // 报告尚未生成（任务存在但无 audit_report 记录）时返回 null，
+        // 由前端据此触发 generateReport；不要抛 404 阻断首次生成流程。
         if (report == null) {
-            throw TenantScope.resourceNotFound();
+            return null;
         }
-        
+
         return report.getDocContent();
     }
 
@@ -159,7 +161,6 @@ public class ReportServiceImpl implements ReportService {
         md.append("# 标书审核报告\n\n");
         
         md.append("**项目名称：** ").append(tender.getBidName() != null ? tender.getBidName() : "").append("  \n");
-        md.append("**供应商名称：** ").append(tender.getSupplierName() != null ? tender.getSupplierName() : "").append("  \n");
         md.append("**审核日期：** ").append(LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy年MM月dd日"))).append("  \n");
         md.append("**审核人：** ").append(auditor != null && auditor.getRealName() != null ? auditor.getRealName() : "").append("  \n");
         md.append("\n---\n\n");
@@ -169,8 +170,6 @@ public class ReportServiceImpl implements ReportService {
         md.append("| --- | --- |\n");
         md.append("| 项目名称 | ").append(tender.getBidName() != null ? tender.getBidName() : "").append(" |\n");
         md.append("| 标书类型 | ").append(getFileCategoryText(tender.getFileCategory())).append(" |\n");
-        md.append("| 供应商名称 | ").append(tender.getSupplierName() != null ? tender.getSupplierName() : "").append(" |\n");
-        md.append("| 预算金额 | ").append(tender.getBudgetAmount() != null ? tender.getBudgetAmount().toString() + "元" : "").append(" |\n");
         md.append("| 标书页数 | ").append(tender.getPageCount() != null ? tender.getPageCount().toString() + "页" : "").append(" |\n");
         md.append("| 上传时间 | ").append(tender.getUploadTime() != null ? 
                 tender.getUploadTime().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")) : "").append(" |\n");

@@ -9,21 +9,21 @@ import lombok.NoArgsConstructor;
 import java.io.Serializable;
 import java.time.LocalDateTime;
 
-/** 管理后台用户列表项。 */
+/** 企业管理后台用户列表项。 */
 @Data
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class AdminUserVO implements Serializable {
+public class EnterpriseUserVO implements Serializable {
 
     @JsonProperty("user_id")
     private Long userId;
     private String username;
     @JsonProperty("real_name")
     private String realName;
-    /** OWNER 或 MEMBER */
+    /** 租户角色：OWNER / ADMIN / MEMBER */
     private String role;
-    /** 账号状态：ACTIVE / DISABLED */
+    /** 成员状态：ACTIVE / SUSPENDED */
     private String status;
     @JsonProperty("member_id")
     private Long memberId;

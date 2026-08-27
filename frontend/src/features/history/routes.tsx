@@ -1,5 +1,9 @@
+import { lazy } from 'react';
 import type { RouteObject } from 'react-router-dom';
-import { HistoryPage } from './HistoryPage';
+
+const HistoryPage = lazy(() =>
+   import('./HistoryPage').then((m) => ({ default: m.HistoryPage }))
+);
 
 export const historyRoutes: RouteObject[] = [
    { path: 'history', element: <HistoryPage /> },
