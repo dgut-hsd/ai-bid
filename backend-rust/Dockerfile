@@ -32,6 +32,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-core libreoffice-writer fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
+# 专用非 root 系统用户：供 docx_convert_service 以非 root 身份运行 soffice（安全加固）
+RUN useradd -r -s /usr/sbin/nologin -m -d /home/soffice soffice
+
 WORKDIR /app
 
 COPY --from=build /app/target/release/server /usr/local/bin/server

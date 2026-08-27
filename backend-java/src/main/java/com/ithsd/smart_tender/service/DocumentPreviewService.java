@@ -14,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Comparator;
@@ -32,6 +33,9 @@ public class DocumentPreviewService {
 
     /** 单次 soffice 转换超时（秒），超时后强制终止进程。 */
     private static final long CONVERT_TIMEOUT_SECONDS = 60;
+
+    /** soffice 以该非 root 系统用户运行（安全加固；见 Dockerfile 中创建的同名用户）。 */
+    private static final String SOFFICE_USER = "soffice";
 
     private static final Semaphore CONVERSION_LIMIT = new Semaphore(MAX_CONCURRENT_CONVERSIONS);
 
@@ -77,7 +81,8 @@ public class DocumentPreviewService {
      * 这里直接调用容器内已安装的 LibreOffice，避免额外服务依赖。</p>
      *
      * <p>关键防护：每次转换使用独立的 UserInstallation profile，规避并发时的
-     * profile 锁冲突；用信号量限制并发数；对进程设置超时并强制终止。</p>
+     * profile 锁冲突；用信号量限制并发数；对进程设置超时并强制终止；
+     * soffice 以非 root 系统用户（{@code soffice}）运行，降低处理不可信文档的权限。</p>
      */
     public byte[] convertToPdfBytes(Path sourcePath) throws IOException {
         String name = sourcePath.getFileName().toString().toLowerCase();
@@ -112,7 +117,11 @@ public class DocumentPreviewService {
         Path profileDir = Files.createDirectories(tempDir.resolve("profile"));
         Path logFile = tempDir.resolve("soffice.log");
 
+        // soffice 以非 root 用户运行，需让其可写这些临时工作目录（随机目录名，用完即删）
+        makeWorldAccessible(tempDir, outDir, profileDir);
+
         List<String> command = List.of(
+                "runuser", "-u", SOFFICE_USER, "--",
                 resolveSoffice(),
                 "--headless",
                 "--nologo",
@@ -171,6 +180,12 @@ public class DocumentPreviewService {
         }
         // 依赖 PATH（Linux 容器内通常为 /usr/bin/soffice）
         return "soffice";
+    }
+
+    private void makeWorldAccessible(Path... paths) throws IOException {
+        for (Path path : paths) {
+            Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rwxrwxrwx"));
+        }
     }
 
     private void killProcessTree(Process process) {

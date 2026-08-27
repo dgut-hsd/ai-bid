@@ -113,8 +113,6 @@ management:
 preview:
   cache:
     path: ${ST_PREVIEW_CACHE_DIR:D:/smart-tender/data/preview-cache}
-  converter:
-    base-url: http://localhost:8088
 
 audit:
   queue:
