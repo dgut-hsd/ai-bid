@@ -12,7 +12,7 @@ export function AdminGuard() {
    );
 
    if (!isCurrentTenantOwner(tenantList, currentTenantId)) {
-      return <Navigate to='/dashboard' replace />;
+      return <Navigate to='/bidReview' replace />;
    }
 
    return <Outlet />;

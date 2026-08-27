@@ -4,18 +4,8 @@ import { useDebounce } from '@/hooks/useDebounce';
 
 import { ResponsiveRangePicker } from '@/components/ResponsiveRangePicker/ResponsiveRangePicker';
 
-import type { AuditListQueryParams, FileCategory } from '../types';
-import {
-   Form,
-   Row,
-   Col,
-   Input,
-   Select,
-   Button,
-   Space,
-   Drawer,
-   Badge,
-} from 'antd';
+import type { AuditListQueryParams } from '../types';
+import { Form, Row, Col, Input, Button, Space, Drawer, Badge } from 'antd';
 import {
    ReloadOutlined,
    FilterOutlined,
@@ -23,14 +13,8 @@ import {
 } from '@ant-design/icons';
 import dayjs from 'dayjs';
 
-const FILE_CATEGORY_CONFIG: { value: FileCategory; label: FileCategory }[] = [
-   { value: '标书', label: '标书' },
-   { value: '合同', label: '合同' },
-];
-
 interface FormValues {
    bidName?: string;
-   fileCategory?: FileCategory;
    uploadDateRange?: [dayjs.Dayjs, dayjs.Dayjs];
 }
 
@@ -39,6 +23,8 @@ interface AuditFilterProps {
    queryParams: AuditListQueryParams;
    onSearch: (values: Partial<AuditListQueryParams>) => void;
    onReset: () => void;
+   /** 工具栏右侧插槽（如「新建项目并上传招标文件」按钮） */
+   extra?: React.ReactNode;
 }
 
 export const AuditFilter: React.FC<AuditFilterProps> = ({
@@ -46,6 +32,7 @@ export const AuditFilter: React.FC<AuditFilterProps> = ({
    queryParams,
    onSearch,
    onReset,
+   extra,
 }) => {
    const [form] = Form.useForm();
    const isMobile = useIsMobile();
@@ -63,7 +50,6 @@ export const AuditFilter: React.FC<AuditFilterProps> = ({
 
    useEffect(() => {
       form.setFieldsValue({
-         fileCategory: queryParams.fileCategory || undefined,
          uploadDateRange:
             queryParams.uploadStartTime && queryParams.uploadEndTime
                ? [
@@ -74,27 +60,25 @@ export const AuditFilter: React.FC<AuditFilterProps> = ({
       });
    }, [queryParams, form]);
 
-   // 激活的次要筛选数量（文件类型 + 时间），用于「筛选」按钮角标
-   const activeFilterCount = [
-      queryParams.fileCategory ? 1 : 0,
-      queryParams.uploadStartTime || queryParams.uploadEndTime ? 1 : 0,
-   ].reduce((s, n) => s + n, 0);
+   // 激活的次要筛选数量（仅上传时间），用于「筛选」按钮角标
+   const activeFilterCount = queryParams.uploadStartTime ||
+      queryParams.uploadEndTime
+      ? 1
+      : 0;
 
-   // 桌面端：整表单提交（含项目名称）
+   // 桌面端：整表单提交（含项目名称 + 上传时间）
    const handleDesktopFinish = (values: FormValues) => {
       onSearch({
          bidName: values.bidName,
-         fileCategory: values.fileCategory,
          uploadStartTime:
             values.uploadDateRange?.[0]?.format('YYYY-MM-DD') || '',
          uploadEndTime: values.uploadDateRange?.[1]?.format('YYYY-MM-DD') || '',
       });
    };
 
-   // 移动端抽屉：只提交次要筛选，不动搜索框
+   // 移动端抽屉：只提交上传时间，不动搜索框
    const handleDrawerFinish = (values: FormValues) => {
       onSearch({
-         fileCategory: values.fileCategory,
          uploadStartTime:
             values.uploadDateRange?.[0]?.format('YYYY-MM-DD') || '',
          uploadEndTime: values.uploadDateRange?.[1]?.format('YYYY-MM-DD') || '',
@@ -146,6 +130,8 @@ export const AuditFilter: React.FC<AuditFilterProps> = ({
                aria-label='重置'
             />
 
+            {extra}
+
             <Drawer
                title='筛选条件'
                placement='bottom'
@@ -156,15 +142,6 @@ export const AuditFilter: React.FC<AuditFilterProps> = ({
                <Form form={form} onFinish={handleDrawerFinish} layout='vertical'>
                   <Form.Item name='uploadDateRange' label='上传时间'>
                      <ResponsiveRangePicker />
-                  </Form.Item>
-
-                  <Form.Item name='fileCategory' label='文件类型'>
-                     <Select
-                        options={FILE_CATEGORY_CONFIG}
-                        placeholder='请选择文件类型'
-                        allowClear
-                        style={{ width: '100%' }}
-                     />
                   </Form.Item>
 
                   <Space
@@ -181,7 +158,7 @@ export const AuditFilter: React.FC<AuditFilterProps> = ({
       );
    }
 
-   // ── 桌面端：保持原有左右分栏筛选 ──
+   // ── 桌面端：项目名称 + 上传时间 + 重置（左）｜ 额外操作（右）──
    return (
       <div className={styles.filterSection}>
          <Form
@@ -192,21 +169,16 @@ export const AuditFilter: React.FC<AuditFilterProps> = ({
          >
             <Row
                gutter={16}
-               style={{
-                  display: 'flex',
-                  alignItems: 'center',
-               }}
+               align='middle'
+               wrap
+               style={{ rowGap: '8px' }}
             >
-               <Col
-                  sm={12}
-                  md={8}
-                  flex={1}
-                  style={{
-                     width: '100%',
-                     maxWidth: '350px',
-                  }}
-               >
-                  <Form.Item name='bidName' label='项目名称'>
+               <Col flex='1 1 220px' style={{ maxWidth: '320px' }}>
+                  <Form.Item
+                     name='bidName'
+                     label='项目名称'
+                     style={{ marginBottom: 0 }}
+                  >
                      <Input
                         placeholder='请输入项目名称'
                         allowClear
@@ -217,45 +189,39 @@ export const AuditFilter: React.FC<AuditFilterProps> = ({
                   </Form.Item>
                </Col>
 
-               <Col sm={12} md={8} flex='none'>
-                  <Form.Item name='uploadDateRange' label='上传时间'>
+               <Col flex='none'>
+                  <Form.Item
+                     name='uploadDateRange'
+                     label='上传时间'
+                     style={{ marginBottom: 0 }}
+                  >
                      <ResponsiveRangePicker onChange={debouncedSubmit} />
                   </Form.Item>
                </Col>
-            </Row>
 
-            <Row gutter={16}>
-               <Col xs={24} sm={14} md={6}>
-                  <Form.Item name='fileCategory' label='文件类型'>
-                     <Select
-                        options={FILE_CATEGORY_CONFIG}
-                        placeholder='请选择文件类型'
-                        allowClear
-                        onChange={debouncedSubmit}
+               <Col flex='none'>
+                  <Form.Item style={{ marginBottom: 0 }}>
+                     <Button
+                        icon={<ReloadOutlined />}
+                        onClick={handleResetAll}
                         style={{ height: 35 }}
-                     />
+                     >
+                        重置
+                     </Button>
                   </Form.Item>
                </Col>
 
-               <Col xs={24} sm={16} md={6}>
-                  <Form.Item label=' ' colon={false}>
-                     <Space
-                        style={{
-                           display: 'flex',
-                           alignItems: 'center',
-                           justifyContent: 'flex-start',
-                        }}
-                     >
-                        <Button
-                           icon={<ReloadOutlined />}
-                           onClick={handleResetAll}
-                           style={{ fontSize: '1.4rem', height: 35 }}
-                        >
-                           重置
-                        </Button>
-                     </Space>
-                  </Form.Item>
-               </Col>
+               {extra && (
+                  <Col
+                     flex='auto'
+                     style={{
+                        display: 'flex',
+                        justifyContent: 'flex-end',
+                     }}
+                  >
+                     {extra}
+                  </Col>
+               )}
             </Row>
          </Form>
       </div>

@@ -25,19 +25,9 @@ export const BidUploadPage: React.FC = () => {
    const { mutateAsync: uploadDoc, isPending } = useUploadBidMutation();
 
    const handleFinish = async (values: BidUploadQueryParams, file: File) => {
-      const params: BidUploadQueryParams = {
-         id: values.id,
-         fileCategory: values.fileCategory,
-         bidName: values.bidName,
-         supplierName: values.supplierName,
-         budgetAmount: values.budgetAmount,
-         version: values.version,
-         projectId: values.projectId,
-      };
-
-      await uploadDoc({ params, file });
-      message.success('标书上传成功！');
-      navigate('/bidReview');
+      const uploaded = await uploadDoc({ params: values, file });
+      message.success('招标文件上传成功！');
+      navigate(`/bidReview/detail/${uploaded.id}`);
    };
 
    return (

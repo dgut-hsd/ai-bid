@@ -89,6 +89,10 @@ export const deleteProject = async (id: number): Promise<void> => {
    await request.delete<unknown, BaseResponse<void>>(`/api/projects/${id}`);
 };
 
+export const deleteTenderVersion = async (id: number): Promise<void> => {
+   await request.delete<unknown, BaseResponse<void>>(`/api/bid-documents/${id}`);
+};
+
 export const auditListOptions = {
    list: () =>
       queryOptions({
@@ -123,6 +127,20 @@ export const useDeleteProject = () => {
       onSuccess: () => {
          queryClient.invalidateQueries({ queryKey: ['auditList'] });
          queryClient.invalidateQueries({ queryKey: ['auditListWithParams'] });
+         queryClient.invalidateQueries({ queryKey: ['dashboardList'] });
+      },
+   });
+};
+
+export const useDeleteTenderVersion = () => {
+   const queryClient = useQueryClient();
+
+   return useMutation({
+      mutationFn: (id: number) => deleteTenderVersion(id),
+      onSuccess: () => {
+         queryClient.invalidateQueries({ queryKey: ['auditList'] });
+         queryClient.invalidateQueries({ queryKey: ['auditListWithParams'] });
+         queryClient.invalidateQueries({ queryKey: ['projectVersions'] });
       },
    });
 };

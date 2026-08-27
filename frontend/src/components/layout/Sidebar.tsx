@@ -3,7 +3,6 @@ import { Layout, Menu, Typography } from 'antd';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useSelector } from 'react-redux';
 import {
-   LayoutDashboard,
    FileSearch,
    BookOpen,
    Users,
@@ -17,8 +16,7 @@ import bidAuditLogo from '../../assets/bid-audit.svg';
 const { Sider } = Layout;
 
 const BASE_NAV_ITEMS = [
-   { key: '/dashboard', icon: <LayoutDashboard size={18} />, label: '工作台' },
-   { key: '/bidReview', icon: <FileSearch size={18} />, label: '审核列表' },
+   { key: '/bidReview', icon: <FileSearch size={18} />, label: '招标文件' },
    { key: '/library', icon: <BookOpen size={18} />, label: '标准库管理' },
 ];
 

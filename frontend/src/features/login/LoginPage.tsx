@@ -42,7 +42,7 @@ export function LoginPage() {
                'pathname' in locationState.from &&
                typeof locationState.from.pathname === 'string'
                   ? locationState.from.pathname
-                  : '/dashboard';
+                  : '/bidReview';
             navigate(from, { replace: true });
          } else {
             message.error(response.msg || '登录失败');

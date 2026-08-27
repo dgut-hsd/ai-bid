@@ -7,7 +7,6 @@ import { TenantGuard } from './TenantGuard';
 import { AdminGuard } from './AdminGuard';
 
 import { loginRoutes } from '../features/login/routes';
-import { dashboardRoutes } from '../features/dashboard/routes';
 import { uploadRoutes } from '../features/bidUpload/routes';
 import { bidAuditRoutes } from '../features/bidAudit/routes';
 import { libraryRoutes } from '../features/bidLibrary/routes';
@@ -38,7 +37,7 @@ export const router = createBrowserRouter([
          </RouteGuard>
       ),
       children: [
-         { index: true, element: <Navigate to='/dashboard' replace /> },
+         { index: true, element: <Navigate to='/bidReview' replace /> },
 
          // 系统管理 — 仅企业 OWNER 可访问
          {
@@ -50,7 +49,8 @@ export const router = createBrowserRouter([
          {
             element: <TenantGuard />,
             children: [
-               ...dashboardRoutes,
+               // 工作台与审核列表已合并为「招标文件」主工作区，旧工作台路径重定向到新列表
+               { path: 'dashboard', element: <Navigate to='/bidReview' replace /> },
                ...uploadRoutes,
                ...bidAuditRoutes,
                ...libraryRoutes,
