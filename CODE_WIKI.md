@@ -30,7 +30,8 @@
 | AI 引擎 | Rust 2024 (edition) + Tokio + Axum | 3001 |
 | 数据库 | MySQL 8.0 | 3306 |
 | 缓存/队列 | Redis 7.2 | 6379 |
-| 向量库 | Milvus 2.6 | 19530 |
+| 向量库 | Qdrant 1.17 | 6333/6334 |
+| 图数据库 | Neo4j 5.21 | 7474/7687 |
 | 文档转换 | JODConverter + LibreOffice | 8088 |
 | LLM | DashScope (qwen-plus) 或 OpenAI 兼容接口 | — |
 | 嵌入 | BGE-M3 ONNX 本地推理 / DashScope text-embedding-v4 远程 | — |
@@ -38,7 +39,7 @@
 
 ### 核心理念
 
-Rust 引擎遵循 **"搜索优先，渐进积累"**：不预设庞大本地知识库，审查时才联网搜法规/案例/负面清单/标准范本，搜过的结果缓存下来渐进生长成知识库。无外部数据库依赖（内存 SessionGraph + JSON 文件）。
+Rust 引擎遵循 **"搜索优先，渐进积累"**：不预设庞大本地知识库，审查时才联网搜法规/案例/负面清单/标准范本，搜过的结果缓存下来渐进生长成知识库。向量检索落 Qdrant、知识图谱落 Neo4j，其余核心结构（SessionGraph/审查结果）仍以内存 + JSON 文件为主。
 
 ---
 
@@ -53,9 +54,10 @@ Rust 引擎遵循 **"搜索优先，渐进积累"**：不预设庞大本地知�
        │ REST/SSE           │ REST/SSE 透明代理   │ 内存审核
        ▼                    ▼                    ▼
                  ┌───────────────┐        ┌─────────────┐
-                 │ MySQL 3306    │        │  Milvus     │
-                 │ Redis 6379    │        │  19530      │
-                 └───────────────┘        └─────────────┘
+                 │ MySQL 3306    │        │  Qdrant     │
+                 │ Redis 6379    │        │  6333/6334  │
+                 │ Neo4j 7474    │        └─────────────┘
+                 └───────────────┘
 ```
 
 ### 三层职责划分
@@ -744,7 +746,7 @@ backend-rust (Axum :3001)
    ├─ BGE-M3 ONNX ── 本地嵌入
    ├─ DashScope/OpenAI ── LLM 推理
    ├─ SearXNG/DashScope ── 联网搜索
-   └─ Milvus (:19530) ── 向量检索（Rust 侧）
+   └─ Qdrant (:6333/6334) ── 向量检索（Rust 侧）
 ```
 
 ### 8.2 核心数据流（审核任务端到端）
@@ -841,7 +843,7 @@ Scout（Phase 0）输出低置信度 Hypothesis → SessionGraph 注入 Phase 2 
 ### 9.2 启动顺序
 
 ```
-1. Docker 基础设施  →  MySQL + Redis + Milvus + MinIO + etcd + doc-converter
+1. Docker 基础设施  →  MySQL + Redis + Qdrant + Neo4j
 2. .env 配置        →  填写 API 密钥和环境变量
 3. Rust 引擎 :3001  →  AI 审核 / 嵌入 / LLM 调用
 4. Java 网关 :3000  →  认证 / CRUD / SSE 推送
@@ -923,12 +925,9 @@ python run_benchmark.py --base-url http://127.0.0.1:3001 --scope injected
 |---|---|---|
 | smart-mysql | 3306 | MySQL 8.0（smart_tender_system） |
 | smart-redis | 6379 | Redis 7.2 |
-| milvus-standalone | 19530 | Milvus 向量库 |
-| milvus-minio | 9000/9001 | Milvus 对象存储 |
-| milvus-etcd | 2379 | Milvus 配置中心 |
-| doc-converter | 8088 | DOCX→PDF 转换 |
-
-> Milvus Attu 占用 3000 端口，与 Java 后端冲突。不需要 Web 管理界面时可在 docker-compose.yml 注释 attu。
+| smart-qdrant | 6333/6334 | Qdrant 向量库（6333 REST + Dashboard，6334 gRPC） |
+| my-neo4j | 7474/7687 | Neo4j 图数据库（凭据由 ST_NEO4J_AUTH 配置，含 APOC 插件） |
+| doc-converter | 8088 | DOCX→PDF 转换（可选，默认注释；docx 走 Rust 侧转换） |
 
 ---
 
