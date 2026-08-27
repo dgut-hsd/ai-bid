@@ -5,10 +5,8 @@ import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.ithsd.smart_tender.common.BaseContext;
 import com.ithsd.smart_tender.common.BizException;
-import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
 import com.ithsd.smart_tender.mapper.TenderMapper;
-import com.ithsd.smart_tender.model.entity.AuditIssue;
 import com.ithsd.smart_tender.model.entity.AuditTask;
 import com.ithsd.smart_tender.model.enums.AuditTaskStatusEnum;
 import com.ithsd.smart_tender.mapper.UserMapper;
@@ -48,16 +46,14 @@ public class TenderServiceImpl implements TenderService {
 
     private final TenderMapper tenderMapper;
     private final AuditTaskMapper auditTaskMapper;
-    private final AuditIssueMapper auditIssueMapper;
     private final UserMapper userMapper;
     private final com.ithsd.smart_tender.mapper.ProjectMapper projectMapper;
     private final AuditTaskService auditTaskService;
     private final StoragePathService storagePathService;
 
-    public TenderServiceImpl(TenderMapper tenderMapper, AuditTaskMapper auditTaskMapper, AuditIssueMapper auditIssueMapper, UserMapper userMapper, com.ithsd.smart_tender.mapper.ProjectMapper projectMapper, @Lazy AuditTaskService auditTaskService, StoragePathService storagePathService) {
+    public TenderServiceImpl(TenderMapper tenderMapper, AuditTaskMapper auditTaskMapper, UserMapper userMapper, com.ithsd.smart_tender.mapper.ProjectMapper projectMapper, @Lazy AuditTaskService auditTaskService, StoragePathService storagePathService) {
         this.tenderMapper = tenderMapper;
         this.auditTaskMapper = auditTaskMapper;
-        this.auditIssueMapper = auditIssueMapper;
         this.userMapper = userMapper;
         this.projectMapper = projectMapper;
         this.auditTaskService = auditTaskService;
@@ -240,18 +236,23 @@ public class TenderServiceImpl implements TenderService {
     public PageResult page(TenderPageQueryDTO dto) {
         Long tenantId = TenantScope.requiredTenantId();
         Page<Project> pageInfo = new Page<>(dto.getPage(), dto.getSize());
-        LambdaQueryWrapper<Project> wrapper = new LambdaQueryWrapper<>();
-        
-        wrapper.eq(Project::getTenantId, tenantId)
-               .eq(Project::getUserId, BaseContext.getCurrentId())
-               .like(StringUtils.hasText(dto.getBidName()), Project::getProjectName, dto.getBidName())
-               .ge(dto.getUploadStartTime() != null, Project::getCreateTime, dto.getUploadStartTime() != null ? dto.getUploadStartTime().atStartOfDay() : null)
-               .le(dto.getUploadEndTime() != null, Project::getCreateTime, dto.getUploadEndTime() != null ? dto.getUploadEndTime().atTime(java.time.LocalTime.MAX) : null)
-               // 按「改动时间」(updateTime) 倒序：每次上传新版本标书都会刷新 Project.updateTime，
-               // 因此刚上传完标书的项目会排在列表最前，便于在审核列表里快速定位。
-               .orderByDesc(Project::getUpdateTime);
 
-        Page<Project> p = projectMapper.selectPage(pageInfo, wrapper);
+        LocalDateTime uploadStart = dto.getUploadStartTime() != null
+                ? dto.getUploadStartTime().atStartOfDay() : null;
+        LocalDateTime uploadEnd = dto.getUploadEndTime() != null
+                ? dto.getUploadEndTime().atTime(java.time.LocalTime.MAX) : null;
+
+        // 状态与文件类型过滤下推到 SQL（见 ProjectMapper#selectProjectPageWithStatus），
+        // 保证分页 total 与当前页数据严格一致，修复「先分页再内存过滤导致 total 失配」问题。
+        Page<Project> p = projectMapper.selectProjectPageWithStatus(
+                pageInfo,
+                tenantId,
+                BaseContext.getCurrentId(),
+                dto.getBidName(),
+                dto.getFileCategory(),
+                dto.getStatus(),
+                uploadStart,
+                uploadEnd);
 
         List<TenderVO> vos = p.getRecords().stream().map(project -> {
             TenderVO vo = new TenderVO();
@@ -283,44 +284,15 @@ public class TenderServiceImpl implements TenderService {
                 // 文件类型英文转中文
                 vo.setFileCategory(latestTender.getFileCategory() != null && latestTender.getFileCategory().equals("bid") ? "标书" : "合同");
                 vo.setParseStatus(resolveParseStatusFromLatestTask(latestTender.getId()));
-                vo.setAuditResult(resolveAuditResultFromLatestTask(latestTender.getId()));
                 fillAuditorName(vo);
             } else {
                 vo.setFileCategory(null);
                 vo.setAuditorName(null);
                 vo.setParseStatus(0);
-                vo.setAuditResult(null);
             }
 
             return vo;
         }).collect(Collectors.toList());
-
-        if (dto.getStatus() != null) {
-            final Integer s = dto.getStatus();
-            vos = vos.stream()
-                    .filter(vo -> {
-                        int ps = vo.getParseStatus() == null ? 0 : vo.getParseStatus();
-                        switch (s) {
-                            case 1: return ps == 1;                                                 // 审核中
-                            case 2: return ps == 2 && "pass".equals(vo.getAuditResult());          // 已通过
-                            case 3: return ps == 3;                                                 // 审核失败
-                            case 4: return ps == 2 && !"pass".equals(vo.getAuditResult());          // 需修改
-                            case 0:
-                            default: return ps == 0;                                                // 待审核
-                        }
-                    })
-                    .collect(Collectors.toList());
-        }
-
-        // 根据 fileCategory 进行内存过滤 (如果前端传了 fileCategory 参数)
-        if (StringUtils.hasText(dto.getFileCategory())) {
-            String targetCategory = dto.getFileCategory().equals("bid") ? "标书" : "合同";
-            vos = vos.stream()
-                     .filter(vo -> targetCategory.equals(vo.getFileCategory()))
-                     .collect(Collectors.toList());
-            // 注意：内存过滤会导致返回的 total 和当前页的数量不匹配，最完美的做法是自定义 SQL，但为了简单这里做内存过滤
-            // 如果希望完全准确，需要在 mapper 层写关联查询 SQL
-        }
 
         return new PageResult(p.getTotal(), vos);
     }
@@ -342,7 +314,6 @@ public class TenderServiceImpl implements TenderService {
         TenderVO vo = new TenderVO();
         BeanUtils.copyProperties(tender, vo);
         vo.setParseStatus(resolveParseStatusFromLatestTask(tender.getId()));
-        vo.setAuditResult(resolveAuditResultFromLatestTask(tender.getId()));
 
         fillAuditorName(vo);
 
@@ -376,7 +347,6 @@ public class TenderServiceImpl implements TenderService {
             TenderVO vo = new TenderVO();
             BeanUtils.copyProperties(tender, vo);
             vo.setParseStatus(resolveParseStatusFromLatestTask(tender.getId()));
-            vo.setAuditResult(resolveAuditResultFromLatestTask(tender.getId()));
             fillAuditorName(vo);
 
             return vo;
@@ -439,31 +409,6 @@ public class TenderServiceImpl implements TenderService {
             return 3;
         }
         return 0;
-    }
-
-    private String resolveAuditResultFromLatestTask(Long bidId) {
-        AuditTask task = findLatestTaskByBidId(bidId);
-        if (task == null) {
-            return null;
-        }
-        // 基于 taskStatus + 是否发现风险点映射结果：
-        // 完成且无风险点 → 已通过(pass)；完成但有风险点 → 需修改(reject)
-        Integer status = task.getTaskStatus();
-        if (AuditTaskStatusEnum.COMPLETED.getCode().equals(status)) {
-            return hasIssues(task.getId()) ? "reject" : "pass";
-        }
-        if (AuditTaskStatusEnum.FAILED.getCode().equals(status)) return "reject";
-        return "pending";
-    }
-
-    /** 审核完成后是否产生过风险点（audit_issue 存在记录即视为「需修改」） */
-    private boolean hasIssues(Long auditId) {
-        if (auditId == null) {
-            return false;
-        }
-        Long count = auditIssueMapper.selectCount(new LambdaQueryWrapper<AuditIssue>()
-                .eq(AuditIssue::getAuditId, auditId));
-        return count != null && count > 0;
     }
 
     @Override

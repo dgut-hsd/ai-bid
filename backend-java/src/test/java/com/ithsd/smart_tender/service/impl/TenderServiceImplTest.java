@@ -616,7 +616,6 @@ class TenderServiceImplTest {
         assertNotNull(result);
         assertEquals("标书A", result.getBidName());
         assertEquals(2, result.getParseStatus()); // COMPLETED -> parseStatus=2
-        assertEquals("pass", result.getAuditResult());
         assertEquals("审核员张三", result.getAuditorName());
     }
 
@@ -647,7 +646,6 @@ class TenderServiceImplTest {
 
         assertNotNull(result);
         assertEquals(1, result.getParseStatus()); // PROCESSING -> parseStatus=1
-        assertEquals("pending", result.getAuditResult());
     }
 
     @Test
