@@ -9,6 +9,23 @@ export const useStyles = createStyles(({ css, token }) => ({
          font-size: 1.2rem;
       }
    `,
+   // 顶部状态 Tab 的计数角标
+   tabCount: css`
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 1.8rem;
+      height: 1.8rem;
+      padding: 0 6px;
+      margin-left: 6px;
+      border-radius: 999px;
+      background-color: ${token.colorFillSecondary};
+      color: ${token.colorTextSecondary};
+      font-size: 1.1rem;
+      font-weight: 500;
+      line-height: 1;
+      vertical-align: middle;
+   `,
    filterSection: css`
       display: flex;
       align-items: center;
