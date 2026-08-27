@@ -14,11 +14,16 @@ import {
    Popconfirm,
    Drawer,
    Empty,
+   Pagination,
+   Skeleton,
 } from 'antd';
 import { PlusOutlined, SwapOutlined, ReloadOutlined, TeamOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { platformApi } from '../api/platform';
+import { useStyles } from '../style';
+import { PlatformTenantCard } from '../components/PlatformTenantCard';
+import { useIsMobile } from '@/hooks/useMediaQuery';
 import type { PlatformTenant, CreatePlatformTenantParams } from '../types';
 import type { EnterpriseUser } from '../../enterprise/types';
 
@@ -39,6 +44,8 @@ const ROLE_LABEL: Record<string, string> = {
 export const PlatformEnterprisesPage: React.FC = () => {
    const { message } = App.useApp();
    const queryClient = useQueryClient();
+   const { styles } = useStyles();
+   const isMobile = useIsMobile();
 
    const [page, setPage] = React.useState(1);
    const [size, setSize] = React.useState(20);
@@ -250,7 +257,7 @@ export const PlatformEnterprisesPage: React.FC = () => {
    ];
 
    return (
-      <div style={{ padding: 24 }}>
+      <div style={{ padding: isMobile ? 12 : 24 }}>
          <Card>
             <div
                style={{
@@ -268,7 +275,7 @@ export const PlatformEnterprisesPage: React.FC = () => {
                      平台管理员可创建、停用、恢复、删除企业，并转移企业所有权。
                   </Typography.Text>
                </Space>
-               <Space>
+               <Space wrap>
                   <Input.Search
                      placeholder='搜索企业名称/编码'
                      allowClear
@@ -276,12 +283,12 @@ export const PlatformEnterprisesPage: React.FC = () => {
                         setPage(1);
                         setKeyword(value);
                      }}
-                     style={{ width: 220 }}
+                     style={{ width: isMobile ? '100%' : 220 }}
                   />
                   <Select
                      placeholder='状态'
                      allowClear
-                     style={{ width: 120 }}
+                     style={{ width: isMobile ? '100%' : 120 }}
                      value={statusFilter}
                      onChange={(value) => {
                         setPage(1);
@@ -303,25 +310,69 @@ export const PlatformEnterprisesPage: React.FC = () => {
                </Space>
             </div>
 
-            <Table
-               rowKey='tenant_id'
-               columns={columns}
-               dataSource={tenantsQuery.data?.items || []}
-               loading={tenantsQuery.isLoading}
-               size='middle'
-               scroll={{ x: 'max-content' }}
-               pagination={{
-                  current: page,
-                  pageSize: size,
-                  total: tenantsQuery.data?.total || 0,
-                  showSizeChanger: true,
-                  onChange: (nextPage, nextSize) => {
-                     setPage(nextPage);
-                     setSize(nextSize);
-                  },
-                  showTotal: (total) => `共 ${total} 家企业`,
-               }}
-            />
+            {isMobile ? (
+               tenantsQuery.isLoading && !tenantsQuery.data ? (
+                  <Skeleton active paragraph={{ rows: 4 }} style={{ padding: 12 }} />
+               ) : (tenantsQuery.data?.items?.length ?? 0) === 0 ? (
+                  <Empty description='暂无企业' style={{ padding: '32px 0' }} />
+               ) : (
+                  <>
+                     <div className={styles.mobileCardList}>
+                        {(tenantsQuery.data?.items || []).map((tenant) => (
+                           <PlatformTenantCard
+                              key={tenant.tenant_id}
+                              tenant={tenant}
+                              busy={lifecycleMutation.isPending}
+                              onMembers={setMembersTarget}
+                              onTransfer={setTransferTarget}
+                              onLifecycle={(t, action) =>
+                                 lifecycleMutation.mutate({
+                                    tenantId: t.tenant_id,
+                                    action,
+                                 })
+                              }
+                           />
+                        ))}
+                     </div>
+                     <div
+                        style={{
+                           display: 'flex',
+                           justifyContent: 'center',
+                           marginTop: 16,
+                        }}
+                     >
+                        <Pagination
+                           current={page}
+                           pageSize={size}
+                           total={tenantsQuery.data?.total || 0}
+                           size='small'
+                           showSizeChanger={false}
+                           onChange={(nextPage) => setPage(nextPage)}
+                        />
+                     </div>
+                  </>
+               )
+            ) : (
+               <Table
+                  rowKey='tenant_id'
+                  columns={columns}
+                  dataSource={tenantsQuery.data?.items || []}
+                  loading={tenantsQuery.isLoading}
+                  size='middle'
+                  scroll={{ x: 'max-content' }}
+                  pagination={{
+                     current: page,
+                     pageSize: size,
+                     total: tenantsQuery.data?.total || 0,
+                     showSizeChanger: true,
+                     onChange: (nextPage, nextSize) => {
+                        setPage(nextPage);
+                        setSize(nextSize);
+                     },
+                     showTotal: (total) => `共 ${total} 家企业`,
+                  }}
+               />
+            )}
          </Card>
 
          {/* 创建企业 */}

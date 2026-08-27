@@ -66,4 +66,52 @@ export const useStyles = createStyles(({ css, token }) => ({
       color: ${token.colorTextTertiary};
       user-select: none;
    `,
+
+   // ─── 移动端：表格 → 卡片（只显示项目名称 + 状态 + 操作） ───
+   mobileListContainer: css`
+      padding: 12px;
+   `,
+   mobileCardList: css`
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      width: 100%;
+   `,
+   auditCard: css`
+      background: ${token.colorBgContainer};
+      border: 1px solid ${token.colorBorderSecondary};
+      border-radius: ${token.borderRadiusLG}px;
+      padding: 12px 14px;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+
+      &:active {
+         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+      }
+   `,
+   auditCardHeader: css`
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+   `,
+   auditCardName: css`
+      font-size: 1.5rem;
+      font-weight: 600;
+      color: ${token.colorText};
+      line-height: 1.4;
+      word-break: break-all;
+      min-width: 0;
+   `,
+   auditCardStatus: css`
+      flex-shrink: 0;
+   `,
+   auditCardActions: css`
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid ${token.colorBorderSecondary};
+   `,
 }));

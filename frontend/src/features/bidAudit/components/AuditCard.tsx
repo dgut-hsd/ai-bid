@@ -1,8 +1,7 @@
 import React from 'react';
-import { Tag, Button, Popconfirm } from 'antd';
+import { Button, Popconfirm } from 'antd';
 import { EyeOutlined, DeleteOutlined, UploadOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
-import dayjs from 'dayjs';
 import { StatusTag } from './StatusTag';
 import type { ProjectItem } from '../types';
 
@@ -14,6 +13,10 @@ interface AuditCardProps {
    styles: Record<string, string>;
 }
 
+/**
+ * 移动端招标文件卡片 —— 只保留核心信息：
+ * 项目名称 + 审核状态 + 操作按钮（查看 / 上传新版本 / 删除）。
+ */
 export const AuditCard: React.FC<AuditCardProps> = ({
    record,
    deleting,
@@ -22,23 +25,14 @@ export const AuditCard: React.FC<AuditCardProps> = ({
    styles,
 }) => {
    const navigate = useNavigate();
-   const uploadDate = record.uploadTime
-      ? dayjs(record.uploadTime).format('YYYY-MM-DD HH:mm')
-      : '-';
 
    return (
       <div className={styles.auditCard} onClick={() => onView(record.projectId)}>
          <div className={styles.auditCardHeader}>
             <span className={styles.auditCardName}>{record.bidName || '-'}</span>
-            <div className={styles.auditCardBadges}>
+            <span className={styles.auditCardStatus}>
                <StatusTag parseStatus={record.parseStatus} />
-               <Tag style={{ margin: 0 }}>V{record.version}</Tag>
-            </div>
-         </div>
-
-         <div className={styles.auditCardMeta}>
-            <span>审核人：{record.auditorName || '-'}</span>
-            <span>上传：{uploadDate}</span>
+            </span>
          </div>
 
          <div className={styles.auditCardActions}>

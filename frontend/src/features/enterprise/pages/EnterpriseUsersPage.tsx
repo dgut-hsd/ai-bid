@@ -12,11 +12,16 @@ import {
    Card,
    Typography,
    Popconfirm,
+   Skeleton,
+   Empty,
 } from 'antd';
 import { PlusOutlined, KeyOutlined, UserDeleteOutlined, EditOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { enterpriseApi } from '../api/enterprise';
+import { useStyles } from '../style';
+import { EnterpriseUserCard } from '../components/EnterpriseUserCard';
+import { useIsMobile } from '@/hooks/useMediaQuery';
 import type { EnterpriseUser, EnterpriseRole, CreateUserParams } from '../types';
 
 const { Title } = Typography;
@@ -37,6 +42,8 @@ const ROLE_OPTIONS = SELECTABLE_ROLES.map((role) => ({
 export const EnterpriseUsersPage: React.FC = () => {
    const { message } = App.useApp();
    const queryClient = useQueryClient();
+   const { styles } = useStyles();
+   const isMobile = useIsMobile();
 
    const [createModalOpen, setCreateModalOpen] = React.useState(false);
    const [resetTarget, setResetTarget] = React.useState<EnterpriseUser | null>(null);
@@ -286,7 +293,7 @@ export const EnterpriseUsersPage: React.FC = () => {
    ];
 
    return (
-      <div style={{ padding: 24 }}>
+      <div style={{ padding: isMobile ? 12 : 24 }}>
          <Card>
             <div
                style={{
@@ -311,15 +318,57 @@ export const EnterpriseUsersPage: React.FC = () => {
                </Button>
             </div>
 
-            <Table
-               rowKey='user_id'
-               columns={columns}
-               dataSource={usersQuery.data || []}
-               loading={usersQuery.isLoading}
-               size='middle'
-               scroll={{ x: 'max-content' }}
-               pagination={false}
-            />
+            {isMobile ? (
+               usersQuery.isLoading && !usersQuery.data ? (
+                  <Skeleton active paragraph={{ rows: 4 }} style={{ padding: 12 }} />
+               ) : (usersQuery.data?.length ?? 0) === 0 ? (
+                  <Empty description='暂无用户' style={{ padding: '32px 0' }} />
+               ) : (
+                  <div className={styles.mobileCardList}>
+                     {(usersQuery.data || []).map((user) => (
+                        <EnterpriseUserCard
+                           key={user.user_id}
+                           user={user}
+                           roleUpdating={changeRoleMutation.isPending}
+                           onEdit={(u) => {
+                              setEditTarget(u);
+                              editForm.setFieldsValue({
+                                 username: u.username,
+                                 real_name: u.real_name ?? '',
+                              });
+                           }}
+                           onResetPassword={setResetTarget}
+                           onToggleStatus={(u) =>
+                              toggleStatusMutation.mutate({
+                                 userId: u.user_id,
+                                 status:
+                                    u.status === 'SUSPENDED'
+                                       ? 'ACTIVE'
+                                       : 'SUSPENDED',
+                              })
+                           }
+                           onRemove={(u) => removeMutation.mutate(u.user_id)}
+                           onChangeRole={(u, role) =>
+                              changeRoleMutation.mutate({
+                                 userId: u.user_id,
+                                 role,
+                              })
+                           }
+                        />
+                     ))}
+                  </div>
+               )
+            ) : (
+               <Table
+                  rowKey='user_id'
+                  columns={columns}
+                  dataSource={usersQuery.data || []}
+                  loading={usersQuery.isLoading}
+                  size='middle'
+                  scroll={{ x: 'max-content' }}
+                  pagination={false}
+               />
+            )}
          </Card>
 
          {/* 创建用户 */}
