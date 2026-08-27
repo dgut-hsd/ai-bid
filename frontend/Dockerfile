@@ -6,6 +6,9 @@ RUN npm install -g pnpm@11.20.0
 
 WORKDIR /app
 
+# 构建期内存上限：宿主机 7.7G 无 swap，限制 node/vite/tsc 堆避免构建 OOM
+ENV NODE_OPTIONS="--max-old-space-size=1536"
+
 # 先复制依赖清单，利用 Docker 层缓存（依赖没变就不重装）
 # pnpm-workspace.yaml 含 allowBuilds（esbuild 放行），必须一起 COPY，否则 pnpm 11 会忽略 esbuild 构建脚本
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./

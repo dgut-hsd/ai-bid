@@ -1,6 +1,9 @@
 # ── Java 后端多阶段构建：Maven 构建 → JRE 运行 ──
 FROM maven:3.9-eclipse-temurin-17 AS build
 
+# 构建期内存上限：宿主机 7.7G 无 swap，限制 Maven/JVM 避免构建 OOM
+ENV MAVEN_OPTS="-Xmx1024m -XX:MaxMetaspaceSize=512m"
+
 WORKDIR /app
 
 # 先复制 pom，利用依赖缓存（pom 已配置阿里云 Maven 镜像，加速下载）
