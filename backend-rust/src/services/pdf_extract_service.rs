@@ -1427,7 +1427,7 @@ mod tests {
             Ok(())
         };
         let doc = try_extract_with_python("/tmp/x.pdf", &ok).expect("应返回 Some(真实坐标)");
-        let bb = doc.pages[0].blocks[0].bbox;
+        let bb = &doc.pages[0].blocks[0].bbox;
         assert!(
             bb.x0 > 0.0 && bb.x1 != 400.0 && (bb.bottom - bb.top) > 20.1,
             "应为非占位 bbox，got {:?}",
