@@ -46,6 +46,10 @@ services:
       RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
       # JWT 密钥
       ST_JWT_SECRET: ${ST_JWT_SECRET:-local-test-only-jwt-secret-change-me}
+      # 孤儿任务守护（Spring relaxed binding：AUDIT_ORPHAN_* → audit.orphan.*）
+      AUDIT_ORPHAN_ENABLED: "${AUDIT_ORPHAN_ENABLED:-true}"
+      AUDIT_ORPHAN_SWEEP_INTERVAL_MS: "${AUDIT_ORPHAN_SWEEP_INTERVAL_MS:-60000}"
+      AUDIT_ORPHAN_STALE_AFTER_MS: "${AUDIT_ORPHAN_STALE_AFTER_MS:-180000}"
       # 文件存储（覆盖 prod profile 里硬编码的 /opt 路径）
       FILE_STORAGE_PATH: /data/uploads
       PREVIEW_CACHE_PATH: /data/preview-cache

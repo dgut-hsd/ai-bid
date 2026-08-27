@@ -43,6 +43,14 @@ NEW=$(git rev-parse HEAD)
 
 cd "$DEPLOY_DIR"
 
+# ── 发布护栏：存在在途审核时重建 Rust 会制造孤儿任务 ──────────────
+source "$DEPLOY_DIR/lib/audit-guard.sh"
+if ! audit_guard_ensure_idle "${1:-}"; then
+    echo ""
+    echo "❌ 发布已中止（存在进行中的审核任务）。"
+    exit 1
+fi
+
 echo "==> 重新构建并滚动更新（数据卷不动）..."
 if docker compose up -d --build --remove-orphans; then
     echo "$NEW" >> "$HISTORY_FILE"

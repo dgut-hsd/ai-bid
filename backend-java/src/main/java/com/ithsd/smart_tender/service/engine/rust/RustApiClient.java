@@ -156,7 +156,9 @@ public class RustApiClient {
 
             URI uri = URI.create(properties.apiUrl("/api/v1/documents/" + documentId + "/review"));
             HttpRequest request = signedRequestBuilder("POST", uri, body)
-                    .timeout(Duration.ofMillis(properties.getConnectTimeoutMs()))  // 仅连接超时，不设读超时
+                    // 整体请求超时用独立的 reviewStartTimeoutMs（默认 30s），
+                    // 不能复用 5s 连接超时，否则引擎忙碌时会把慢启动误判为失败。
+                    .timeout(Duration.ofMillis(properties.getReviewStartTimeoutMs()))
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofByteArray(body))
                     .build();

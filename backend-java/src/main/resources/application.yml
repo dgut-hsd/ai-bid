@@ -133,11 +133,19 @@ audit:
     max-pool-size: 4
     queue-capacity: 100
     keep-alive-seconds: 60
+  # 孤儿任务守护：周期性对账滞留的 PENDING/PROCESSING 任务。
+  # 详见 docs/审核稳定性修复计划.md（F3）。
+  orphan:
+    enabled: true
+    sweep-interval-ms: 60000     # 守护扫描周期
+    stale-after-ms: 180000       # updated_at 落后超过 3 分钟视为陈旧候选
 # Rust 审核引擎 HTTP API（唯一 AI 引擎）
 rust:
   api:
     base-url: http://127.0.0.1:3001
     connect-timeout-ms: 5000
     read-timeout-ms: 900000
+    # 启动审核（POST /review）的整体请求超时，独立于连接超时
+    review-start-timeout-ms: 30000
     health-check-enabled: true
     internal-secret: ${RUST_API_INTERNAL_SECRET:dev-internal-secret-key-2024}

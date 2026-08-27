@@ -3,6 +3,7 @@ package com.ithsd.smart_tender.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ithsd.smart_tender.common.BaseContext;
+import com.ithsd.smart_tender.common.BizException;
 import com.ithsd.smart_tender.common.TenantContext;
 import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.config.RustApiProperties;
@@ -39,9 +40,7 @@ import org.springframework.util.StringUtils;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.Objects;
 import java.util.stream.Collectors;
 
@@ -53,7 +52,6 @@ import java.util.stream.Collectors;
 @Service
 public class AuditEngineServiceImpl implements AuditEngineService {
 
-    private static final Set<String> RUNNING_TASKS = ConcurrentHashMap.newKeySet();
     private static final Logger log = LoggerFactory.getLogger(AuditEngineServiceImpl.class);
 
     private final AuditTaskMapper auditTaskMapper;
@@ -65,6 +63,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
     private final RustSseClient rustSseClient;
     private final RustApiProperties rustApiProperties;
     private final TraceService traceService;
+    private final RunningTaskRegistry runningTaskRegistry;
     private final ObjectMapper objectMapper = new ObjectMapper()
             .setPropertyNamingStrategy(
                 com.fasterxml.jackson.databind.PropertyNamingStrategies.SNAKE_CASE);
@@ -78,7 +77,8 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             RustDocumentService rustDocumentService,
             RustSseClient rustSseClient,
             RustApiProperties rustApiProperties,
-            TraceService traceService
+            TraceService traceService,
+            RunningTaskRegistry runningTaskRegistry
     ) {
         this.auditTaskMapper = auditTaskMapper;
         this.auditIssueMapper = auditIssueMapper;
@@ -89,6 +89,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
         this.rustSseClient = rustSseClient;
         this.rustApiProperties = rustApiProperties;
         this.traceService = traceService;
+        this.runningTaskRegistry = runningTaskRegistry;
     }
 
     @Override
@@ -103,7 +104,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
         try {
             log.info("audit async task started: taskId={}, tenantId={}, thread={}"
                     , taskId, envelope.tenantId(), Thread.currentThread().getName());
-            if (!RUNNING_TASKS.add(runningKey)) {
+            if (!runningTaskRegistry.register(runningKey)) {
                 log.warn("audit task skipped due to concurrent start, taskId={}, tenantId={}"
                         , taskId, envelope.tenantId());
                 return;
@@ -111,7 +112,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             try {
                 runEngine(taskId);
             } finally {
-                RUNNING_TASKS.remove(runningKey);
+                runningTaskRegistry.remove(runningKey);
             }
         } finally {
             TenantContext.clear();
@@ -124,19 +125,23 @@ public class AuditEngineServiceImpl implements AuditEngineService {
     }
 
     @Override
-    public boolean recover(String taskId) {
+    public RecoverOutcome recover(String taskId) {
         AuditTask task = loadTask(taskId);
         if (task == null) {
-            return false;
+            log.warn("recover: task not found, taskId={}", taskId);
+            return RecoverOutcome.NOT_FOUND;
         }
         if (AuditTaskStatusEnum.COMPLETED.getCode().equals(task.getTaskStatus())) {
-            return true;
+            return RecoverOutcome.COMPLETED;
+        }
+        if (AuditTaskStatusEnum.FAILED.getCode().equals(task.getTaskStatus())) {
+            return RecoverOutcome.FAILED;
         }
 
         String rustDocId = rustDocumentService.getCachedDocumentId(task.getBidId());
         if (!StringUtils.hasText(rustDocId)) {
             log.warn("recover: no cached Rust document id, taskId={}", taskId);
-            return false;
+            return RecoverOutcome.STATE_LOST;
         }
 
         RustReviewResultResponse result;
@@ -144,19 +149,43 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             result = rustApiClient.getReviewResult(rustDocId);
         } catch (Exception e) {
             log.warn("recover: Rust result unavailable, taskId={}, {}", taskId, e.getMessage());
-            return false;
+            return RecoverOutcome.UNREACHABLE;
         }
         if (result != null && result.getResult() != null
                 && (result.isCompleted() || result.isPartialFailed())) {
             log.info("recover: {} Rust result found, taskId={}, docId={}",
                     result.isPartialFailed() ? "partial_failed" : "completed", taskId, rustDocId);
             completeTaskFromReview(task, result.getResult());
-            return true;
+            return RecoverOutcome.COMPLETED;
         }
         if (result != null && result.isFailed()) {
             failTask(task, "Rust 审核失败: " + result.getError());
+            return RecoverOutcome.FAILED;
         }
-        return false;
+        if (result == null) {
+            log.warn("recover: Rust has no review record (state lost?), taskId={}, docId={}",
+                    taskId, rustDocId);
+            return RecoverOutcome.STATE_LOST;
+        }
+        // pending → 审核仍在 Rust 进行中
+        return RecoverOutcome.STILL_RUNNING;
+    }
+
+    @Override
+    public void failOrphan(String taskId) {
+        AuditTask task = loadTask(taskId);
+        if (task == null) {
+            log.warn("failOrphan: task not found, taskId={}", taskId);
+            return;
+        }
+        Integer status = task.getTaskStatus();
+        if (AuditTaskStatusEnum.COMPLETED.getCode().equals(status)
+                || AuditTaskStatusEnum.FAILED.getCode().equals(status)) {
+            log.info("failOrphan: task already terminal, taskId={}, status={}", taskId, status);
+            return;
+        }
+        log.warn("failOrphan: marking orphan task failed, taskId={}, status={}", taskId, status);
+        failTask(task, "审核任务因引擎中断成为孤儿，已自动判定失败，请重新发起审核");
     }
 
     // ── 主流程 ──────────────────────────────────────────────────────
@@ -180,6 +209,11 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             sseHub.close(taskId);
             return;
         }
+
+        // 主流程结束标记：任何路径退出（完成/失败/超时）后都应停止 SSE 重连。
+        // 声明在 try 外，finally 块统一置位。
+        final java.util.concurrent.atomic.AtomicBoolean relayStop =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
 
         try {
             // Stage 1: 上传文件到 Rust（幂等）
@@ -209,8 +243,8 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             CompletableFuture<String> reviewErrorSignal = new CompletableFuture<>();
 
             // 启动 Rust SSE 实时推送 relay（在调用 Rust POST /review 之前连接，
-            // 确保不丢失早期事件）
-            CompletableFuture<Void> sseRelay = rustSseClient.connect(rustDocId, (eventType, data) -> {
+            // 确保不丢失早期事件）。断线后按退避策略重连，直到审核结束。
+            CompletableFuture<Void> sseRelay = rustSseClient.connectWithReconnect(rustDocId, (eventType, data) -> {
                 try {
                     switch (eventType) {
                         case "agent_progress" -> {
@@ -312,7 +346,9 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                 } catch (Exception e) {
                     log.debug("SSE relay event process failed: {}", e.getMessage());
                 }
-            });
+            },
+            () -> relayStop.get() || reviewDoneSignal.isDone() || reviewErrorSignal.isDone(),
+            com.ithsd.smart_tender.service.engine.rust.SseRetryPolicy.defaults());
 
             // 等待 SSE 连接就绪（避免丢失早期事件）
             waitForSseConnection(sseRelay);
@@ -360,6 +396,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             log.error("❌ [审核] 未预期的异常导致审核失败: taskId={} — {}", taskId, ex.getMessage(), ex);
             failTask(task, crop(ex.getMessage()));
         } finally {
+            relayStop.set(true);
             sseHub.close(taskId);
         }
     }
@@ -590,18 +627,18 @@ public class AuditEngineServiceImpl implements AuditEngineService {
 
             try {
                 RustReviewResultResponse result = rustApiClient.getReviewResult(rustDocId);
-                if (result != null && result.isCompleted()) {
-                    return result.getResult();
+                RustReviewResponse response = classifyPollResult(result);
+                if (response != null) {
+                    return response;
                 }
-                if (result != null && result.isPartialFailed() && result.getResult() != null) {
-                    log.warn("Rust review partial_failed (部分 clause 失败，落库已有 findings): docId={}, findings={}",
-                            rustDocId,
-                            result.getResult().getFindings() != null ? result.getResult().getFindings().size() : 0);
-                    return result.getResult();
-                }
-                if (result != null && result.isFailed()) {
-                    log.error("Rust review failed: docId={}, error={}", rustDocId, result.getError());
-                    return null;
+                // response == null → Rust 侧仍为 pending，继续轮询
+            } catch (BizException e) {
+                if (e.getCode() != null && e.getCode() == 5701) {
+                    // 5701 = Rust 连接失败（引擎可能暂时不可达），保持重试
+                    log.warn("Rust result poll failed, will retry: docId={}, {}", rustDocId, e.getMessage());
+                } else {
+                    // 终态判定（failed / 状态丢失）→ 快速失败，携带真实原因
+                    throw e;
                 }
             } catch (Exception e) {
                 log.warn("Rust result poll failed, will retry: docId={}, {}", rustDocId, e.getMessage());
@@ -628,6 +665,39 @@ public class AuditEngineServiceImpl implements AuditEngineService {
 
         log.error("Rust review timed out after {}min: docId={}",
                 rustApiProperties.getReviewTimeoutMinutes(), rustDocId);
+        return null;
+    }
+
+    /**
+     * 单次轮询结果的处置（纯函数，便于单测）。
+     *
+     * <ul>
+     *   <li>null（Rust 404：无任何审核记录）→ 审核已启动则状态丢失，抛 5705</li>
+     *   <li>completed / partial_failed（带结果）→ 返回结果</li>
+     *   <li>failed → 抛 5705，透传 Rust 原始错误</li>
+     *   <li>pending → 返回 null，继续轮询</li>
+     * </ul>
+     */
+    static RustReviewResponse classifyPollResult(RustReviewResultResponse result) {
+        if (result == null) {
+            throw new BizException(5705,
+                    "Rust 审核状态丢失（引擎可能重启），请重新发起审核");
+        }
+        if (result.isCompleted()) {
+            return result.getResult();
+        }
+        if (result.isPartialFailed()) {
+            if (result.getResult() != null) {
+                return result.getResult();
+            }
+            throw new BizException(5705,
+                    "Rust 审核部分失败且无可用结果，请重新发起审核");
+        }
+        if (result.isFailed()) {
+            String reason = result.getError();
+            throw new BizException(5705, "Rust 审核失败: "
+                    + (reason == null || reason.isBlank() ? "未知原因" : reason));
+        }
         return null;
     }
 

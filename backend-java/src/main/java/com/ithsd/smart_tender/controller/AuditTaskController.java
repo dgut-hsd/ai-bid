@@ -58,7 +58,8 @@ public class AuditTaskController {
     public Result<Boolean> recover(
             @PathVariable @NotBlank(message = "taskId不能为空") String taskId) {
         auditTaskService.getStatus(taskId);
-        return Result.success(auditEngineService.recover(taskId));
+        AuditEngineService.RecoverOutcome outcome = auditEngineService.recover(taskId);
+        return Result.success(outcome == AuditEngineService.RecoverOutcome.COMPLETED);
     }
 
     @GetMapping("/{taskId}/result")
