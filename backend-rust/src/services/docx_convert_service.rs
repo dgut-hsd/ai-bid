@@ -6,6 +6,8 @@
 //! ## 依赖
 //!
 //! 需要系统已安装 LibreOffice（Windows / Linux / macOS 均支持）。
+//! Linux 下以专用非 root 系统用户 `soffice` 运行（见 Dockerfile），
+//! 降低处理不可信文档时的权限。
 //! 默认搜索路径：
 //!   - Windows: `C:\Program Files\LibreOffice\program\soffice.exe`
 //!   - Linux/macOS: `soffice` (PATH 中)
@@ -62,12 +64,18 @@ fn find_soffice() -> Result<PathBuf> {
     )
 }
 
-/// 将 DOCX 文件转换为 PDF。
+/// 将 DOCX/DOC 文件转换为 PDF。
 ///
 /// # 参数
 ///
-/// * `input_path` - 输入的 .docx 文件路径
-/// * `output_dir` - 输出目录（生成的 PDF 文件名与输入相同，仅扩展名改为 .pdf）
+/// * `input_path` - 输入的 .docx / .doc 文件路径
+/// * `output_dir` - 输出目录（生成的 PDF 放在此处，文件名与输入同 stem）
+///
+/// # 安全 / 并发说明
+///
+/// 在 Linux 上，LibreOffice 以专用的非 root 系统用户（`soffice`）运行，
+/// 且每次转换使用独立的 `UserInstallation` profile 与独立的临时输出目录，
+/// 既避免并发时的 profile 锁冲突，也降低处理不可信文档时的权限。
 ///
 /// # 返回
 ///
@@ -98,22 +106,67 @@ pub fn convert_docx_to_pdf(input_path: &str, output_dir: &str) -> Result<PathBuf
     );
 
     let soffice = find_soffice()?;
+    let input_abs = input.canonicalize()?;
     let output_dir_abs = Path::new(output_dir)
         .canonicalize()
         .with_context(|| format!("输出目录不存在或无法访问: {}", output_dir))?;
+    let stem = input.file_stem().unwrap().to_string_lossy().to_string();
 
     println!(
         "  [转换] {} → PDF (LibreOffice)",
         input.file_name().unwrap().to_string_lossy()
     );
 
+    // 独立临时工作目录：out=输出、profile=隔离的用户配置（规避并发 profile 锁）
+    let work_root = std::env::temp_dir().join(format!("lo-convert-{}", uuid::Uuid::new_v4()));
+    let work_out = work_root.join("out");
+    let work_profile = work_root.join("profile");
+    std::fs::create_dir_all(&work_out)?;
+    std::fs::create_dir_all(&work_profile)?;
+    let _guard = WorkDirGuard(work_root.clone());
+
+    // 非 root 运行需要让 soffice 用户可写这些临时目录
+    #[cfg(target_os = "linux")]
+    {
+        make_world_writable(&work_root)?;
+        make_world_writable(&work_out)?;
+        make_world_writable(&work_profile)?;
+    }
+
+    // Linux：以非 root 专用用户运行，隔离 profile，输出到临时目录
+    #[cfg(target_os = "linux")]
+    let output = Command::new("runuser")
+        .arg("-u")
+        .arg("soffice")
+        .arg("--")
+        .arg(&soffice)
+        .arg("--headless")
+        .arg("--nologo")
+        .arg("--nofirststartwizard")
+        .arg("--nodefault")
+        .arg(format!("-env:UserInstallation=file://{}", work_profile.display()))
+        .arg("--convert-to")
+        .arg("pdf")
+        .arg("--outdir")
+        .arg(&work_out)
+        .arg(&input_abs)
+        .output()
+        .with_context(|| {
+            format!(
+                "无法以非 root 用户执行 LibreOffice(soffice)。请确认已安装 LibreOffice 且已创建 soffice 用户: {}",
+                soffice.display()
+            )
+        })?;
+
+    // Windows / macOS：直接以当前用户运行，输出到 output_dir（保留原行为）
+    #[cfg(not(target_os = "linux"))]
     let output = Command::new(&soffice)
         .arg("--headless")
         .arg("--convert-to")
         .arg("pdf")
         .arg("--outdir")
         .arg(&output_dir_abs)
-        .arg(input.canonicalize()?)
+        .arg(&input_abs)
         .output()
         .with_context(|| {
             format!(
@@ -132,15 +185,29 @@ pub fn convert_docx_to_pdf(input_path: &str, output_dir: &str) -> Result<PathBuf
         );
     }
 
-    // 推断输出 PDF 路径
-    let stem = input.file_stem().unwrap().to_string_lossy();
     let pdf_path = output_dir_abs.join(format!("{}.pdf", stem));
 
-    anyhow::ensure!(
-        pdf_path.exists(),
-        "LibreOffice 未生成 PDF 文件: {}",
-        pdf_path.display()
-    );
+    // Linux 下产物先写在临时目录，拷回调用方期望的 output_dir
+    #[cfg(target_os = "linux")]
+    {
+        let produced = work_out.join(format!("{}.pdf", stem));
+        anyhow::ensure!(
+            produced.exists(),
+            "LibreOffice 未生成 PDF 文件: {}",
+            produced.display()
+        );
+        std::fs::copy(&produced, &pdf_path)
+            .with_context(|| format!("无法将转换结果写入输出目录: {}", pdf_path.display()))?;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        anyhow::ensure!(
+            pdf_path.exists(),
+            "LibreOffice 未生成 PDF 文件: {}",
+            pdf_path.display()
+        );
+    }
 
     // 打印转换日志
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -149,6 +216,23 @@ pub fn convert_docx_to_pdf(input_path: &str, output_dir: &str) -> Result<PathBuf
     }
 
     Ok(pdf_path)
+}
+
+/// 将路径权限设为 rwxrwxrwx（供非 root 的 soffice 用户写入临时工作目录）。
+#[cfg(target_os = "linux")]
+fn make_world_writable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))?;
+    Ok(())
+}
+
+/// 临时工作目录守护：Drop 时递归删除（防止转换失败造成 /tmp 残留）。
+struct WorkDirGuard(PathBuf);
+
+impl Drop for WorkDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[cfg(test)]
