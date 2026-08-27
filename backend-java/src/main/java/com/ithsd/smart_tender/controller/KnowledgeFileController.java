@@ -47,7 +47,7 @@ public class KnowledgeFileController {
                                                @RequestParam(value = "fileName", required = false) String fileName,
                                                @RequestParam("category") String category,
                                                @RequestParam(value = "tags", required = false) String tags,
-                                               @RequestParam(value = "applicable_scope", required = false) String applicableScope,
+                                               @RequestParam(value = "applicableScope", required = false) String applicableScope,
                                                @RequestParam(value = "description", required = false) String description,
                                                @RequestParam(value = "status", required = false) Integer status) {
         log.info("上传标准库文件：fileName={}, category={}, applicableScope={}", fileName, category, applicableScope);
@@ -62,7 +62,7 @@ public class KnowledgeFileController {
     public Result<PageResult> getKnowledgeFileList(
             @RequestParam(value = "category", required = false) String category,
             @RequestParam(value = "tags", required = false) String tags,
-            @RequestParam(value = "applicable_scope", required = false) String applicableScope,
+            @RequestParam(value = "applicableScope", required = false) String applicableScope,
             @RequestParam(value = "sortBy", defaultValue = "asc") String sortBy,
             @RequestParam(value = "page", defaultValue = "1") int page,
             @RequestParam(value = "size", defaultValue = "10") int size) {
@@ -107,7 +107,7 @@ public class KnowledgeFileController {
             @RequestParam(value = "fileName", required = false) String fileName,
             @RequestParam("category") String category,
             @RequestParam(value = "tags", required = false) String tags,
-            @RequestParam(value = "applicable_scope", required = false) String applicableScope,
+            @RequestParam(value = "applicableScope", required = false) String applicableScope,
             @RequestParam(value = "description", required = false) String description,
             @RequestParam(value = "status", required = false) Integer status) {
         log.info("更新标准库文件：fileId={}, fileName={}, category={}", fileId, fileName, category);

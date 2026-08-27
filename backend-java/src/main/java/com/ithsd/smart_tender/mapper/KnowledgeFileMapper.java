@@ -12,7 +12,7 @@ public interface KnowledgeFileMapper extends BaseMapper<KnowledgeFile> {
     @Select("""
             SELECT id, tenant_id, file_name, file_path, file_size, file_type, category, tags,
                    description, applicable_scope, status, version, chunk_count,
-                   upload_user_id, upload_time, update_time
+                   rust_document_id, upload_user_id, upload_time, update_time
               FROM knowledge_file
              WHERE id = #{fileId} AND tenant_id = #{tenantId}
              LIMIT 1
