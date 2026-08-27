@@ -1,5 +1,6 @@
 package com.ithsd.smart_tender.model.dto;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import lombok.Data;
@@ -21,6 +22,7 @@ public class AdminCreateUserRequest implements Serializable {
 
     @NotBlank
     @Size(min = 1, max = 50)
+    @JsonProperty("real_name")
     private String realName;
 
     /** 角色：OWNER 或 MEMBER */
