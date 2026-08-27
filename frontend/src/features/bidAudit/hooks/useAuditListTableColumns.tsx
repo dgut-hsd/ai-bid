@@ -1,11 +1,9 @@
 import { useNavigate } from 'react-router-dom';
-import { App, Button, Dropdown } from 'antd';
+import { App, Button, Space } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import type { MenuProps } from 'antd';
 import {
    DeleteOutlined,
    EyeOutlined,
-   MoreOutlined,
    UploadOutlined,
 } from '@ant-design/icons';
 
@@ -65,10 +63,7 @@ export const useAuditListTableColumns = ({
          align: 'center',
          width: 110,
          render: (_, record) => (
-            <StatusTag
-               parseStatus={record.parseStatus}
-               auditResult={record.auditResult}
-            />
+            <StatusTag parseStatus={record.parseStatus} />
          ),
       },
       {
@@ -84,66 +79,67 @@ export const useAuditListTableColumns = ({
          title: '操作',
          key: 'actions',
          align: 'center',
-         width: 60,
+         width: 360,
          fixed: 'right',
          render: (_, record) => {
             const deletingCurrent =
                isDeletingProject && deletingProjectId === record.projectId;
 
-            const items: MenuProps['items'] = [
-               {
-                  key: 'detail',
-                  icon: <EyeOutlined />,
-                  label: '查看详情',
-               },
-               {
-                  key: 'upload',
-                  icon: <UploadOutlined />,
-                  label: '上传新版本',
-               },
-               { type: 'divider' },
-               {
-                  key: 'delete',
-                  icon: <DeleteOutlined />,
-                  label: deletingCurrent ? '删除中…' : '删除项目',
-                  danger: true,
-                  disabled: deletingCurrent,
-               },
-            ];
-
-            const onClickMenu: MenuProps['onClick'] = ({ key, domEvent }) => {
-               domEvent.stopPropagation();
-               if (key === 'detail') {
-                  navigate(`/bidReview/detail/${record.id}`);
-               } else if (key === 'upload') {
-                  navigate(`/upload/${record.projectId}`);
-               } else if (key === 'delete') {
-                  modal.confirm({
-                     title: '确定要删除该项目吗？',
-                     content:
-                        '删除后将同步移除该项目下全部版本与审核记录，且不可恢复。',
-                     okText: '确认删除',
-                     cancelText: '取消',
-                     okButtonProps: { danger: true },
-                     onOk: () => handleDeleteProject(record.projectId),
-                  });
-               }
+            const confirmDelete = () => {
+               modal.confirm({
+                  title: '确定要删除该项目吗？',
+                  content:
+                     '删除后将同步移除该项目下全部版本与审核记录，且不可恢复。',
+                  okText: '确认删除',
+                  cancelText: '取消',
+                  okButtonProps: { danger: true },
+                  onOk: () => handleDeleteProject(record.projectId),
+               });
             };
 
             return (
-               <Dropdown
-                  menu={{ items, onClick: onClickMenu }}
-                  trigger={['click']}
-                  placement='bottomRight'
-               >
+               <Space size='small' style={{ whiteSpace: 'nowrap' }}>
                   <Button
-                     type='text'
-                     aria-label='更多操作'
-                     icon={<MoreOutlined />}
-                     onClick={(e) => e.stopPropagation()}
+                     type='link'
+                     size='small'
+                     icon={<EyeOutlined />}
                      className={styles.actionLinkBtn}
-                  />
-               </Dropdown>
+                     onClick={(e) => {
+                        e.stopPropagation();
+                        navigate(`/bidReview/detail/${record.id}`);
+                     }}
+                  >
+                     查看详情
+                  </Button>
+
+                  <Button
+                     type='link'
+                     size='small'
+                     icon={<UploadOutlined />}
+                     className={styles.actionLinkBtn}
+                     onClick={(e) => {
+                        e.stopPropagation();
+                        navigate(`/upload/${record.projectId}`);
+                     }}
+                  >
+                     上传新版本
+                  </Button>
+
+                  <Button
+                     type='link'
+                     size='small'
+                     danger
+                     icon={<DeleteOutlined />}
+                     loading={deletingCurrent}
+                     className={styles.actionLinkBtn}
+                     onClick={(e) => {
+                        e.stopPropagation();
+                        confirmDelete();
+                     }}
+                  >
+                     {deletingCurrent ? '删除中…' : '删除项目'}
+                  </Button>
+               </Space>
             );
          },
       },

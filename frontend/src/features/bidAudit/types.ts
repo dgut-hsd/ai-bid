@@ -54,5 +54,4 @@ export interface ProjectItem {
   version: number;
   projectId: number;
   auditorName: string;
-  auditResult?: string | null;
 }

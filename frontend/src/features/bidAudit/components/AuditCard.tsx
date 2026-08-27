@@ -31,10 +31,7 @@ export const AuditCard: React.FC<AuditCardProps> = ({
          <div className={styles.auditCardHeader}>
             <span className={styles.auditCardName}>{record.bidName || '-'}</span>
             <div className={styles.auditCardBadges}>
-               <StatusTag
-                  parseStatus={record.parseStatus}
-                  auditResult={record.auditResult}
-               />
+               <StatusTag parseStatus={record.parseStatus} />
                <Tag style={{ margin: 0 }}>V{record.version}</Tag>
             </div>
          </div>
