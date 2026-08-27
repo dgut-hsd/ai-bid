@@ -6,7 +6,8 @@ public record TenantRequestContext(
         Long tenantId,
         String role,
         long sessionVersion,
-        String requestId
+        String requestId,
+        boolean platformAdmin
 ) {
     public TenantRequestContext {
         if (userId == null || userId <= 0) {
@@ -18,5 +19,19 @@ public record TenantRequestContext(
         if (requestId == null || requestId.isBlank()) {
             throw new IllegalArgumentException("requestId is required");
         }
+    }
+
+    /**
+     * Compatibility constructor. Tenant-scoped callers and legacy tests that do
+     * not carry a platform scope default to {@code platformAdmin = false}.
+     */
+    public TenantRequestContext(
+            Long userId,
+            Long tenantId,
+            String role,
+            long sessionVersion,
+            String requestId
+    ) {
+        this(userId, tenantId, role, sessionVersion, requestId, false);
     }
 }

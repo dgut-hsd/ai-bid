@@ -13,6 +13,8 @@ export interface AuthState {
    token: string | null;
    userInfo: UserInfo | null;
    isAuthenticated: boolean;
+   /** 是否平台管理员（系统管理者），用于门控「系统管理」入口。 */
+   isPlatformAdmin: boolean;
    /** 当前租户 ID（字符串，按租户 API 契约保存） */
    currentTenantId: string | null;
    /** 当前用户可见的租户列表 */
@@ -78,6 +80,7 @@ function stateFromSession(session: AuthSession): AuthState {
       token: session.token,
       userInfo: userInfoFromSession(session),
       isAuthenticated: true,
+      isPlatformAdmin: session.user_info.is_platform_admin ?? false,
       currentTenantId: session.current_tenant?.tenant_id ?? null,
       tenantList: session.tenants,
    };
@@ -139,6 +142,7 @@ function readInitialState(): AuthState {
          token: null,
          userInfo: null,
          isAuthenticated: false,
+         isPlatformAdmin: false,
          currentTenantId: null,
          tenantList: [],
       };
@@ -148,6 +152,7 @@ function readInitialState(): AuthState {
       token,
       userInfo,
       isAuthenticated: true,
+      isPlatformAdmin: false,
       currentTenantId: storage?.getItem(STORAGE_KEYS.tenantId) ?? null,
       tenantList: parseStoredTenantList(storage?.getItem(STORAGE_KEYS.tenantList) ?? null),
    };
@@ -188,6 +193,7 @@ function applySession(state: AuthState, session: AuthSession): void {
    state.token = next.token;
    state.userInfo = next.userInfo;
    state.isAuthenticated = next.isAuthenticated;
+   state.isPlatformAdmin = next.isPlatformAdmin;
    state.currentTenantId = next.currentTenantId;
    state.tenantList = next.tenantList;
 }
@@ -256,6 +262,7 @@ const authSlice = createSlice({
          state.token = null;
          state.userInfo = null;
          state.isAuthenticated = false;
+         state.isPlatformAdmin = false;
          state.currentTenantId = null;
          state.tenantList = [];
          clearAllStorage();
@@ -274,6 +281,7 @@ const authSlice = createSlice({
             state.token = token;
             state.userInfo = userInfo;
             state.isAuthenticated = true;
+            state.isPlatformAdmin = false;
             state.currentTenantId = storage?.getItem(STORAGE_KEYS.tenantId) ?? null;
             state.tenantList = parseStoredTenantList(
                storage?.getItem(STORAGE_KEYS.tenantList) ?? null

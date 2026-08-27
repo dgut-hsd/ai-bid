@@ -111,12 +111,11 @@ request.interceptors.response.use(
 
     // ── 401：认证相关，按 error_code 细分 ──────────────────────────
     if (status === 401) {
-      // 登录 / 注册 / 刷新接口自身的 401（如密码错误）不代表"需要刷新登录态"，
+      // 登录 / 刷新接口自身的 401（如密码错误）不代表"需要刷新登录态"，
       // 直接 reject 交给 UI 层展示错误提示，避免误触发 refresh → forceLogout → 整页刷新。
       const reqUrl = (originalConfig?.url || '').toLowerCase();
       if (
         reqUrl.includes('/api/auth/login') ||
-        reqUrl.includes('/api/auth/register') ||
         reqUrl.includes('/api/auth/refresh')
       ) {
         return Promise.reject(error);

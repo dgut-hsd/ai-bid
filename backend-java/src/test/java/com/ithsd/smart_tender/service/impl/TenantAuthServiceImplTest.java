@@ -167,7 +167,7 @@ class TenantAuthServiceImplTest {
         Tenant firstTenant = tenant(20001L, "first", "ACTIVE");
         Tenant secondTenant = tenant(20002L, "second", "ACTIVE");
         TenantMember firstMember = member(30001L, firstTenant.getId(), user.getId(), "ADMIN", "ACTIVE");
-        TenantMember secondMember = member(30002L, secondTenant.getId(), user.getId(), "VIEWER", "ACTIVE");
+        TenantMember secondMember = member(30002L, secondTenant.getId(), user.getId(), "MEMBER", "ACTIVE");
         TenantSessionStateVO previous = session(user.getId(), firstTenant.getId(), 3L, "session-first", "ADMIN");
         String oldToken = jwtTokenService.issue(
                 user.getId(), firstTenant.getId(), "ADMIN", List.of("tenant.read"), 3L, "session-first");
@@ -187,7 +187,7 @@ class TenantAuthServiceImplTest {
 
         assertThat(response.getSessionVersion()).isEqualTo(4L);
         assertThat(response.getCurrentTenant().getTenantId()).isEqualTo(secondTenant.getId());
-        assertThat(response.getCurrentTenant().getRole()).isEqualTo("VIEWER");
+        assertThat(response.getCurrentTenant().getRole()).isEqualTo("MEMBER");
         TenantJwtClaims switchedClaims = jwtTokenService.parse(response.getToken());
         assertThat(switchedClaims.tenantId()).isEqualTo(secondTenant.getId());
         assertThat(switchedClaims.sessionVersion()).isEqualTo(4L);
@@ -207,7 +207,7 @@ class TenantAuthServiceImplTest {
         Tenant currentTenant = tenant(20001L, "first", "ACTIVE");
         Tenant disabledTenant = tenant(20002L, "disabled", "DISABLED");
         TenantMember currentMember = member(30001L, currentTenant.getId(), user.getId(), "ADMIN", "ACTIVE");
-        TenantMember disabledMember = member(30002L, disabledTenant.getId(), user.getId(), "VIEWER", "ACTIVE");
+        TenantMember disabledMember = member(30002L, disabledTenant.getId(), user.getId(), "MEMBER", "ACTIVE");
         TenantSessionStateVO previous = session(user.getId(), currentTenant.getId(), 1L, "session", "ADMIN");
         String token = jwtTokenService.issue(
                 user.getId(), currentTenant.getId(), "ADMIN", List.of("tenant.read"), 1L, "session");

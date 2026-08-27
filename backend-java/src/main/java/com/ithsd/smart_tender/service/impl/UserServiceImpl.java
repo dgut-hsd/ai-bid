@@ -3,7 +3,6 @@ package com.ithsd.smart_tender.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ithsd.smart_tender.mapper.UserMapper;
 import com.ithsd.smart_tender.model.dto.UserLoginDTO;
-import com.ithsd.smart_tender.model.dto.UserRegisterDTO;
 import com.ithsd.smart_tender.model.entity.User;
 import com.ithsd.smart_tender.service.UserService;
 import com.ithsd.smart_tender.service.TenantSessionStore;
@@ -44,38 +43,6 @@ public class UserServiceImpl implements UserService {
             userMapper.updateById(user);
         }
         return user;
-    }
-
-    @Override
-    public void register(UserRegisterDTO userRegisterDTO) {
-        LambdaQueryWrapper<User> wrapper = new LambdaQueryWrapper<>();
-        wrapper.eq(User::getUsername, userRegisterDTO.getUsername());
-        User existUser = userMapper.selectOne(wrapper);
-        
-        if (existUser != null) {
-            throw new BizException("用户名已存在");
-        }
-
-        LambdaQueryWrapper<User> phoneWrapper = new LambdaQueryWrapper<>();
-        phoneWrapper.eq(User::getPhone, userRegisterDTO.getPhone());
-        User existPhone = userMapper.selectOne(phoneWrapper);
-        if (existPhone != null) {
-             throw new BizException("手机号已存在");
-        }
-
-        String password = passwordService.encode(userRegisterDTO.getPassword());
-
-        User user = User.builder()
-                .username(userRegisterDTO.getUsername())
-                .password(password)
-                .realName(userRegisterDTO.getRealName())
-                .email(userRegisterDTO.getEmail())
-                .phone(userRegisterDTO.getPhone())
-                .status(1)
-                .createTime(LocalDateTime.now())
-                .updateTime(LocalDateTime.now())
-                .build();
-        userMapper.insert(user);
     }
 
     @Override

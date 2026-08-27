@@ -29,7 +29,7 @@ class TenantContextTest {
     @Test
     void wrapper_shouldPropagateContextAndRestoreWorkerState() throws Exception {
         TenantRequestContext outer = new TenantRequestContext(10001L, 20001L, "ADMIN", 1L, "outer");
-        TenantRequestContext workerState = new TenantRequestContext(10002L, 20002L, "VIEWER", 2L, "worker");
+        TenantRequestContext workerState = new TenantRequestContext(10002L, 20002L, "MEMBER", 2L, "worker");
         TenantContext.set(outer);
 
         Callable<TenantRequestContext> wrapped = TenantContext.wrap(() -> {

@@ -4,13 +4,17 @@ import MainLayout from '../components/layout/MainLayout';
 import { Loading } from '../components/Loading/Loading';
 import { RouteGuard } from './RouteGuard';
 import { TenantGuard } from './TenantGuard';
-import { AdminGuard } from './AdminGuard';
+import { TenantManageGuard } from './TenantManageGuard';
+import { PlatformAdminGuard } from './PlatformAdminGuard';
+import { EnterpriseOwnerGuard } from './EnterpriseOwnerGuard';
 
 import { loginRoutes } from '../features/login/routes';
 import { uploadRoutes } from '../features/bidUpload/routes';
 import { bidAuditRoutes } from '../features/bidAudit/routes';
 import { libraryRoutes } from '../features/bidLibrary/routes';
-import { adminRoutes } from '../features/admin/routes';
+import { enterpriseRoutes } from '../features/enterprise/routes';
+import { platformRoutes } from '../features/platform/routes';
+import { tenantRoutes } from '../features/tenant/routes';
 
 // basename 跟随 Vite 的 base 配置：base='/aibid/' 时 import.meta.env.BASE_URL 自动等于 '/aibid/'，
 // 路由据此识别子路径前缀；base='/'（本地开发）时 basename 为 undefined（根路径）。
@@ -39,10 +43,22 @@ export const router = createBrowserRouter([
       children: [
          { index: true, element: <Navigate to='/bidReview' replace /> },
 
-         // 系统管理 — 仅企业 OWNER 可访问
+         // 系统管理 — 仅平台管理员可访问（管理所有企业）
          {
-            element: <AdminGuard />,
-            children: adminRoutes,
+            element: <PlatformAdminGuard />,
+            children: platformRoutes,
+         },
+
+         // 企业管理 — 仅企业 OWNER 可访问（管理本企业用户）
+         {
+            element: <EnterpriseOwnerGuard />,
+            children: enterpriseRoutes,
+         },
+
+         // 租户管理 — 无租户引导 / OWNER·ADMIN 租户管理
+         {
+            element: <TenantManageGuard />,
+            children: tenantRoutes,
          },
 
          // 业务路由 — 需要租户上下文

@@ -17,6 +17,7 @@ import com.ithsd.smart_tender.model.vo.TenantSummaryVO;
 import com.ithsd.smart_tender.model.vo.UserInfoVO;
 import com.ithsd.smart_tender.model.vo.UserLoginVO;
 import com.ithsd.smart_tender.service.TenantAuthService;
+import com.ithsd.smart_tender.service.TenantAuthorizationService;
 import com.ithsd.smart_tender.service.TenantSessionStore;
 import com.ithsd.smart_tender.service.UserService;
 import lombok.RequiredArgsConstructor;
@@ -24,7 +25,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.time.Duration;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -35,7 +35,6 @@ import java.util.UUID;
 public class TenantAuthServiceImpl implements TenantAuthService {
 
     private static final String ACTIVE = "ACTIVE";
-    private static final Map<String, List<String>> ROLE_PERMISSIONS = rolePermissions();
 
     private final UserService userService;
     private final UserMapper userMapper;
@@ -130,9 +129,10 @@ public class TenantAuthServiceImpl implements TenantAuthService {
         }
 
         User user = activeUser(claims.userId(), normalizedRequestId);
+        boolean platformAdmin = isPlatformAdmin(user);
         if (claims.tenantId() == null) {
             return new TenantRequestContext(
-                    user.getId(), null, null, claims.sessionVersion(), normalizedRequestId);
+                    user.getId(), null, null, claims.sessionVersion(), normalizedRequestId, platformAdmin);
         }
 
         Tenant tenant = tenantMapper.selectById(claims.tenantId());
@@ -143,7 +143,8 @@ public class TenantAuthServiceImpl implements TenantAuthService {
             throw error(401, "TENANT_SESSION_STALE", "租户会话已失效", normalizedRequestId);
         }
         return new TenantRequestContext(
-                user.getId(), tenant.getId(), member.getRole(), claims.sessionVersion(), normalizedRequestId);
+                user.getId(), tenant.getId(), member.getRole(), claims.sessionVersion(), normalizedRequestId,
+                platformAdmin);
     }
 
     private User activeUser(Long userId, String requestId) {
@@ -184,7 +185,7 @@ public class TenantAuthServiceImpl implements TenantAuthService {
         if (tenant == null || member.getTenantId() == null || !member.getTenantId().equals(tenant.getId())) {
             return null;
         }
-        List<String> permissions = ROLE_PERMISSIONS.getOrDefault(member.getRole(), List.of());
+        List<String> permissions = TenantAuthorizationService.permissionsFor(member.getRole());
         return new TenantAccess(tenant, member, permissions);
     }
 
@@ -245,6 +246,7 @@ public class TenantAuthServiceImpl implements TenantAuthService {
                         .id(user.getId())
                         .username(user.getUsername())
                         .realName(user.getRealName())
+                        .isPlatformAdmin(isPlatformAdmin(user))
                         .build())
                 .currentTenant(current == null ? null : summary(current, true))
                 .tenants(summaries)
@@ -309,15 +311,8 @@ public class TenantAuthServiceImpl implements TenantAuthService {
         return new TenantAuthException(status, code, message, normalizeRequestId(requestId), Map.of());
     }
 
-    private static Map<String, List<String>> rolePermissions() {
-        Map<String, List<String>> permissions = new LinkedHashMap<>();
-        permissions.put("OWNER", List.of(
-                "tenant.read", "tenant.settings.write", "tenant.members.invite", "tenant.members.remove",
-                "tenant.members.role.write", "tenant.owner.transfer", "tender.write", "audit.start",
-                "audit.report.read", "knowledge.write", "tenant.delete"));
-        permissions.put("MEMBER", List.of(
-                "tenant.read", "tender.write", "audit.start", "audit.report.read", "knowledge.write"));
-        return Map.copyOf(permissions);
+    private static boolean isPlatformAdmin(User user) {
+        return user != null && Boolean.TRUE.equals(user.getIsPlatformAdmin());
     }
 
     private record TenantAccess(Tenant tenant, TenantMember member, List<String> permissions) {

@@ -6,9 +6,9 @@ import lombok.Data;
 
 import java.io.Serializable;
 
-/** 管理员重置用户密码的请求。 */
+/** 企业管理员重置用户密码的请求。 */
 @Data
-public class AdminResetPasswordRequest implements Serializable {
+public class EnterpriseResetPasswordRequest implements Serializable {
 
     @NotBlank
     @Size(min = 6, max = 100)

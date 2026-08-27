@@ -93,8 +93,8 @@ export const HeaderToolbar: React.FC<HeaderToolbarProps> = ({ isMobile }) => {
     },
   ];
 
-  // 优先展示真实姓名，缺失时回退到登录账号
-  const displayName = userInfo?.realName || userInfo?.username || '未知用户';
+  // 展示登录账号
+  const displayName = userInfo?.username || '未知用户';
   const avatarChar = displayName.charAt(0).toUpperCase();
 
   return (
