@@ -186,6 +186,8 @@ pub struct ReviewClause {
     pub tier: RiskTier,
     /// 该级别的最大 ReAct 轮次
     pub tier_max_turns: usize,
+    /// 来源 block ID（透传 Chunk.source_block_ids，用于流式阶段补发 block_ids）
+    pub source_block_ids: Vec<String>,
 }
 
 impl ReviewClause {
@@ -206,6 +208,7 @@ impl ReviewClause {
             page_end: chunk.page_end,
             tier,
             tier_max_turns,
+            source_block_ids: chunk.source_block_ids.clone(),
         }
     }
 
@@ -1820,6 +1823,7 @@ mod tests {
             page_end: 0,
             tier: RiskTier::High,
             tier_max_turns: 14,
+            source_block_ids: vec![],
         };
         // agent 能力只有 4 轮 → 取 4
         assert_eq!(clause.effective_max_turns(4), 4);

@@ -54,6 +54,35 @@ fn severity_str(s: &RiskSeverity) -> &'static str {
     }
 }
 
+/// 从 `clause_ids` 按顺序聚合各条款的 `source_block_ids`（去重、保序、上限防爆）。
+///
+/// 用于流式 `finding_added` 阶段补发 block_ids——LLM 输出的是 clause_ids，
+/// block_ids 由框架从 clause.source_block_ids 确定性聚合，无需等待 /result
+/// 的 source_quote 反查。配合「块序回退」策略，保证正确页面上能画出 bbox。
+fn collect_block_ids_for_clause_ids(
+    clause_ids: &[String],
+    clause_blocks: &HashMap<String, Vec<String>>,
+    max_blocks: usize,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for cid in clause_ids {
+        if out.len() >= max_blocks {
+            break;
+        }
+        if let Some(ids) = clause_blocks.get(cid) {
+            for id in ids {
+                if out.len() >= max_blocks {
+                    break;
+                }
+                if !out.contains(id) {
+                    out.push(id.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 struct AgentTaskOutput {
     findings: Vec<RiskFinding>,
     successful_clauses: usize,
@@ -1313,8 +1342,21 @@ impl Coordinator {
                     // B-2 流式发射：每个 Agent 审查完成即把其发现推向前端
                     // 不再等 MERGE/LEGAL_VERIFY，也不依赖 enable_legal_verify 开关
                     // 重复/被合并项由 merge_findings_v3 后续发 finding_removed 自动清理
+                    //
+                    // 流式阶段即补发 block_ids（从 clause.source_block_ids 聚合），
+                    // 让前端无需等 /result 就能直接查 bbox 画高亮框；/result 仍会
+                    // 用 source_quote 反查做更精确的 block 筛选覆盖。
                     if let Some(ref events) = review_events {
+                        let clause_blocks: HashMap<String, Vec<String>> = clauses
+                            .iter()
+                            .map(|c| (c.chunk_id.clone(), c.source_block_ids.clone()))
+                            .collect();
                         for f in findings.iter().filter(|f| !f.no_risk) {
+                            let block_ids = collect_block_ids_for_clause_ids(
+                                &f.clause_ids,
+                                &clause_blocks,
+                                10,
+                            );
                             events.emit(&ReviewEvent::FindingAdded {
                                 risk_id: f.risk_id.clone(),
                                 severity: severity_str(&f.severity).to_string(),
@@ -1331,6 +1373,7 @@ impl Coordinator {
                                 lifecycle: FindingLifecycle::Verified,
                                 page_number: f.page_number,
                                 section_path: f.section_path.clone(),
+                                block_ids,
                             });
                         }
                     }
@@ -1916,6 +1959,7 @@ impl Coordinator {
                     page_end: 0,
                     tier: RiskTier::Medium,
                     tier_max_turns: 4, // 批量模式 4 轮即可（共享搜索结果，效率更高）
+                    source_block_ids: vec![],
                 };
 
                 let mut config = def.to_agent_config();
@@ -2043,6 +2087,7 @@ impl Coordinator {
                     page_end: 0,
                     tier: RiskTier::Medium,
                     tier_max_turns: 3, // fallback 模式减到 3 轮
+                    source_block_ids: vec![],
                 };
 
                 let config = def.to_agent_config();
@@ -2353,6 +2398,7 @@ impl Coordinator {
                     page_end: 0,
                     tier: RiskTier::High,
                     tier_max_turns: 8,
+                    source_block_ids: vec![],
                 };
 
                 let def = debate_def.unwrap().clone();
@@ -2596,6 +2642,7 @@ impl Coordinator {
                     page_end: chunk.page_end,
                     tier: chunk.tier,
                     tier_max_turns: chunk.tier.max_turns(),
+                    source_block_ids: vec![],
                 })
             })
             .collect();
@@ -3319,6 +3366,46 @@ mod tests {
     use crate::agents::react_loop::{ChatMessage, LlmResponse, ToolCall, ToolChoice};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn test_collect_block_ids_for_clause_ids_aggregates_dedups() {
+        let mut clause_blocks: HashMap<String, Vec<String>> = HashMap::new();
+        clause_blocks.insert(
+            "ch_1".to_string(),
+            vec!["b_1_0".to_string(), "b_1_1".to_string()],
+        );
+        clause_blocks.insert(
+            "ch_2".to_string(),
+            vec!["b_2_0".to_string(), "b_1_1".to_string()], // b_1_1 与 ch_1 重复
+        );
+        let clause_ids = vec!["ch_1".to_string(), "ch_2".to_string()];
+        let result = collect_block_ids_for_clause_ids(&clause_ids, &clause_blocks, 10);
+        assert_eq!(result, vec!["b_1_0", "b_1_1", "b_2_0"]);
+    }
+
+    #[test]
+    fn test_collect_block_ids_for_clause_ids_respects_cap() {
+        let mut clause_blocks: HashMap<String, Vec<String>> = HashMap::new();
+        clause_blocks.insert(
+            "ch_1".to_string(),
+            vec![
+                "b_1_0".to_string(),
+                "b_1_1".to_string(),
+                "b_1_2".to_string(),
+            ],
+        );
+        let clause_ids = vec!["ch_1".to_string()];
+        let result = collect_block_ids_for_clause_ids(&clause_ids, &clause_blocks, 2);
+        assert_eq!(result, vec!["b_1_0", "b_1_1"]);
+    }
+
+    #[test]
+    fn test_collect_block_ids_for_clause_ids_unknown_clause() {
+        let clause_blocks: HashMap<String, Vec<String>> = HashMap::new();
+        let clause_ids = vec!["ch_unknown".to_string()];
+        let result = collect_block_ids_for_clause_ids(&clause_ids, &clause_blocks, 10);
+        assert!(result.is_empty());
+    }
+
     struct NoRiskLlm;
 
     struct ConditionalPanicLlm;
@@ -3472,6 +3559,7 @@ mod tests {
             page_end: 0,
             tier: RiskTier::from_clause_text(text),
             tier_max_turns: RiskTier::from_clause_text(text).max_turns(),
+            source_block_ids: vec![],
         }
     }
 

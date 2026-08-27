@@ -214,11 +214,13 @@ where
 }
 
 fn is_internal_path(path: &str) -> bool {
-    // 罗盘（实验指标仪表板）是随 server 启动的本地调试工具，浏览器直接访问无法做 HMAC 签名；
-    // 其余 /api/v1/* 仍受内部认证保护（供 Java 后端调用）。
-    let is_api = path == "/api/v1" || path.starts_with("/api/v1/");
-    let is_metrics = path.starts_with("/api/v1/metrics");
-    is_api && !is_metrics
+    // 罗盘（实验指标仪表板）挂载在 /metrics，不在 /api/v1 名下，天然不受内部认证约束；
+    // 其余 /api/v1/* 一律受 HMAC 内部认证保护（供 Java 后端调用）。
+    //
+    // H5：删除历史上误把 `/api/v1/metrics*`（真正的 Metrics CRUD）划出鉴权的 `is_metrics`
+    // 子句——它既让该组端点免鉴权暴露，又因为不注入 `InternalRequestContext` 使 handler
+    // 恒 500。仪表盘 `/metrics` 与 `/api/v1/metrics` 前缀无关，删除后不受影响。
+    path == "/api/v1" || path.starts_with("/api/v1/")
 }
 
 fn required_header(

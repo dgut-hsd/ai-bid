@@ -9,8 +9,8 @@
 //! 1. **Rust 主路径** — 优先使用 `pdf-extract`（纯 Rust，基于 pdf-rs）做文本提取；
 //!    单词/表格坐标使用 `pdfplumber` (lopdf)。当 lopdf 在某页失败时，
 //!    该页降级为仅文本提取（无单词坐标）
-//! 2. **Python 终极兜底** — 当 Rust 主路径完全失败（0 页成功）时，
-//!    通过子进程调用 Python pdfplumber (pdfminer.six)
+//! 2. **Python 兜底** — 当 lopdf 有页面失败时，优先通过子进程调用
+//!    Python pdfplumber (pdfminer.six) 拿「真实坐标」；不可用才回退 pdf-extract 占位框
 //!
 //! ## 文本清洗与段落分块
 //!
@@ -595,6 +595,14 @@ fn create_stub_page(page_index: usize, text: &str, width: f64, height: f64) -> R
 /// 3. 新增表格 bbox 检测（基于单词位置聚类）
 /// 4. 如果所有页面都失败，尝试 Python 兜底
 pub fn extract_pdf_to_raw_json(path: &str) -> Result<RawDocument> {
+    extract_pdf_to_raw_json_with_python(path, &extract_with_python)
+}
+
+/// 可注入 Python 兜底实现的内部版本（便于单测注入假 python）。
+fn extract_pdf_to_raw_json_with_python(
+    path: &str,
+    python_extract: &dyn Fn(&str, &str) -> Result<()>,
+) -> Result<RawDocument> {
     let pdf = Pdf::open_file(path, None)?;
 
     let mut pages = Vec::new();
@@ -637,13 +645,18 @@ pub fn extract_pdf_to_raw_json(path: &str) -> Result<RawDocument> {
         }
     }
 
-    // 如果有失败页面，尝试用 pdf-extract 补充文本
+    // 如果有失败页面，优先用 Python pdfplumber 兜底（真实坐标），
+    // 不可用再回退 pdf-extract 纯文本（占位框）。
     if !failed_page_indices.is_empty() {
         eprintln!(
-            "  [混合] {} 页中 {} 页 lopdf 失败，尝试 pdf-extract 补充文本...",
+            "  [混合] {} 页中 {} 页 lopdf 失败，优先尝试 Python pdfplumber（真实坐标）...",
             page_count,
             failed_page_indices.len()
         );
+        if let Some(doc) = try_extract_with_python(path, python_extract) {
+            return Ok(doc);
+        }
+        eprintln!("  [混合] Python 兜底不可用，回退 pdf-extract 补充文本...");
         match extract_text_with_pdf_extract(path) {
             Ok(full_text) => {
                 // 将 pdf-extract 文本按页面数均匀分配
@@ -779,6 +792,30 @@ pub fn extract_with_python(input_path: &str, output_path: &str) -> Result<()> {
     anyhow::ensure!(meta.len() > 0, "Python 兜底提取的 JSON 文件为空");
 
     Ok(())
+}
+
+/// 用 Python pdfplumber 兜底提取「真实坐标」的 [`RawDocument`]。
+///
+/// 返回 `None` 表示 Python 不可用/失败（调用方回退 pdf-extract 占位框路径）。
+fn try_extract_with_python(
+    path: &str,
+    python_extract: &dyn Fn(&str, &str) -> Result<()>,
+) -> Option<RawDocument> {
+    let output = std::env::temp_dir().join(format!("aibid_py_{}.json", Uuid::new_v4()));
+    let output_str = output.to_string_lossy();
+    if let Err(e) = python_extract(path, &output_str) {
+        eprintln!("  [混合] Python pdfplumber 兜底失败: {}（回退占位框路径）", e);
+        let _ = std::fs::remove_file(&output);
+        return None;
+    }
+    let doc = std::fs::read_to_string(&output)
+        .ok()
+        .and_then(|s| serde_json::from_str::<RawDocument>(&s).ok());
+    let _ = std::fs::remove_file(&output);
+    if doc.is_none() {
+        eprintln!("  [混合] Python 兜底 JSON 解析失败（回退占位框路径）");
+    }
+    doc
 }
 
 // ─── 测试 ────────────────────────────────────────────────────────
@@ -1329,5 +1366,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── 高亮链路：真实坐标提取回归 ─────────────────────────────
+    /// 真实 PDF 必须能解析出「非占位」bbox。
+    ///
+    /// 占位 bbox（x0==0 && x1==400 && 高度≤20）来自 lopdf 失败时的
+    /// `blocks_from_text` 兜底，意味着没有任何真实坐标，前端 BBox 高亮无法工作。
+    /// 该测试守卫：一旦 lopdf 降级而拿不到真实坐标，这里会失败提醒。
+    #[test]
+    fn real_pdf_yields_non_placeholder_bboxes() {
+        let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/file/研究生院智慧校园项目招标测试文件（2页）.pdf");
+        let doc =
+            extract_pdf_to_raw_json(pdf.to_string_lossy().as_ref()).expect("PDF 解析失败");
+        let total: usize = doc.pages.iter().map(|p| p.blocks.len()).sum();
+        let non_placeholder = doc
+            .pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter(|b| {
+                !(b.bbox.x0 == 0.0 && b.bbox.x1 == 400.0 && (b.bbox.bottom - b.bbox.top) <= 20.1)
+            })
+            .count();
+        println!("blocks total={total} non_placeholder={non_placeholder}");
+        assert!(
+            non_placeholder > 0,
+            "真实 PDF 应解析出非占位 bbox（否则前端高亮链路无坐标可用）"
+        );
+    }
+
+    // ── 兜底重排：lopdf 失败时优先 Python（真实坐标） ──────────
+    #[test]
+    fn try_python_fallback_yields_real_bbox_and_none_on_error() {
+        let real = RawDocument {
+            document_id: "py_doc".to_string(),
+            source_path: "/tmp/x.pdf".to_string(),
+            pages: vec![RawPage {
+                page_index: 0,
+                width: 595.0,
+                height: 842.0,
+                text: "真实坐标段落".to_string(),
+                words: vec![],
+                blocks: vec![RawBlock {
+                    id: "b_0_0".to_string(),
+                    block_type: BlockType::Paragraph,
+                    text: "真实坐标段落".to_string(),
+                    bbox: BBox { x0: 12.0, top: 24.0, x1: 320.0, bottom: 48.0 },
+                }],
+                tables: vec![],
+                lines: vec![],
+                rects: vec![],
+            }],
+        };
+        let json = serde_json::to_string(&real).unwrap();
+
+        // 成功分支：解析出非占位 bbox（真实坐标）
+        let ok = |_inp: &str, out: &str| -> Result<()> {
+            std::fs::write(out, &json)?;
+            Ok(())
+        };
+        let doc = try_extract_with_python("/tmp/x.pdf", &ok).expect("应返回 Some(真实坐标)");
+        let bb = doc.pages[0].blocks[0].bbox;
+        assert!(
+            bb.x0 > 0.0 && bb.x1 != 400.0 && (bb.bottom - bb.top) > 20.1,
+            "应为非占位 bbox，got {:?}",
+            bb
+        );
+
+        // 失败分支：返回 None（回退 pdf-extract 占位框路径）
+        let fail = |_inp: &str, _out: &str| -> Result<()> { anyhow::bail!("no python") };
+        assert!(try_extract_with_python("/tmp/x.pdf", &fail).is_none());
     }
 }

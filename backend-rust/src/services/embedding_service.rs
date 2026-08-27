@@ -477,6 +477,27 @@ impl EmbeddingClient {
             }
         }
     }
+
+    /// H3：本地引擎复用启动时已加载的 BGE-M3 实例批量编码 chunks，
+    /// 避免每次上传都重新串行加载 ~1.2GB×2 的模型实例。
+    pub fn embed_chunks_local_reuse(
+        &self,
+        chunks: &[Chunk],
+        config: &ChunkingConfig,
+        document_id: &str,
+    ) -> Result<DocumentVectorIndex> {
+        match self {
+            Self::Local { model } => {
+                let mut guard = model
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("嵌入模型锁被毒化（poisoned）"))?;
+                embed_chunks(chunks, config, document_id, &mut *guard)
+            }
+            Self::Remote { .. } => {
+                anyhow::bail!("embed_engine 与嵌入客户端不一致：期望 local，实际 remote")
+            }
+        }
+    }
 }
 
 /// L2 归一化（原地修改，返回原 Vec 避免分配）。
