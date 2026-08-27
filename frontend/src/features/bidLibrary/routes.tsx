@@ -1,5 +1,9 @@
+import { lazy } from 'react';
 import type { RouteObject } from 'react-router-dom';
-import { BidLibraryPage } from './BidLibraryPage';
+
+const BidLibraryPage = lazy(() =>
+   import('./BidLibraryPage').then((m) => ({ default: m.BidLibraryPage }))
+);
 
 export const libraryRoutes: RouteObject[] = [
    { path: '/library', element: <BidLibraryPage /> },

@@ -13,6 +13,7 @@ export const useTableColumns = (
          title: '序号',
          key: 'index',
          width: 70,
+         responsive: ['md', 'lg', 'xl', 'xxl'],
          align: 'center',
          render: (_: unknown, __: AuditIssue, index: number) =>
             (currentPage - 1) * pageSize + index + 1,
@@ -49,6 +50,7 @@ export const useTableColumns = (
          title: '问题维度',
          dataIndex: 'category',
          align: 'center',
+         responsive: ['md', 'lg', 'xl', 'xxl'],
          width: 120,
          render: (cat: string) => cat,
       },

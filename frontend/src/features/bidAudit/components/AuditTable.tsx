@@ -65,7 +65,7 @@ export const AuditTable: React.FC<AuditTableProps> = ({
                };
             }}
             loading={isFetching}
-            scroll={{ x: 800 }}
+            scroll={{ x: 'max-content' }}
             pagination={{
                current: page,
                pageSize: 10,

@@ -1,5 +1,7 @@
+import { Suspense } from 'react';
 import { createBrowserRouter, Navigate } from 'react-router-dom';
 import MainLayout from '../components/layout/MainLayout';
+import { Loading } from '../components/Loading/Loading';
 import { RouteGuard } from './RouteGuard';
 import { TenantGuard } from './TenantGuard';
 import { AdminGuard } from './AdminGuard';
@@ -22,7 +24,9 @@ export const router = createBrowserRouter([
    {
       path: '/login',
       element: (
-         <RouteGuard requireAuth={false}>{loginRoutes[0].element}</RouteGuard>
+         <Suspense fallback={<Loading loading fullScreen />}>
+            <RouteGuard requireAuth={false}>{loginRoutes[0].element}</RouteGuard>
+         </Suspense>
       ),
    },
 

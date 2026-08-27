@@ -44,6 +44,7 @@ export const useHistoryTableColumns = () => {
          dataIndex: 'supplierName',
          key: 'supplierName',
          align: 'center',
+         responsive: ['md', 'lg', 'xl', 'xxl'],
          ellipsis: true,
          width: 150,
          render: (text: string) => <EllipsisTooltip text={text} />,
@@ -53,6 +54,7 @@ export const useHistoryTableColumns = () => {
          dataIndex: 'auditUserName',
          align: 'center',
          key: 'auditUserName',
+         responsive: ['md', 'lg', 'xl', 'xxl'],
          width: 80,
          ellipsis: true,
          render: (text: string) => <EllipsisTooltip text={text} />,
@@ -62,6 +64,7 @@ export const useHistoryTableColumns = () => {
          dataIndex: 'endTime',
          key: 'endTime',
          align: 'center',
+         responsive: ['md', 'lg', 'xl', 'xxl'],
          width: 150,
       },
       {
@@ -69,6 +72,7 @@ export const useHistoryTableColumns = () => {
          dataIndex: 'issueCount',
          key: 'issueCount',
          align: 'center',
+         responsive: ['md', 'lg', 'xl', 'xxl'],
          width: 80,
       },
       {
@@ -91,6 +95,7 @@ export const useHistoryTableColumns = () => {
          key: 'action',
          align: 'center',
          width: 160,
+         fixed: 'right',
          render: (_, record) => (
             <Button
                type='link'

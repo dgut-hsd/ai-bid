@@ -3,6 +3,7 @@ import { Segmented, Typography, Tag, Space, Progress, Alert } from 'antd';
 import { useStyles } from '../../style';
 import type { AuditIssue } from '../../types';
 import type { BBoxData } from '../../components/PDFPreview/PdfPreview';
+import { mapBBoxEntries } from './bboxMapping';
 import { agentLabel, SEVERITY_MAP } from '@/types/audit';
 import { useUrlState } from '@/hooks/useUrlState';
 
@@ -564,14 +565,7 @@ async function fetchBlockBboxes(taskId: string, blockIds: string[]): Promise<BBo
   const json = await resp.json();
   const list = json?.data || [];
   console.info('[bbox-fetch] got %d bbox entries for %d blockIds', list.length, blockIds.length);
-  return list.map((item: Record<string, any>) => ({
-    x0: item.bbox?.x0 ?? 0,
-    top: item.bbox?.top ?? 0,
-    x1: item.bbox?.x1 ?? 0,
-    bottom: item.bbox?.bottom ?? 0,
-    pageWidth: item.page_width ?? 595,
-    page: (item.page ?? 0) + 1,            // ← 新增：把后端返回的 page 带出来
-  }));
+  return mapBBoxEntries(list);
 }
 
 export const AnalysisList: React.FC<AnalysisListProps> = React.memo(

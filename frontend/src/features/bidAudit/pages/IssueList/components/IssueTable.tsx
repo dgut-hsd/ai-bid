@@ -58,7 +58,7 @@ export const IssueTable: React.FC<IssueTableProps> = ({
             dataSource={issues}
             rowKey='issueNo'
             pagination={false}
-            scroll={{ x: 800 }}
+            scroll={{ x: 'max-content' }}
          />
 
          <div className={styles.paginationArea}>

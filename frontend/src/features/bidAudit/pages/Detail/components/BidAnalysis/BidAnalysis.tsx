@@ -48,6 +48,8 @@ interface BidAnalysisProps {
   phaseEvent?: PhaseEvent | null;
   statsEvent?: StatsEvent | null;
   liveFindings?: FindingAddedEvent[];
+  /** 透传给根节点，移动端用于控制显示/隐藏 */
+  style?: React.CSSProperties;
 }
 
 /**
@@ -77,6 +79,7 @@ const BidAnalysis: React.FC<BidAnalysisProps> = ({
   phaseEvent,
   statsEvent,
   liveFindings,
+  style,
 }) => {
   const { styles } = useStyles();
   const navigate = useNavigate();
@@ -248,7 +251,7 @@ const BidAnalysis: React.FC<BidAnalysisProps> = ({
   ];
 
   return (
-    <div ref={rightPanelRef} className={styles.rightPanel}>
+    <div ref={rightPanelRef} className={styles.rightPanel} style={style}>
       <Tabs
         activeKey={activeTab}
         onChange={(key) => setActiveTab(key as DetailTab)}

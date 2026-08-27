@@ -226,6 +226,17 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
    const [highlightText, setHighlightText] = React.useState('');
    const [, setHighlightStatus] = React.useState<HighlightStatus>('idle');
    const [highlightBoxesByPage, setHighlightBoxesByPage] = React.useState<Record<number, HighlightBox[]>>({});
+   // ── PDF 懒渲染：只挂载可视区附近及被标记的页，避免 120 页一次性全量渲染 ──
+   const [renderedPages, setRenderedPages] = React.useState<Set<number>>(() => new Set([1]));
+
+   const markPageRendered = React.useCallback((page: number) => {
+      setRenderedPages((prev) => {
+         if (!page || prev.has(page)) return prev;
+         const next = new Set(prev);
+         next.add(page);
+         return next;
+      });
+   }, []);
    const pdfDocRef = React.useRef<any | null>(null);
    const pageDimRef = React.useRef<Record<number, { width: number; height: number }>>({}); //缓存每页"原生 PDF 点尺寸"，用于高亮坐标换算
    const pageTextIndexCacheRef = React.useRef<Record<string, PageTextIndex>>({});
@@ -627,40 +638,44 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
                   position: 'relative',
                }}
             >
-               <Page
-                  pageNumber={pageNum}
-                  width={pageWidth}
-                  renderAnnotationLayer={false}
-                  renderTextLayer
-                  devicePixelRatio={1.5}
-               />
-               {(highlightBoxesByPage[pageNum] || []).length > 0 && (
-                  <div
-                     style={{
-                        position: 'absolute',
-                        inset: 0,
-                        pointerEvents: 'none',
-                        zIndex: 3,
-                     }}
-                  >
-                     {(highlightBoxesByPage[pageNum] || []).map((box, idx) => (
+               {renderedPages.has(pageNum) && (
+                  <>
+                     <Page
+                        pageNumber={pageNum}
+                        width={pageWidth}
+                        renderAnnotationLayer={false}
+                        renderTextLayer
+                        devicePixelRatio={1.5}
+                     />
+                     {(highlightBoxesByPage[pageNum] || []).length > 0 && (
                         <div
-                           key={`${pageNum}_${idx}`}
-                           data-overlay-hit={box.primary ? '1' : '2'}
                            style={{
                               position: 'absolute',
-                              left: `${box.left}px`,
-                              top: `${box.top}px`,
-                              width: `${box.width}px`,
-                              height: `${box.height}px`,
-                              background: box.primary
-                                 ? 'rgba(255, 230, 0, 0.46)'
-                                 : 'rgba(255, 230, 0, 0.22)',
-                              borderRadius: 2,
+                              inset: 0,
+                              pointerEvents: 'none',
+                              zIndex: 3,
                            }}
-                        />
-                     ))}
-                  </div>
+                        >
+                           {(highlightBoxesByPage[pageNum] || []).map((box, idx) => (
+                              <div
+                                 key={`${pageNum}_${idx}`}
+                                 data-overlay-hit={box.primary ? '1' : '2'}
+                                 style={{
+                                    position: 'absolute',
+                                    left: `${box.left}px`,
+                                    top: `${box.top}px`,
+                                    width: `${box.width}px`,
+                                    height: `${box.height}px`,
+                                    background: box.primary
+                                       ? 'rgba(255, 230, 0, 0.46)'
+                                       : 'rgba(255, 230, 0, 0.22)',
+                                    borderRadius: 2,
+                                 }}
+                              />
+                           ))}
+                        </div>
+                     )}
+                  </>
                )}
             </div>
          );
@@ -752,6 +767,27 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
    ]);
    const isPdf = !previewFailed && previewableTypes.has(lowerType);
 
+   // 滚动时懒加载页：仅挂载进入可视区（含上下各一屏预渲染）的页，挂载后保持不清除
+   React.useEffect(() => {
+      const container = containerRef.current;
+      if (!container || !numPages) return;
+      const observer = new IntersectionObserver(
+         (entries) => {
+            entries.forEach((entry) => {
+               if (entry.isIntersecting) {
+                  const pageNum = Number(
+                     (entry.target as HTMLElement).getAttribute('data-page-num') || 0
+                  );
+                  if (pageNum) markPageRendered(pageNum);
+               }
+            });
+         },
+         { root: container, rootMargin: '100% 0px 100% 0px' }
+      );
+      container.querySelectorAll('[data-page-num]').forEach((el) => observer.observe(el));
+      return () => observer.disconnect();
+   }, [numPages, isPdf, containerRef, markPageRendered]);
+
    React.useImperativeHandle(
       ref,
       () => ({
@@ -761,6 +797,7 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
             setHighlightStatus('idle');
             setHighlightBoxesByPage({});
             setHighlightText(normalized);
+            markPageRendered(page);
             jumpToPage(page);
             const marker = `${page}|${normalized}`;
             if (pendingSecondaryMatchRef.current !== marker) {
@@ -835,6 +872,11 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
 
             // 1. 跳到"主"目标页用于滚动定位；【不再清空】其它页已有高亮
             setHighlightStatus('idle');
+            markPageRendered(page);
+            bboxes.forEach((b) => {
+               const p = b.page ?? page;
+               if (p) markPageRendered(p);
+            });
             jumpToPage(page);
 
             // 2. 等 DOM 渲染完（pdfjs 异步），再读每页真实宽度
@@ -895,7 +937,7 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
             }, 100);
          },
       }),
-      [jumpToPage, applySecondaryPageMatch, scrollFirstHitIntoView, applySpanHighlights, applyPdfJsHighlights, numPages, containerRef]
+      [jumpToPage, applySecondaryPageMatch, scrollFirstHitIntoView, applySpanHighlights, applyPdfJsHighlights, numPages, containerRef, markPageRendered]
    );
 
    return (

@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense } from 'react';
 import { Layout } from 'antd';
 import { Outlet } from 'react-router-dom';
+import { Loading } from '@/components/Loading/Loading';
 import { createStyles } from 'antd-style';
 import { Sidebar, MobileBottomNav } from './Sidebar';
 import { Header } from './Header';
@@ -55,7 +56,9 @@ const MainLayout: React.FC = () => {
 
             <Content style={{ margin: 12 }}>
                <div className={styles.content}>
-                  <Outlet />
+                  <Suspense fallback={<Loading loading />}>
+                     <Outlet />
+                  </Suspense>
                </div>
             </Content>
 

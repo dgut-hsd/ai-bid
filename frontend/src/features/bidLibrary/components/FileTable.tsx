@@ -157,6 +157,7 @@ export function FileTable({
          title: '操作',
          key: 'action',
          width: 240,
+         fixed: 'right',
          align: 'center',
          render: (_: unknown, record: KnowledgeFile) => (
             <span style={{ whiteSpace: 'nowrap' }}>
@@ -203,7 +204,7 @@ export function FileTable({
             loading={loading}
             pagination={false}
             bordered={false}
-            scroll={{ x: 800 }}
+            scroll={{ x: 'max-content' }}
          />
 
          <div className={styles.paginationRow}>

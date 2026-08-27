@@ -150,12 +150,14 @@ export const AdminUsersPage: React.FC = () => {
       title: '创建时间',
       dataIndex: 'created_at',
       key: 'created_at',
+      responsive: ['md', 'lg', 'xl', 'xxl'],
       render: (t?: string) => (t ? new Date(t).toLocaleString('zh-CN') : '-'),
     },
     {
       title: '操作',
       key: 'action',
       width: 180,
+      fixed: 'right',
       render: (_: unknown, record: AdminUser) => (
         <Space>
           <Button
@@ -228,6 +230,7 @@ export const AdminUsersPage: React.FC = () => {
           loading={usersQuery.isLoading}
           pagination={false}
           size='middle'
+          scroll={{ x: 'max-content' }}
         />
       </Card>
 

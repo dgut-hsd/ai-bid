@@ -17,6 +17,21 @@ export const useStyles = createStyles(({ css, token }) => ({
       border-bottom: 1px solid #eee;
       background-color: ${token.colorBgContainer};
    `,
+   // 移动端：单行搜索 + 吸顶
+   mobileFilterSticky: css`
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background-color: ${token.colorBgContainer};
+      border-bottom: 1px solid ${token.colorBorderSecondary};
+   `,
+   mobileSearchInput: css`
+      flex: 1;
+   `,
    tableContainer: css`
       background-color: ${token.colorBgContainer};
       padding: 1rem;
