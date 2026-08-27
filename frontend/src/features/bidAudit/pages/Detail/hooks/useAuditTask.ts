@@ -453,10 +453,11 @@ export const useAuditTask = (bidId?: number) => {
                size: 200,
             });
             if (stopped) return;
-            const hasResult =
-               (fallbackResult.issues?.length || 0) > 0 ||
-               (status.status === 'completed' && !!fallbackResult.auditResult);
-            if (hasResult) {
+            // P2 后 getResult 在「进行中」也会返回增量 issues，不能因「有 finding」就判完成；
+            // 完成必须以 auditResult 离开 pending（revise/pass）为准。
+            const done = !!fallbackResult.auditResult
+               && fallbackResult.auditResult !== 'pending';
+            if (done) {
                setIssues((fallbackResult.issues || []).map(withAnchorFallback));
                updateFinalElapsed();
                setIsComplete(true);
@@ -466,6 +467,10 @@ export const useAuditTask = (bidId?: number) => {
                setHasStartedAudit(false);
                setError(null);
                return;
+            }
+            // 进行中：仅用增量结果刷新展示，绝不切完成态、不关流。
+            if ((fallbackResult.issues?.length || 0) > 0) {
+               setIssues((fallbackResult.issues || []).map(withAnchorFallback));
             }
 
             if (status.status === 'failed') {
