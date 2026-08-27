@@ -3,8 +3,7 @@
 # 用法：./update.sh          正常更新
 #       ./update.sh --force  跳过「在途审核」护栏（不清除未提交改动）
 #
-# 部署分支用环境变量 DEPLOY_BRANCH 覆盖（默认 dev，与本机实际运行分支一致）。
-# 注意：本机生产跟随 dev；待 dev → main 合并同步后，可 export DEPLOY_BRANCH=main 切换。
+# 部署分支用环境变量 DEPLOY_BRANCH 覆盖（默认 main，生产分支见 origin/main）。
 
 set -euo pipefail
 
@@ -12,7 +11,7 @@ DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="$(dirname "$DEPLOY_DIR")"
 HISTORY_FILE="$DEPLOY_DIR/.deploy-history"
 HOLD_FILE="$DEPLOY_DIR/.rollback-hold"
-DEPLOY_BRANCH="${DEPLOY_BRANCH:-dev}"
+DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 SMOKE_URL="${SMOKE_URL:-http://127.0.0.1/aibid/api/health}"
 SMOKE_RETRIES="${SMOKE_RETRIES:-40}"   # 每次 3s，共约 120s 等待后端就绪
 
