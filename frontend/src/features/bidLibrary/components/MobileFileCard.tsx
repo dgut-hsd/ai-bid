@@ -1,121 +1,122 @@
 import React from 'react';
-import { Tag, Button, Dropdown, type MenuProps, Modal } from 'antd';
-import { MoreOutlined, EyeOutlined, DownloadOutlined, EditOutlined, DeleteOutlined, CheckCircleOutlined, CloseCircleOutlined } from '@ant-design/icons';
-import type { KnowledgeFile } from '../api/types';
+import {
+   Tag,
+   Button,
+   Dropdown,
+   Modal,
+   type MenuProps,
+} from 'antd';
+import {
+   MoreOutlined,
+   EyeOutlined,
+   DownloadOutlined,
+   EditOutlined,
+   DeleteOutlined,
+} from '@ant-design/icons';
+import dayjs from 'dayjs';
+
+import {
+   CategoryMap,
+   ApplicableScopeMap,
+   type KnowledgeFile,
+} from '../types';
 
 interface MobileFileCardProps {
-  file: KnowledgeFile;
-  categoryMap: Record<string, string>;
-  categoryColorMap: Record<string, string>;
-  onView: (file: KnowledgeFile) => void;
-  onDownload: (file: KnowledgeFile) => void;
-  onEdit: (file: KnowledgeFile) => void;
-  onDelete: (file: KnowledgeFile) => void;
-  onStatusChange: (file: KnowledgeFile) => void;
+   file: KnowledgeFile;
+   styles: Record<string, string>;
+   onView: (file: KnowledgeFile) => void;
+   onDownload: (file: KnowledgeFile) => void;
+   onEdit: (file: KnowledgeFile) => void;
+   onDelete: (file: KnowledgeFile) => void;
 }
 
-const scopeMap: Record<string, string> = {
-  procurement: '采购类',
-  engineering: '工程类',
-  general: '通用',
+// 分类标签颜色（与桌面表格 Tag 配色保持一致）
+const categoryColors: Record<string, string> = {
+   regulation: 'green',
+   price: 'blue',
+   supplier: 'orange',
+   contract: 'purple',
+   case: 'cyan',
+   other: 'default',
 };
 
+/**
+ * 移动端标准库文件紧凑卡片：
+ * 第一行 文件名 + 分类标签；第二行 适用范围·上传人·时间；第三行 状态 + 操作。
+ */
 export const MobileFileCard: React.FC<MobileFileCardProps> = ({
-  file,
-  categoryMap,
-  categoryColorMap,
-  onView,
-  onDownload,
-  onEdit,
-  onDelete,
-  onStatusChange,
+   file,
+   styles,
+   onView,
+   onDownload,
+   onEdit,
+   onDelete,
 }) => {
-  const moreMenuItems: MenuProps['items'] = [
-    {
-      key: 'status',
-      icon: file.status === 1 ? <CloseCircleOutlined /> : <CheckCircleOutlined />,
-      label: file.status === 1 ? '停用' : '启用',
-      onClick: () => onStatusChange(file),
-    },
-    {
-      key: 'download',
-      icon: <DownloadOutlined />,
-      label: '下载',
-      onClick: () => onDownload(file),
-    },
-    {
-      key: 'edit',
-      icon: <EditOutlined />,
-      label: '编辑',
-      onClick: () => onEdit(file),
-    },
-    {
-      type: 'divider',
-    },
-    {
-      key: 'delete',
-      icon: <DeleteOutlined />,
-      label: '删除',
-      danger: true,
-      onClick: () => {
-        Modal.confirm({
-          title: '确定要删除该文件吗？',
-          content: '删除后将无法参与审核，且不可恢复，请谨慎操作！',
-          okText: '确认删除',
-          cancelText: '取消',
-          okButtonProps: { danger: true },
-          onOk: () => onDelete(file),
-        });
-      },
-    },
-  ];
+   const uploadTime = file.uploadTime
+      ? dayjs(file.uploadTime).format('YYYY-MM-DD')
+      : '-';
+   const enabled = file.status === 1;
 
-  return (
-    <div className="mobile-file-card">
-      <div className="mobile-file-card-header">
-        <div className="mobile-file-card-title-row">
-          <span className="mobile-file-card-name">{file.fileName}</span>
-          <div className="mobile-file-card-badges">
-            <Tag color={categoryColorMap[file.category]} className="mobile-file-card-category">
-              {categoryMap[file.category]}
-            </Tag>
-            <Tag 
-              color={file.status === 1 ? 'success' : 'default'}
-              className="mobile-file-card-status"
+   const menuItems: MenuProps['items'] = [
+      { key: 'view', icon: <EyeOutlined />, label: '查看', onClick: () => onView(file) },
+      { key: 'download', icon: <DownloadOutlined />, label: '下载', onClick: () => onDownload(file) },
+      { key: 'edit', icon: <EditOutlined />, label: '编辑', onClick: () => onEdit(file) },
+      { type: 'divider' },
+      {
+         key: 'delete',
+         icon: <DeleteOutlined />,
+         label: '删除',
+         danger: true,
+         onClick: () => {
+            Modal.confirm({
+               title: '确定要删除该文件吗？',
+               content: '删除后将无法参与审核，且不可恢复，请谨慎操作！',
+               okText: '确认删除',
+               cancelText: '取消',
+               okButtonProps: { danger: true },
+               onOk: () => onDelete(file),
+            });
+         },
+      },
+   ];
+
+   return (
+      <div className={styles.mobileCard} onClick={() => onView(file)}>
+         <div className={styles.mobileCardHeader}>
+            <span className={styles.mobileCardName}>{file.fileName}</span>
+            <Tag
+               color={categoryColors[file.category] ?? 'default'}
+               className={styles.mobileCardCategory}
             >
-              {file.status === 1 ? '启用' : '停用'}
+               {CategoryMap[file.category]}
             </Tag>
-          </div>
-        </div>
+         </div>
+
+         <div className={styles.mobileCardMeta}>
+            {ApplicableScopeMap[file.applicableScope] || '通用'} ·{' '}
+            {file.uploadUserName || '-'} · {uploadTime}
+         </div>
+
+         <div className={styles.mobileCardFooter}>
+            <Tag
+               color={enabled ? 'success' : 'default'}
+               className={styles.mobileCardStatus}
+            >
+               {enabled ? '启用' : '停用'}
+            </Tag>
+
+            <span onClick={(e) => e.stopPropagation()}>
+               <Dropdown
+                  menu={{ items: menuItems }}
+                  trigger={['click']}
+                  placement='bottomRight'
+               >
+                  <Button size='small' type='text' className={styles.mobileCardMore}>
+                     操作 <MoreOutlined />
+                  </Button>
+               </Dropdown>
+            </span>
+         </div>
       </div>
-      <div className="mobile-file-card-info">
-        <span className="mobile-file-card-meta">
-          {file.uploadTime} · {scopeMap[file.applicableScope]} · {file.uploadUserName}
-        </span>
-      </div>
-      <div className="mobile-file-card-actions">
-        <Button 
-          type="link" 
-          size="small"
-          icon={<EyeOutlined />}
-          onClick={() => onView(file)}
-          className="mobile-file-card-view-btn"
-        >
-          查看
-        </Button>
-        <Dropdown
-          menu={{ items: moreMenuItems }}
-          trigger={['click']}
-          placement="bottomRight"
-        >
-          <Button 
-            type="text" 
-            size="small"
-            icon={<MoreOutlined />}
-            className="mobile-file-card-more-btn"
-          />
-        </Dropdown>
-      </div>
-    </div>
-  );
+   );
 };

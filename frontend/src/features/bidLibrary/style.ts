@@ -330,4 +330,79 @@ export const useStyles = createStyles(({ css, token }) => ({
       font-size: 14px;
       color: ${token.colorTextSecondary};
    `,
+
+   // 6. 移动端：表格 → 紧凑卡片
+   mobileListContainer: css`
+      padding: 12px;
+      background: ${token.colorBgLayout};
+   `,
+   mobileCardList: css`
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      width: 100%;
+   `,
+   mobileCard: css`
+      background: ${token.colorBgContainer};
+      border: 1px solid ${token.colorBorderSecondary};
+      border-radius: ${token.borderRadiusLG}px;
+      padding: 10px 12px;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+
+      &:active {
+         box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
+      }
+   `,
+   mobileCardHeader: css`
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+      margin-bottom: 6px;
+   `,
+   mobileCardName: css`
+      flex: 1;
+      min-width: 0;
+      font-size: 14px;
+      font-weight: 600;
+      color: ${token.colorText};
+      line-height: 1.4;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+   `,
+   mobileCardCategory: css`
+      margin-inline-end: 0;
+      font-size: 11px;
+      line-height: 1.4;
+      padding: 0 6px;
+      flex-shrink: 0;
+   `,
+   mobileCardMeta: css`
+      font-size: 12px;
+      color: ${token.colorTextSecondary};
+      line-height: 1.5;
+      margin-bottom: 8px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+   `,
+   mobileCardFooter: css`
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-top: 8px;
+      border-top: 1px solid ${token.colorBorderSecondary};
+   `,
+   mobileCardStatus: css`
+      margin-inline-end: 0;
+      font-size: 11px;
+      line-height: 1.4;
+      padding: 0 6px;
+   `,
+   mobileCardMore: css`
+      padding: 0 6px !important;
+      font-size: 13px;
+      height: auto !important;
+   `,
 }));
