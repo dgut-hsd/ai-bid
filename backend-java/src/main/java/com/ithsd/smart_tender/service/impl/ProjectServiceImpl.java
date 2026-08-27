@@ -291,9 +291,14 @@ public class ProjectServiceImpl implements ProjectService {
         if (task == null) {
             return null;
         }
-        // auditResult 已废弃，基于 taskStatus 映射结果
+        // 基于 taskStatus + 是否发现风险点映射结果：
+        // 完成且无风险点 → 已通过(pass)；完成但有风险点 → 需修改(reject)
         Integer status = task.getTaskStatus();
-        if (AuditTaskStatusEnum.COMPLETED.getCode().equals(status)) return "pass";
+        if (AuditTaskStatusEnum.COMPLETED.getCode().equals(status)) {
+            Long issueCount = auditIssueMapper.selectCount(new LambdaQueryWrapper<AuditIssue>()
+                    .eq(AuditIssue::getAuditId, task.getId()));
+            return (issueCount != null && issueCount > 0) ? "reject" : "pass";
+        }
         if (AuditTaskStatusEnum.FAILED.getCode().equals(status)) return "reject";
         return "pending";
     }
