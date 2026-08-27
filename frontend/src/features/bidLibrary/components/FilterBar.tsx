@@ -16,8 +16,9 @@ interface FilterBarProps {
    dateRange: [Dayjs | null, Dayjs | null] | null;
    onDateRangeChange: (value: [Dayjs | null, Dayjs | null] | null) => void;
    onReset: () => void;
-   drawerOpen: boolean;
-   onDrawerClose: () => void;
+   // 移动端筛选抽屉（可选：桌面端无需传，后续移动端接线时再补充）
+   drawerOpen?: boolean;
+   onDrawerClose?: () => void;
 }
 
 export function FilterBar({
@@ -28,8 +29,8 @@ export function FilterBar({
    dateRange,
    onDateRangeChange,
    onReset,
-   drawerOpen,
-   onDrawerClose,
+   drawerOpen = false,
+   onDrawerClose = () => {},
 }: FilterBarProps) {
    const { styles } = useStyles();
    const isMobile = useIsMobile();
