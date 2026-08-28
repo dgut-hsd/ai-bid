@@ -34,15 +34,16 @@ RUN mkdir -p /usr/local/cargo && printf '%s\n' \
     'git-fetch-with-cli = true' \
     > /usr/local/cargo/config.toml
 
-# 先只复制依赖清单并预取依赖（manifest 不变则此层缓存，不重复下载）
+# 复制依赖清单与源码（src 需同时存在，cargo 才能解析出 target）
 COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml ./
-RUN --mount=type=cache,target=/usr/local/cargo/registry cargo fetch
-
-# 再复制源码，增量编译业务代码；registry 与 target 产物跨构建复用
 COPY src ./src
+
+# 编译 HTTP 服务入口；registry 与 target 产物跨构建复用（首次全量，之后增量）。
+# 注意：target 在 cache mount 中不会进入镜像层，需把产物拷到普通路径供 COPY --from 使用。
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --bin server
+    cargo build --release --bin server \
+    && cp /app/target/release/server /app/server-release
 
 # ── 运行阶段 ──
 FROM debian:bookworm-slim
@@ -62,7 +63,7 @@ RUN useradd -r -s /usr/sbin/nologin -m -d /home/soffice soffice
 
 WORKDIR /app
 
-COPY --from=build /app/target/release/server /usr/local/bin/server
+COPY --from=build /app/server-release /usr/local/bin/server
 
 # 规则库数据（conditions.yaml / catalog.yaml）—— 引擎按 CARGO_MANIFEST_DIR=/app 定位 /app/src/rules/data，必须拷入
 COPY src/rules/data /app/src/rules/data
