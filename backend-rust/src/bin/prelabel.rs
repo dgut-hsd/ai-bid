@@ -176,6 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             risk_id: format!("RC_{idx:04}"),
             clause_ids: vec![format!("clause_{idx}")],
             block_ids: vec![],
+            highlight_rects: Vec::new(),
             agent: "RuleEngineAgent".into(),
             no_risk: raw_hits.is_empty(),
             severity: ai_bid::agents::types::RiskSeverity::Medium,

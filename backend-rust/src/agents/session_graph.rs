@@ -650,6 +650,7 @@ mod tests {
                 risk_id: risk_id.to_string(),
                 clause_ids: vec![chunk_id.to_string()],
                 block_ids: Vec::new(),
+                highlight_rects: Vec::new(),
                 agent: "TestAgent".to_string(),
                 no_risk: false,
                 severity: RiskSeverity::High,

@@ -693,6 +693,12 @@ impl Coordinator {
                 .is_err()
             {
                 eprintln!("  [EVIDENCE_VERIFY] 阶段超时，跳过");
+                // 证据核验被跳过后，未验证的发现仍会原样输出 → 结果必须标记为
+                // partial_failed，避免把降级质量的结果当成 completed 静默交付。
+                execution_control.record_stage_failure(
+                    ExecutionStage::EvidenceVerify,
+                    "证据核验阶段未在剩余时长内完成，相关发现未经核验即输出",
+                );
                 execution_control.record_pipeline_timeout_if_expired();
             }
         }
@@ -2880,6 +2886,7 @@ impl Coordinator {
                     risk_id: format!("BLIND_{}", cid),
                     clause_ids: vec![(*cid).clone()],
                     block_ids: Vec::new(),
+                    highlight_rects: Vec::new(),
                     agent: "BlindSpotAgent".to_string(),
                     no_risk: false,
                     severity: RiskSeverity::Info,
@@ -2940,6 +2947,7 @@ impl Coordinator {
                     risk_id: format!("BLIND_NO_RISK_{}", cid),
                     clause_ids: vec![(*cid).clone()],
                     block_ids: Vec::new(),
+                    highlight_rects: Vec::new(),
                     agent: "BlindSpotAgent".to_string(),
                     no_risk: true,
                     severity: RiskSeverity::Info,
@@ -3568,6 +3576,7 @@ mod tests {
             risk_id: risk_id.to_string(),
             clause_ids: vec![clause_id.to_string()],
             block_ids: Vec::new(),
+            highlight_rects: Vec::new(),
             agent: agent.to_string(),
             no_risk: false,
             severity: RiskSeverity::High,

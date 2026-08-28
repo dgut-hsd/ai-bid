@@ -465,6 +465,7 @@ mod tests {
             risk_id: "R_001".into(),
             clause_ids: vec!["ch_1".into()],
             block_ids: vec![],
+            highlight_rects: Vec::new(),
             agent: "test".into(),
             no_risk: false,
             severity: RiskSeverity::High,

@@ -25,6 +25,7 @@ interface BackendFinding {
   risk_id: string;
   clause_ids: string[];
   block_ids?: string[];
+  highlight_rects?: BackendHighlightRect[];
   agent: string;
   no_risk: boolean;
   severity: string;
@@ -52,6 +53,15 @@ interface BackendCitation {
   title: string;
   url: string;
   site_name?: string;
+}
+
+interface BackendHighlightRect {
+  page?: number;
+  x0?: number;
+  top?: number;
+  x1?: number;
+  bottom?: number;
+  page_width?: number;
 }
 
 interface BackendSuggestedAgent {
@@ -153,6 +163,17 @@ export const mapBackendFinding = (raw: BackendFinding): AuditIssue => {
       : [],
     clauseIds: Array.isArray(raw.clause_ids) ? raw.clause_ids : [],
     blockIds: Array.isArray(raw.block_ids) ? raw.block_ids : [],
+    // 词级精确高亮矩形（后端 source_quote → 命中词的逐行 union bbox）
+    highlightRects: Array.isArray(raw.highlight_rects)
+      ? raw.highlight_rects.map((r) => ({
+          page: r.page ?? 0,
+          x0: r.x0 ?? 0,
+          top: r.top ?? 0,
+          x1: r.x1 ?? 0,
+          bottom: r.bottom ?? 0,
+          pageWidth: r.page_width ?? 0,
+        }))
+      : [],
     // 锚定信息
     anchorPage:
       typeof raw.page_number === 'number' && raw.page_number >= 0

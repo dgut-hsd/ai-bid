@@ -108,6 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             risk_id: ann.finding_id.clone(),
             clause_ids: vec![],
             block_ids: vec![],
+            highlight_rects: Vec::new(),
             agent: "RuleEngineAgent".into(),
             no_risk: hits.is_empty() && legacy_candidates.is_empty(),
             severity: match ann.severity.as_str() {

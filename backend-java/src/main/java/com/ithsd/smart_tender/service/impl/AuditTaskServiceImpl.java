@@ -530,6 +530,20 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         vo.setTruncated(f.isTruncated());
         vo.setClauseIds(f.getClauseIds());
         vo.setBlockIds(f.getBlockIds());
+        // 词级精确高亮矩形（非空时前端跳过段落级 block 与文本层收敛，直接渲染）
+        if (f.getHighlightRects() != null && !f.getHighlightRects().isEmpty()) {
+            List<IssueVO.HighlightRectVO> rects = f.getHighlightRects().stream().map(r -> {
+                IssueVO.HighlightRectVO rv = new IssueVO.HighlightRectVO();
+                rv.setPage(r.getPage());
+                rv.setX0(r.getX0());
+                rv.setTop(r.getTop());
+                rv.setX1(r.getX1());
+                rv.setBottom(r.getBottom());
+                rv.setPageWidth(r.getPageWidth());
+                return rv;
+            }).collect(Collectors.toList());
+            vo.setHighlightRects(rects);
+        }
         vo.setAgent(f.getAgent());
 
         // Citations

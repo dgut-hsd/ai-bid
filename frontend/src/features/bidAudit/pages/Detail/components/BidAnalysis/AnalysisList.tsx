@@ -657,6 +657,21 @@ export const AnalysisList: React.FC<AnalysisListProps> = React.memo(
             if (page == null) return;
             const src = extractSourceInfo(target, currentFileName, currentFileId);
             const normalizedPage = normalizeLocatePage(page, src.fileName);
+            // ★ 首选：后端已算好词级紧致框（highlight_rects），直接按坐标渲染，
+            //   无需再 fetch /blocks，也无需走 pdf.js 文本层收敛（避免其固有误差）。
+            const preciseRects = Array.isArray(target.highlightRects) ? target.highlightRects : [];
+            if (HIGHLIGHT_MODE !== 'text' && preciseRects.length > 0 && onLocateBboxes) {
+               const boxes: BBoxData[] = preciseRects.map((r) => ({
+                  x0: r.x0,
+                  top: r.top,
+                  x1: r.x1,
+                  bottom: r.bottom,
+                  pageWidth: r.pageWidth,
+                  page: (r.page ?? 0) + 1, // 后端 page 为 0-based → 前端 1-based data-page-num
+               }));
+               onLocateBboxes(normalizedPage, boxes);
+               return;
+            }
             const useBbox =
                HIGHLIGHT_MODE !== 'text' &&
                target.blockIds &&

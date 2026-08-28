@@ -59,10 +59,10 @@ use crate::agents::tools::{
 use crate::agents::trace::TraceLog;
 use crate::agents::types::{
     AgentId, ChatAgentConfig, ChatResponse, ChatStreamEvent, CoordinatorConfig, CoordinatorOutput,
-    ReviewClause, TextSelection,
+    HighlightRect, ReviewClause, TextSelection,
 };
 use crate::domain::chunk::{Chunk, ChunkingConfig};
-use crate::domain::raw_document::RawDocument;
+use crate::domain::raw_document::{BBox, RawDocument};
 use crate::domain::vector_index::DocumentVectorIndex;
 use crate::paths::data_path_str;
 use crate::services::chunking_service::chunk_sections;
@@ -966,6 +966,27 @@ pub async fn review_document(
         ec.clone()
     };
 
+    // 提取每页 word 级坐标（审核完成后做 source_quote → 词级精确高亮）。
+    // 键为 0-based 页码，值为 (页宽 pt, 阅读顺序的 (词文本, bbox) 列表)。
+    let page_words: Arc<HashMap<usize, (f64, Vec<(String, BBox)>)>> = Arc::new(
+        doc.raw_doc
+            .pages
+            .iter()
+            .map(|p| {
+                (
+                    p.page_index,
+                    (
+                        p.width,
+                        p.words
+                            .iter()
+                            .map(|w| (w.text.clone(), w.bbox.clone()))
+                            .collect(),
+                    ),
+                )
+            })
+            .collect(),
+    );
+
     // 后台执行管线
     let state_for_task = state.clone();
     let document_key_for_task = key.clone();
@@ -983,6 +1004,7 @@ pub async fn review_document(
             dashscope_search,
             search_backend,
             embed_client_for_tools,
+            page_words,
             review_events,
         )
         .await;
@@ -1016,6 +1038,7 @@ async fn run_review_pipeline(
     dashscope_search: Option<Arc<DashScopeSearchBackend>>,
     search_backend: String,
     embed_client_for_tools: Option<Arc<EmbeddingClient>>,
+    page_words: Arc<HashMap<usize, (f64, Vec<(String, BBox)>)>>,
     review_events: Arc<ReviewEventBus>,
 ) {
     let tenant_id = document_key.tenant_id.clone();
@@ -1212,6 +1235,26 @@ let max_blocks = 5usize;
                         &chunk.text,
                         max_blocks,
                     );
+
+                    // ★ 词级精确高亮：用同一份 source_quote 反查该页的词坐标，
+                    //   返回紧贴命中原句的逐行矩形（比段落级 block 更精确）。
+                    //   chunk.page_start 为 0-based，与 page_words 键一致。
+                    finding.highlight_rects = page_words
+                        .get(&chunk.page_start)
+                        .map(|(width, words)| {
+                            match_words_to_quote(words, &source_quote)
+                                .into_iter()
+                                .map(|bbox| HighlightRect {
+                                    page: chunk.page_start,
+                                    x0: bbox.x0,
+                                    top: bbox.top,
+                                    x1: bbox.x1,
+                                    bottom: bbox.bottom,
+                                    page_width: *width,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                 }
             }
             let findings_with_blocks = output
@@ -3035,6 +3078,81 @@ fn select_blocks_by_source_quote(
         .take(max_blocks)
         .map(|(_, bid)| bid.clone())
         .collect()
+}
+
+/// 在页面的词序列（阅读顺序）中定位 `source_quote`，返回命中词的逐行紧致包围盒。
+///
+/// 与 `select_blocks_by_source_quote` 共用同一套 bigram 定位（`find_quote_position`），
+/// 区别是匹配粒度在「词」而非「段落块」，因此返回的矩形紧贴原句、不会盖住整段。
+/// 每个返回值对应一个视觉行（同行命中词合并为一个矩形）。
+///
+/// 匹配不可靠时返回空 `Vec`，前端回落到 block 级高亮 + 文本层收敛。
+fn match_words_to_quote(words: &[(String, BBox)], source_quote: &str) -> Vec<BBox> {
+    if words.is_empty() || source_quote.trim().is_empty() {
+        return Vec::new();
+    }
+
+    // 1. 按阅读顺序拼接词文本（词间空格），并记录每个词的字符区间。
+    //    字符偏移与 `find_quote_position` 的 char 语义保持一致（UTF-8 按 char 而非字节）。
+    let mut word_text = String::new();
+    let mut ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(words.len());
+    for (i, (text, bbox)) in words.iter().enumerate() {
+        let start = word_text.chars().count();
+        word_text.push_str(text);
+        let end = word_text.chars().count();
+        if end > start && (bbox.bottom - bbox.top) > 0.0 {
+            ranges.push((i, start, end));
+        }
+        word_text.push(' ');
+    }
+
+    // 2. 用与块级选择相同的 bigram 窗口定位
+    let (match_start, match_end) = match find_quote_position(source_quote, &word_text) {
+        Some(pos) => pos,
+        None => return Vec::new(),
+    };
+
+    // 3. 找出与匹配窗口相交的词
+    let mut hit_idx: Vec<usize> = Vec::new();
+    for &(i, start, end) in &ranges {
+        if start < match_end && match_start < end {
+            hit_idx.push(i);
+        }
+    }
+    if hit_idx.is_empty() {
+        return Vec::new();
+    }
+
+    // 4. 按视觉行分组（top 接近视为同行），每行合并为一个紧致矩形。
+    //    行分组阈值参照 compute_blocks：line_height * 1.2。
+    let hit_boxes: Vec<&BBox> = hit_idx.iter().map(|&i| &words[i].1).collect();
+    let mut heights: Vec<f64> = hit_boxes.iter().map(|b| b.bottom - b.top).collect();
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let line_height = heights[heights.len() / 2];
+
+    let mut sorted: Vec<&BBox> = hit_boxes.clone();
+    sorted.sort_by(|a, b| {
+        a.top
+            .partial_cmp(&b.top)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let tol = (line_height * 1.2).max(6.0);
+    let mut lines: Vec<BBox> = Vec::new();
+    for b in sorted {
+        if let Some(last) = lines.last_mut() {
+            if b.top - last.top < tol {
+                last.x0 = last.x0.min(b.x0);
+                last.top = last.top.min(b.top);
+                last.x1 = last.x1.max(b.x1);
+                last.bottom = last.bottom.max(b.bottom);
+                continue;
+            }
+        }
+        lines.push(b.clone());
+    }
+    lines
 }
 
 #[cfg(test)]
