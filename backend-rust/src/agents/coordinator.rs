@@ -688,9 +688,12 @@ impl Coordinator {
                 message: "证据核验中（证伪导向 NLI 三分类）...".to_string(),
             });
             let ev_timeout = execution_control.pipeline_remaining().unwrap_or_default();
-            if tokio::time::timeout(ev_timeout, self.evidence_verify(&mut merged[..]))
-                .await
-                .is_err()
+            if tokio::time::timeout(
+                ev_timeout,
+                self.evidence_verify(&mut merged[..], execution_control.clone()),
+            )
+            .await
+            .is_err()
             {
                 eprintln!("  [EVIDENCE_VERIFY] 阶段超时，跳过");
                 // 证据核验被跳过后，未验证的发现仍会原样输出 → 结果必须标记为
@@ -2996,7 +2999,11 @@ impl Coordinator {
     /// 对每条 Verified finding 仅凭 source_quote + risk_type 做独立证据核验，不喂 reason。
     /// support → 放行；refute/insufficient → 降级 Info（疑似）。
     /// 同一原文（去重 key）只调用一次 LLM，结果复用。
-    async fn evidence_verify(&self, findings: &mut [RiskFinding]) -> usize {
+    async fn evidence_verify(
+        &self,
+        findings: &mut [RiskFinding],
+        execution_control: Arc<ReviewExecutionControl>,
+    ) -> usize {
         // 1) 去重：同一核心原文只裁决一次
         let mut reps: Vec<(String, String, String)> = Vec::new(); // (key, quote, risk_type)
         let mut seen: HashSet<String> = HashSet::new();
@@ -3014,18 +3021,46 @@ impl Coordinator {
             findings.len(),
             reps.len()
         );
+        if reps.is_empty() {
+            return 0;
+        }
 
-        // 2) 逐组独立裁决
+        // 2) 多组并行裁决：Semaphore 有界并发 + 全局预算/单次超时兜底。
+        //    串行时 79 组 × ~14s ≈ 18 分钟；并行后压到 ceil(N/并发度) 批（默认 6 并发）。
+        let concurrency = execution_control
+            .limits()
+            .evidence_verify_concurrency
+            .max(1);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let llm_factory = self.llm_factory.clone();
+        let mut join_set: JoinSet<(String, Option<(String, String)>)> = JoinSet::new();
+
+        for (key, quote, risk_type) in reps {
+            let semaphore = semaphore.clone();
+            let factory = llm_factory.clone();
+            let control = execution_control.clone();
+            join_set.spawn(async move {
+                let _guard = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("EvidenceVerify 并发信号量未关闭");
+                let llm = crate::agents::execution_control::ControlledLlmClient::wrap(
+                    (factory)(),
+                    control,
+                );
+                let result = verify_evidence(llm.as_ref(), &quote, &risk_type).await;
+                (key, result)
+            });
+        }
+
+        // 汇总结果：全部在途任务完成后才回写，保持"超时即不落半成品"的原子语义。
         let mut cache: HashMap<String, (String, String)> = HashMap::new();
         let mut verified = 0usize;
-        for (key, quote, risk_type) in reps {
-            let llm = (self.llm_factory)();
-            if let Some((verdict, reason)) = verify_evidence(llm.as_ref(), &quote, &risk_type).await {
+        while let Some(res) = join_set.join_next().await {
+            if let Ok((key, Some((verdict, reason)))) = res {
                 verified += 1;
                 cache.insert(key, (verdict, reason));
             }
-            // 轻量节流，避免触发 LLM 限流
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
         // 3) 回写每条 finding：support 放行，其余降级 Info

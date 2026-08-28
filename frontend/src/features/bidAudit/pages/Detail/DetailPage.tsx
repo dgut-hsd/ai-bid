@@ -105,6 +105,7 @@ export const DetailPage: React.FC = () => {
       phaseEvent,
       statsEvent,
       liveFindings,
+      failedStages,
    } = isMock ? mockAudit : realAudit;
 
    if (isLoading) {
@@ -203,6 +204,7 @@ export const DetailPage: React.FC = () => {
                phaseEvent={phaseEvent}
                statsEvent={statsEvent}
                liveFindings={liveFindings}
+               failedStages={failedStages}
             />
          </div>
       </div>

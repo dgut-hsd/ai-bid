@@ -47,6 +47,7 @@ pub struct ExecutionLimits {
     pub legal_verify_timeout: Duration,
     pub debate_timeout: Duration,
     pub pipeline_timeout: Duration,
+    pub evidence_verify_concurrency: usize,
 }
 
 impl Default for ExecutionLimits {
@@ -61,6 +62,7 @@ impl Default for ExecutionLimits {
             legal_verify_timeout: Duration::from_secs(5 * 60),
             debate_timeout: Duration::from_secs(5 * 60),
             pipeline_timeout: Duration::from_secs(60 * 60),
+            evidence_verify_concurrency: 6,
         }
     }
 }
@@ -130,6 +132,8 @@ impl GlobalExecutionLimiter {
         limits.pipeline_timeout = Duration::from_secs(
             (env_usize("AIBID_PIPELINE_TIMEOUT_MINUTES", 60, 5, 1440) as u64) * 60,
         );
+        // 证据核验的多组并行度：串行时 79 组 × ~14s ≈ 18 分钟，并行后按该上限分批。
+        limits.evidence_verify_concurrency = env_usize("AIBID_EVIDENCE_VERIFY_CONCURRENCY", 6, 1, 32);
         Self::new(limits)
     }
 

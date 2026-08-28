@@ -89,6 +89,8 @@ export const useAuditTask = (bidId?: number) => {
    const [phaseHistory, setPhaseHistory] = useState<PhaseEvent[]>([]);
    const [statsEvent, setStatsEvent] = useState<StatsEvent | null>(null);
    const [liveFindings, setLiveFindings] = useState<FindingAddedEvent[]>([]);
+   /** 部分失败阶段名（如 evidence_verify），非空表示结果经过降级、未经完整核验 */
+   const [failedStages, setFailedStages] = useState<string[]>([]);
    const pollFailRef = useRef(0);
    const updateFinalElapsed = useCallback(() => {
       if (auditStartedAt <= 0) return;
@@ -118,6 +120,7 @@ export const useAuditTask = (bidId?: number) => {
          setPhaseHistory([]);
          setStatsEvent(null);
          setLiveFindings([]);
+         setFailedStages([]);
          setCurrentStage('正在创建审核任务...');
       },
 
@@ -213,6 +216,7 @@ export const useAuditTask = (bidId?: number) => {
             const completed = status.status === 'completed';
             setIsComplete(completed);
             if (completed) {
+               setFailedStages(status.failedStages || []);
                const result = await getAuditResult(taskId, { page: 1, size: 200 });
                if (cancelled) return;
                setIssues((result.issues || []).map(withAnchorFallback));
@@ -377,6 +381,7 @@ export const useAuditTask = (bidId?: number) => {
                   if (!isMounted) return;
                   const completed = status.status === 'completed';
                   if (completed) {
+                     setFailedStages(status.failedStages || []);
                      const result = await getAuditResult(taskId, { page: 1, size: 200 });
                      if (!isMounted) return;
                      setIssues((result.issues || []).map(withAnchorFallback));
@@ -435,6 +440,7 @@ export const useAuditTask = (bidId?: number) => {
             if (status.stage) setCurrentStage(status.stage);
 
             if (status.status === 'completed') {
+               setFailedStages(status.failedStages || []);
                const result = await getAuditResult(taskId, { page: 1, size: 200 });
                if (stopped) return;
                setIssues((result.issues || []).map(withAnchorFallback));
@@ -534,5 +540,6 @@ export const useAuditTask = (bidId?: number) => {
       phaseHistory,
       statsEvent,
       liveFindings,
+      failedStages,
    };
 };
