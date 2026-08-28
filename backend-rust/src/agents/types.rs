@@ -368,6 +368,32 @@ pub struct RiskFinding {
     /// 条款原文上下文（截取前 500 字符），框架自动填充
     #[serde(default)]
     pub context: Option<String>,
+    /// 词级精确高亮矩形（按 source_quote 命中的词逐行合并）。
+    /// 非空时前端优先渲染这些紧致框，跳过段落级 block 高亮与文本层收敛。
+    /// 框架在审核完成阶段自动填充。
+    #[serde(default)]
+    pub highlight_rects: Vec<HighlightRect>,
+}
+
+/// 词级精确高亮矩形。
+///
+/// 坐标与 `RawBlock.bbox` / `/blocks` 端点的 `BBoxDto` 一致：PDF points，
+/// 原点在页面左上角，Y 轴向下。`page` 为 0-based 页码。`page_width` 为
+/// 该页原生宽度 (pt)，供前端计算 scale = renderedWidth / pageWidth。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HighlightRect {
+    /// 所在页码 (0-based)
+    pub page: usize,
+    /// 矩形左上角 X（PDF points）
+    pub x0: f64,
+    /// 矩形上边界 Y（距页面顶部距离）
+    pub top: f64,
+    /// 矩形右下角 X
+    pub x1: f64,
+    /// 矩形下边界 Y
+    pub bottom: f64,
+    /// 原始 PDF 页面宽度 (pt)
+    pub page_width: f64,
 }
 
 // ─── 发现角色 ──────────────────────────────────────────────────
@@ -439,6 +465,7 @@ impl RiskFinding {
             risk_id,
             clause_ids: vec![clause_id],
             block_ids: Vec::new(),
+            highlight_rects: Vec::new(),
             agent: agent.to_string(),
             no_risk: true,
             severity: RiskSeverity::Info,
@@ -484,6 +511,7 @@ impl RiskFinding {
             risk_id,
             clause_ids: vec![clause_id],
             block_ids: Vec::new(),
+            highlight_rects: Vec::new(),
             agent: agent.to_string(),
             no_risk: true,
             severity: RiskSeverity::Info,
@@ -1706,6 +1734,7 @@ mod tests {
             risk_id: "R_003".into(),
             clause_ids: vec!["ch_003".into()],
             block_ids: Vec::new(),
+            highlight_rects: Vec::new(),
             agent: "SemanticRiskAgent".into(),
             no_risk: false,
             severity: RiskSeverity::High,

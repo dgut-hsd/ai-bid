@@ -19,6 +19,7 @@ pub enum ExecutionStage {
     LegalVerify,
     Debate,
     BlindSpot,
+    EvidenceVerify,
 }
 
 impl ExecutionStage {
@@ -30,6 +31,7 @@ impl ExecutionStage {
             Self::LegalVerify => "legal_verify",
             Self::Debate => "debate",
             Self::BlindSpot => "blind_spot",
+            Self::EvidenceVerify => "evidence_verify",
         }
     }
 }
@@ -58,7 +60,7 @@ impl Default for ExecutionLimits {
             execute_timeout: Duration::from_secs(20 * 60),
             legal_verify_timeout: Duration::from_secs(5 * 60),
             debate_timeout: Duration::from_secs(5 * 60),
-            pipeline_timeout: Duration::from_secs(30 * 60),
+            pipeline_timeout: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -121,6 +123,12 @@ impl GlobalExecutionLimiter {
             DEFAULT_DOCUMENT_CONCURRENCY,
             1,
             limits.global_concurrency,
+        );
+        // 审核管线总超时（分钟），默认 60；大标书（如 92/145 页）需更长时间完成
+        // 证据核验(EvidenceVerify)。此前硬编码 30 分钟，导致大标书在 30 分钟红线处
+        // 跳过证据核验、把未验证的发现直接落库（详见 docs/审核稳定性修复计划.md）。
+        limits.pipeline_timeout = Duration::from_secs(
+            (env_usize("AIBID_PIPELINE_TIMEOUT_MINUTES", 60, 5, 1440) as u64) * 60,
         );
         Self::new(limits)
     }
@@ -291,7 +299,11 @@ impl ReviewExecutionControl {
 
     pub fn record_pipeline_timeout_if_expired(&self) {
         if self.pipeline_expired() {
-            self.record_stage_failure(ExecutionStage::Pipeline, "审核管线超过 30 分钟硬上限");
+            let minutes = self.limits.pipeline_timeout.as_secs() / 60;
+            self.record_stage_failure(
+                ExecutionStage::Pipeline,
+                format!("审核管线超过 {minutes} 分钟硬上限"),
+            );
         }
     }
 

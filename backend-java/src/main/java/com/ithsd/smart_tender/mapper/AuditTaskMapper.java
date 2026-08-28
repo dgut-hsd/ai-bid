@@ -87,6 +87,7 @@ public interface AuditTaskMapper extends BaseMapper<AuditTask> {
             stage = 'SUMMARY',
             progress = 100,
             error_msg = NULL,
+            failed_stages = #{failedStages},
             end_time = #{endTime},
             updated_at = #{endTime},
             version = version + 1
@@ -97,5 +98,6 @@ public interface AuditTaskMapper extends BaseMapper<AuditTask> {
     int markCompleted(
             @Param("taskId") String taskId,
             @Param("tenantId") Long tenantId,
-            @Param("endTime") LocalDateTime endTime);
+            @Param("endTime") LocalDateTime endTime,
+            @Param("failedStages") String failedStages);
 }

@@ -96,6 +96,8 @@ services:
       # Multi-Agent
       AIBID_AGENT: ${AIBID_AGENT:-1}
       AIBID_COORDINATOR: ${AIBID_COORDINATOR:-1}
+      # 审核管线总超时（分钟），默认 60；大标书需更长时间完成证据核验
+      AIBID_PIPELINE_TIMEOUT_MINUTES: "${AIBID_PIPELINE_TIMEOUT_MINUTES:-60}"
       # Java ↔ Rust 内部签名密钥（必须与 Java 一致）
       RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
       # 向量库 / 图库

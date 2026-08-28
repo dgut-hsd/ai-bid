@@ -29,6 +29,7 @@ import com.ithsd.smart_tender.model.dto.rust.RustReviewRequest;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewResponse;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewResultResponse;
 import com.ithsd.smart_tender.model.dto.rust.RustRiskFinding;
+import com.ithsd.smart_tender.model.dto.rust.RustStageFailure;
 import com.ithsd.smart_tender.sse.AuditTaskEventService;
 import com.ithsd.smart_tender.sse.SseHub;
 import org.slf4j.Logger;
@@ -454,7 +455,31 @@ public class AuditEngineServiceImpl implements AuditEngineService {
         }
 
         LocalDateTime completedAt = LocalDateTime.now();
-        auditTaskMapper.markCompleted(task.getTaskId(), task.getTenantId(), completedAt);
+
+        // 透传 Rust 的「部分失败」信号：EvidenceVerify 等阶段被跳过时，Rust 返回
+        // status=partial_failed 且 failed_stages 非空。这里把失败阶段名写入 audit_task.failed_stages，
+        // 使 COMPLETE 事件的 failedStages 不再恒空（据此可提示结果经过降级而非完整核验）。
+        List<String> failedStages = new ArrayList<>();
+        if (reviewResp != null
+                && reviewResp.getExecutionSummary() != null
+                && reviewResp.getExecutionSummary().getFailedStages() != null) {
+            for (RustStageFailure sf : reviewResp.getExecutionSummary().getFailedStages()) {
+                if (sf != null && sf.getStage() != null && !sf.getStage().isBlank()) {
+                    failedStages.add(sf.getStage());
+                }
+            }
+        }
+        task.setFailedStages(failedStages);
+        String failedStagesJson = null;
+        if (!failedStages.isEmpty()) {
+            try {
+                failedStagesJson = objectMapper.writeValueAsString(failedStages);
+            } catch (Exception e) {
+                log.warn("failedStages serialize failed: taskId={}, {}", task.getTaskId(), e.getMessage());
+            }
+        }
+
+        auditTaskMapper.markCompleted(task.getTaskId(), task.getTenantId(), completedAt, failedStagesJson);
         task.setTaskStatus(AuditTaskStatusEnum.COMPLETED.getCode());
         task.setStage(AuditStageEnum.SUMMARY.name());
         task.setProgress(100);

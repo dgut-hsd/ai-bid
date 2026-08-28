@@ -59,10 +59,10 @@ use crate::agents::tools::{
 use crate::agents::trace::TraceLog;
 use crate::agents::types::{
     AgentId, ChatAgentConfig, ChatResponse, ChatStreamEvent, CoordinatorConfig, CoordinatorOutput,
-    ReviewClause, TextSelection,
+    HighlightRect, ReviewClause, TextSelection,
 };
 use crate::domain::chunk::{Chunk, ChunkingConfig};
-use crate::domain::raw_document::RawDocument;
+use crate::domain::raw_document::{BBox, RawDocument};
 use crate::domain::vector_index::DocumentVectorIndex;
 use crate::paths::data_path_str;
 use crate::services::chunking_service::chunk_sections;
@@ -966,6 +966,27 @@ pub async fn review_document(
         ec.clone()
     };
 
+    // 提取每页 word 级坐标（审核完成后做 source_quote → 词级精确高亮）。
+    // 键为 0-based 页码，值为 (页宽 pt, 阅读顺序的 (词文本, bbox) 列表)。
+    let page_words: Arc<HashMap<usize, (f64, Vec<(String, BBox)>)>> = Arc::new(
+        doc.raw_doc
+            .pages
+            .iter()
+            .map(|p| {
+                (
+                    p.page_index,
+                    (
+                        p.width,
+                        p.words
+                            .iter()
+                            .map(|w| (w.text.clone(), w.bbox.clone()))
+                            .collect(),
+                    ),
+                )
+            })
+            .collect(),
+    );
+
     // 后台执行管线
     let state_for_task = state.clone();
     let document_key_for_task = key.clone();
@@ -983,6 +1004,7 @@ pub async fn review_document(
             dashscope_search,
             search_backend,
             embed_client_for_tools,
+            page_words,
             review_events,
         )
         .await;
@@ -1016,6 +1038,7 @@ async fn run_review_pipeline(
     dashscope_search: Option<Arc<DashScopeSearchBackend>>,
     search_backend: String,
     embed_client_for_tools: Option<Arc<EmbeddingClient>>,
+    page_words: Arc<HashMap<usize, (f64, Vec<(String, BBox)>)>>,
     review_events: Arc<ReviewEventBus>,
 ) {
     let tenant_id = document_key.tenant_id.clone();
@@ -1212,6 +1235,26 @@ let max_blocks = 5usize;
                         &chunk.text,
                         max_blocks,
                     );
+
+                    // ★ 词级精确高亮：用同一份 source_quote 反查该页的词坐标，
+                    //   返回紧贴命中原句的逐行矩形（比段落级 block 更精确）。
+                    //   chunk.page_start 为 0-based，与 page_words 键一致。
+                    finding.highlight_rects = page_words
+                        .get(&chunk.page_start)
+                        .map(|(width, words)| {
+                            match_words_to_quote(words, &source_quote)
+                                .into_iter()
+                                .map(|bbox| HighlightRect {
+                                    page: chunk.page_start,
+                                    x0: bbox.x0,
+                                    top: bbox.top,
+                                    x1: bbox.x1,
+                                    bottom: bbox.bottom,
+                                    page_width: *width,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                 }
             }
             let findings_with_blocks = output
@@ -3037,6 +3080,94 @@ fn select_blocks_by_source_quote(
         .collect()
 }
 
+/// 在页面的词序列（阅读顺序）中定位 `source_quote`，返回命中词的逐行紧致包围盒。
+///
+/// 与 `select_blocks_by_source_quote` 共用同一套 bigram 定位（`find_quote_position`），
+/// 区别是匹配粒度在「词」而非「段落块」，因此返回的矩形紧贴原句、不会盖住整段。
+/// 每个返回值对应一个视觉行（同行命中词合并为一个矩形）。
+///
+/// 匹配不可靠时返回空 `Vec`，前端回落到 block 级高亮 + 文本层收敛。
+fn match_words_to_quote(words: &[(String, BBox)], source_quote: &str) -> Vec<BBox> {
+    if words.is_empty() || source_quote.trim().is_empty() {
+        return Vec::new();
+    }
+
+    // 1. 按阅读顺序「无分隔」拼接词文本（中文词间本无空格），并记录每个词的字符区间。
+    //    字符偏移与 `find_quote_position` 的 char 语义保持一致（UTF-8 按 char 而非字节）。
+    let mut word_text = String::new();
+    let mut ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(words.len());
+    for (i, (text, bbox)) in words.iter().enumerate() {
+        let start = word_text.chars().count();
+        word_text.push_str(text);
+        let end = word_text.chars().count();
+        if end > start && (bbox.bottom - bbox.top) > 0.0 {
+            ranges.push((i, start, end));
+        }
+    }
+
+    // 2. 去掉 source_quote 空白，与无分隔拼接的 word_text 对齐
+    //   （英文短语 / LLM 输出可能带空格）。
+    let compact_quote: String = source_quote.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact_quote.is_empty() {
+        return Vec::new();
+    }
+
+    // 3. 定位匹配范围：逐字引用是最常见情形，先做精确子串匹配（字节偏移 → 字符偏移）；
+    //    引用带标点 / OCR 误差导致不逐字相等时，回落到 bigram 滑动窗口。
+    let (match_start, match_end): (usize, usize) = match word_text.find(&compact_quote) {
+        Some(byte_start) => {
+            let char_start = word_text[..byte_start].chars().count();
+            (char_start, char_start + compact_quote.chars().count())
+        }
+        None => match find_quote_position(&compact_quote, &word_text) {
+            Some(pos) => pos,
+            None => return Vec::new(),
+        },
+    };
+
+    // 3. 找出与匹配窗口相交的词
+    let mut hit_idx: Vec<usize> = Vec::new();
+    for &(i, start, end) in &ranges {
+        if start < match_end && match_start < end {
+            hit_idx.push(i);
+        }
+    }
+    if hit_idx.is_empty() {
+        return Vec::new();
+    }
+
+    // 4. 按视觉行分组（top 接近视为同行），每行合并为一个紧致矩形。
+    //    行分组阈值参照 compute_blocks：line_height * 1.2。
+    let hit_boxes: Vec<&BBox> = hit_idx.iter().map(|&i| &words[i].1).collect();
+    let mut heights: Vec<f64> = hit_boxes.iter().map(|b| b.bottom - b.top).collect();
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let line_height = heights[heights.len() / 2];
+
+    let mut sorted: Vec<&BBox> = hit_boxes.clone();
+    sorted.sort_by(|a, b| {
+        a.top
+            .partial_cmp(&b.top)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let tol = (line_height * 1.2).max(6.0);
+    let mut lines: Vec<BBox> = Vec::new();
+    for b in sorted {
+        if let Some(last) = lines.last_mut() {
+            if b.top - last.top < tol {
+                last.x0 = last.x0.min(b.x0);
+                last.top = last.top.min(b.top);
+                last.x1 = last.x1.max(b.x1);
+                last.bottom = last.bottom.max(b.bottom);
+                continue;
+            }
+        }
+        lines.push(b.clone());
+    }
+    lines
+}
+
 #[cfg(test)]
 mod block_matching_tests {
     use super::*;
@@ -3226,5 +3357,99 @@ mod block_matching_tests {
             "应按真实偏移选中长 block b_nu_9（第十条，index 9），实际: {:?}",
             result
         );
+    }
+
+    // ─── match_words_to_quote 测试 ────────────────────────────────────────
+
+    /// 构造一行词：每个词按「字数 ×10pt」给宽、高 12pt，行首 x=10。
+    /// 用于验证词级高亮返回的矩形紧贴命中的词、不吞掉相邻词。
+    fn words_on_line(top: f64, texts: &[&str]) -> Vec<(String, BBox)> {
+        let mut x = 10.0f64;
+        texts
+            .iter()
+            .map(|t| {
+                let w = t.chars().count() as f64 * 10.0;
+                let b = BBox {
+                    x0: x,
+                    top,
+                    x1: x + w,
+                    bottom: top + 12.0,
+                };
+                x += w;
+                (t.to_string(), b)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn match_words_to_quote_single_line_tight_box() {
+        let words = words_on_line(
+            100.0,
+            &["本", "项目", "要求", "投标人", "须", "在本市", "注册", "三年"],
+        );
+        let quote = "投标人须在本市注册";
+        let rects = match_words_to_quote(&words, quote);
+        assert_eq!(rects.len(), 1, "单行命中应合并为 1 个矩形，实际: {:?}", rects);
+        let r = &rects[0];
+        assert!(
+            (r.x0 - words[3].1.x0).abs() < 1e-6,
+            "x0 应紧贴首个命中词（投标人），实际: {:.3} vs 期望 {:.3}",
+            r.x0,
+            words[3].1.x0
+        );
+        assert!(
+            (r.x1 - words[6].1.x1).abs() < 1e-6,
+            "x1 应紧贴末个命中词（注册），不得吞掉「三年」"
+        );
+        assert!((r.top - 100.0).abs() < 1e-9 && (r.bottom - 112.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn match_words_to_quote_two_lines_two_boxes() {
+        let mut words = words_on_line(100.0, &["投标人", "须", "为中华"]);
+        words.extend(words_on_line(
+            130.0,
+            &["人民", "共和国", "境内", "注册", "的企业"],
+        ));
+        let quote = "投标人须为中华人民共和国境内注册";
+        let rects = match_words_to_quote(&words, quote);
+        assert_eq!(rects.len(), 2, "跨两行应得到 2 个矩形，实际: {:?}", rects);
+        assert!((rects[0].top - 100.0).abs() < 1e-9, "第一行 top 应为 100");
+        assert!((rects[1].top - 130.0).abs() < 1e-9, "第二行 top 应为 130");
+        // 第二行 x1 应停在「注册」，不吞掉「的企业」
+        assert!(
+            (rects[1].x1 - words[6].1.x1).abs() < 1e-6,
+            "第二行 x1 应紧贴注册，实际: {:.3} vs 期望 {:.3}",
+            rects[1].x1,
+            words[6].1.x1
+        );
+    }
+
+    #[test]
+    fn match_words_to_quote_unreliable_returns_empty() {
+        let words = words_on_line(100.0, &["本", "项目", "位于", "北京", "市", "朝阳"]);
+        let quote = "投标人须具有独立法人资格";
+        assert!(
+            match_words_to_quote(&words, quote).is_empty(),
+            "无重叠 quote 应返回空，前端回落 block 级高亮"
+        );
+    }
+
+    #[test]
+    fn match_words_to_quote_empty_inputs_return_empty() {
+        let words = words_on_line(100.0, &["本", "项目"]);
+        assert!(match_words_to_quote(&words, "").is_empty());
+        assert!(match_words_to_quote(&[], "投标人").is_empty());
+    }
+
+    #[test]
+    fn match_words_to_quote_english_with_spaces() {
+        let words = words_on_line(50.0, &["the", "quick", "brown", "fox", "jumps"]);
+        let quote = "the quick brown";
+        let rects = match_words_to_quote(&words, quote);
+        assert_eq!(rects.len(), 1, "英文带空格 quote 应命中单行，实际: {:?}", rects);
+        let r = &rects[0];
+        assert!((r.x0 - words[0].1.x0).abs() < 1e-6, "x0 应贴 the");
+        assert!((r.x1 - words[2].1.x1).abs() < 1e-6, "x1 应贴 brown，不吞掉 fox/jumps");
     }
 }

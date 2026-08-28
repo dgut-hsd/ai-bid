@@ -43,6 +43,7 @@ fn finding(code: &str, quote: &str) -> RiskFinding {
         risk_id: "R_VERIFY".into(),
         clause_ids: vec!["ch_verify".into()],
         block_ids: vec![],
+        highlight_rects: Vec::new(),
         agent: "rule_engine_verify".into(),
         no_risk: false,
         severity: RiskSeverity::High,
