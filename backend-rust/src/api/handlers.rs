@@ -3092,7 +3092,7 @@ fn match_words_to_quote(words: &[(String, BBox)], source_quote: &str) -> Vec<BBo
         return Vec::new();
     }
 
-    // 1. 按阅读顺序拼接词文本（词间空格），并记录每个词的字符区间。
+    // 1. 按阅读顺序「无分隔」拼接词文本（中文词间本无空格），并记录每个词的字符区间。
     //    字符偏移与 `find_quote_position` 的 char 语义保持一致（UTF-8 按 char 而非字节）。
     let mut word_text = String::new();
     let mut ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(words.len());
@@ -3103,13 +3103,26 @@ fn match_words_to_quote(words: &[(String, BBox)], source_quote: &str) -> Vec<BBo
         if end > start && (bbox.bottom - bbox.top) > 0.0 {
             ranges.push((i, start, end));
         }
-        word_text.push(' ');
     }
 
-    // 2. 用与块级选择相同的 bigram 窗口定位
-    let (match_start, match_end) = match find_quote_position(source_quote, &word_text) {
-        Some(pos) => pos,
-        None => return Vec::new(),
+    // 2. 去掉 source_quote 空白，与无分隔拼接的 word_text 对齐
+    //   （英文短语 / LLM 输出可能带空格）。
+    let compact_quote: String = source_quote.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact_quote.is_empty() {
+        return Vec::new();
+    }
+
+    // 3. 定位匹配范围：逐字引用是最常见情形，先做精确子串匹配（字节偏移 → 字符偏移）；
+    //    引用带标点 / OCR 误差导致不逐字相等时，回落到 bigram 滑动窗口。
+    let (match_start, match_end): (usize, usize) = match word_text.find(&compact_quote) {
+        Some(byte_start) => {
+            let char_start = word_text[..byte_start].chars().count();
+            (char_start, char_start + compact_quote.chars().count())
+        }
+        None => match find_quote_position(&compact_quote, &word_text) {
+            Some(pos) => pos,
+            None => return Vec::new(),
+        },
     };
 
     // 3. 找出与匹配窗口相交的词
@@ -3344,5 +3357,99 @@ mod block_matching_tests {
             "应按真实偏移选中长 block b_nu_9（第十条，index 9），实际: {:?}",
             result
         );
+    }
+
+    // ─── match_words_to_quote 测试 ────────────────────────────────────────
+
+    /// 构造一行词：每个词按「字数 ×10pt」给宽、高 12pt，行首 x=10。
+    /// 用于验证词级高亮返回的矩形紧贴命中的词、不吞掉相邻词。
+    fn words_on_line(top: f64, texts: &[&str]) -> Vec<(String, BBox)> {
+        let mut x = 10.0f64;
+        texts
+            .iter()
+            .map(|t| {
+                let w = t.chars().count() as f64 * 10.0;
+                let b = BBox {
+                    x0: x,
+                    top,
+                    x1: x + w,
+                    bottom: top + 12.0,
+                };
+                x += w;
+                (t.to_string(), b)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn match_words_to_quote_single_line_tight_box() {
+        let words = words_on_line(
+            100.0,
+            &["本", "项目", "要求", "投标人", "须", "在本市", "注册", "三年"],
+        );
+        let quote = "投标人须在本市注册";
+        let rects = match_words_to_quote(&words, quote);
+        assert_eq!(rects.len(), 1, "单行命中应合并为 1 个矩形，实际: {:?}", rects);
+        let r = &rects[0];
+        assert!(
+            (r.x0 - words[3].1.x0).abs() < 1e-6,
+            "x0 应紧贴首个命中词（投标人），实际: {:.3} vs 期望 {:.3}",
+            r.x0,
+            words[3].1.x0
+        );
+        assert!(
+            (r.x1 - words[6].1.x1).abs() < 1e-6,
+            "x1 应紧贴末个命中词（注册），不得吞掉「三年」"
+        );
+        assert!((r.top - 100.0).abs() < 1e-9 && (r.bottom - 112.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn match_words_to_quote_two_lines_two_boxes() {
+        let mut words = words_on_line(100.0, &["投标人", "须", "为中华"]);
+        words.extend(words_on_line(
+            130.0,
+            &["人民", "共和国", "境内", "注册", "的企业"],
+        ));
+        let quote = "投标人须为中华人民共和国境内注册";
+        let rects = match_words_to_quote(&words, quote);
+        assert_eq!(rects.len(), 2, "跨两行应得到 2 个矩形，实际: {:?}", rects);
+        assert!((rects[0].top - 100.0).abs() < 1e-9, "第一行 top 应为 100");
+        assert!((rects[1].top - 130.0).abs() < 1e-9, "第二行 top 应为 130");
+        // 第二行 x1 应停在「注册」，不吞掉「的企业」
+        assert!(
+            (rects[1].x1 - words[6].1.x1).abs() < 1e-6,
+            "第二行 x1 应紧贴注册，实际: {:.3} vs 期望 {:.3}",
+            rects[1].x1,
+            words[6].1.x1
+        );
+    }
+
+    #[test]
+    fn match_words_to_quote_unreliable_returns_empty() {
+        let words = words_on_line(100.0, &["本", "项目", "位于", "北京", "市", "朝阳"]);
+        let quote = "投标人须具有独立法人资格";
+        assert!(
+            match_words_to_quote(&words, quote).is_empty(),
+            "无重叠 quote 应返回空，前端回落 block 级高亮"
+        );
+    }
+
+    #[test]
+    fn match_words_to_quote_empty_inputs_return_empty() {
+        let words = words_on_line(100.0, &["本", "项目"]);
+        assert!(match_words_to_quote(&words, "").is_empty());
+        assert!(match_words_to_quote(&[], "投标人").is_empty());
+    }
+
+    #[test]
+    fn match_words_to_quote_english_with_spaces() {
+        let words = words_on_line(50.0, &["the", "quick", "brown", "fox", "jumps"]);
+        let quote = "the quick brown";
+        let rects = match_words_to_quote(&words, quote);
+        assert_eq!(rects.len(), 1, "英文带空格 quote 应命中单行，实际: {:?}", rects);
+        let r = &rects[0];
+        assert!((r.x0 - words[0].1.x0).abs() < 1e-6, "x0 应贴 the");
+        assert!((r.x1 - words[2].1.x1).abs() < 1e-6, "x1 应贴 brown，不吞掉 fox/jumps");
     }
 }
