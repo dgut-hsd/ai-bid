@@ -743,21 +743,25 @@ export const AnalysisList: React.FC<AnalysisListProps> = React.memo(
                         e.currentTarget.style.boxShadow = 'none';
                      }}
                   >
-                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                     <div
+                        onClick={(e) => {
+                           e.stopPropagation();
+                           handleLocate();
+                        }}
+                        style={{
+                           display: 'flex',
+                           alignItems: 'center',
+                           justifyContent: 'space-between',
+                           marginBottom: 8,
+                           cursor: pageNo ? 'pointer' : 'default',
+                        }}
+                     >
                         <Space size={8}>
                            <Tag
                               style={{ fontSize: '1rem' }}
                               color="green"
                            >
-                              <span
-                                 onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleLocate();
-                                 }}
-                                 style={{ cursor: pageNo ? 'pointer' : 'default' }}
-                              >
-                                 {pageNo ? `第 ${pageNo} 页` : '页码待定位'}
-                              </span>
+                              {pageNo ? `第 ${pageNo} 页` : '页码待定位'}
                            </Tag>
 
                            {title ? (
