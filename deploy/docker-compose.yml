@@ -98,6 +98,8 @@ services:
       AIBID_COORDINATOR: ${AIBID_COORDINATOR:-1}
       # 审核管线总超时（分钟），默认 60；大标书需更长时间完成证据核验
       AIBID_PIPELINE_TIMEOUT_MINUTES: "${AIBID_PIPELINE_TIMEOUT_MINUTES:-60}"
+      # 证据核验多组并行度（默认 6），调大可加速、调小可避免 LLM 限流
+      AIBID_EVIDENCE_VERIFY_CONCURRENCY: "${AIBID_EVIDENCE_VERIFY_CONCURRENCY:-6}"
       # Java ↔ Rust 内部签名密钥（必须与 Java 一致）
       RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
       # 向量库 / 图库

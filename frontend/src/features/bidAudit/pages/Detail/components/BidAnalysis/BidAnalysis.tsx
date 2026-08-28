@@ -48,6 +48,8 @@ interface BidAnalysisProps {
   phaseEvent?: PhaseEvent | null;
   statsEvent?: StatsEvent | null;
   liveFindings?: FindingAddedEvent[];
+  /** 部分失败阶段名（如 evidence_verify），非空表示结果经过降级、未经完整核验 */
+  failedStages?: string[];
   /** 透传给根节点，移动端用于控制显示/隐藏 */
   style?: React.CSSProperties;
 }
@@ -79,6 +81,7 @@ const BidAnalysis: React.FC<BidAnalysisProps> = ({
   phaseEvent,
   statsEvent,
   liveFindings,
+  failedStages,
   style,
 }) => {
   const { styles } = useStyles();
@@ -138,6 +141,7 @@ const BidAnalysis: React.FC<BidAnalysisProps> = ({
             <PipelineProgress
               currentStage={currentStage}
               isComplete={isComplete}
+              failedStages={failedStages || []}
               onViewResults={() => setActiveTab('results')}
             />
           )}

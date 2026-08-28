@@ -253,5 +253,6 @@ export const useMockAuditTask = () => {
     phaseHistory,
     statsEvent,
     liveFindings,
+    failedStages: [],
   };
 };
