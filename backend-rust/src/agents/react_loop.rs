@@ -442,6 +442,21 @@ fn tool_names_for_tier(all_tools: &[String], tier: RiskTier) -> Vec<String> {
     }
 }
 
+/// P2：「每轮全量重放冗长独白」是 token 膨胀的第二大来源（约 35%）。
+/// 压缩策略：独白里的推理链（事实→规则→结论）结论通常在尾部，因此截头保尾
+/// 比截尾保头更安全。阈值内原样返回；超过阈值只保留结论尾段，前缀加省略标记。
+fn compress_reasoning(content: &str, max_chars: usize) -> String {
+    let len = content.chars().count();
+    if len <= max_chars {
+        return content.to_string();
+    }
+    let tail: String = content.chars().skip(len - max_chars).collect();
+    format!("[前段推理已省略，仅保留结论尾段]\n{tail}")
+}
+
+/// P2 实验：独白压缩后保留的尾段字符数（约 500 中文字 ≈ 800 token）。
+const TRANSCRIPT_COMPRESS_TAIL: usize = 800;
+
 // ─── ReActLoop ─────────────────────────────────────────────────
 
 /// ReAct 循环引擎 — Agent 审查的运行时。
@@ -474,6 +489,8 @@ pub struct ReActLoop {
     pub review_events: Option<Arc<ReviewEventBus>>,
     /// 指标采集器（可选，启用时记录所有 LLM 调用明细）
     pub metrics: Option<Arc<Mutex<crate::metrics::MetricsCollector>>>,
+    /// P2 实验开关：压缩 assistant 冗长推理独白，只保留结论尾段重放（A/B 对比）。
+    pub compress_transcript: bool,
 }
 
 impl ReActLoop {
@@ -495,6 +512,7 @@ impl ReActLoop {
             print_lock: None,
             review_events: None,
             metrics: None,
+            compress_transcript: false,
         }
     }
 
@@ -542,6 +560,12 @@ impl ReActLoop {
         cache: Arc<Mutex<HashMap<(String, String), serde_json::Value>>>,
     ) -> Self {
         self.search_cache = cache;
+        self
+    }
+
+    /// 开/关 P2 transcript 压缩（A/B 实验用）。默认关闭。
+    pub fn with_transcript_compression(mut self, enabled: bool) -> Self {
+        self.compress_transcript = enabled;
         self
     }
 
@@ -1380,8 +1404,16 @@ impl ReActLoop {
             // ── Step 4: 执行工具调用 ──
             // 先追加 assistant 消息
             let assistant_tool_calls: Vec<ToolCall> = response.tool_calls.clone();
+            let assistant_content = if self.compress_transcript {
+                response
+                    .content
+                    .as_deref()
+                    .map(|c| compress_reasoning(c, TRANSCRIPT_COMPRESS_TAIL))
+            } else {
+                response.content
+            };
             conversation.push(ChatMessage::Assistant {
-                content: response.content,
+                content: assistant_content,
                 tool_calls: if assistant_tool_calls.is_empty() {
                     None
                 } else {
@@ -3009,5 +3041,44 @@ mod tool_gating_tests {
         ];
         let got = tool_names_for_tier(&tools, RiskTier::Low);
         assert_eq!(got, vec!["output_finding".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod transcript_compression_tests {
+    use super::*;
+
+    /// 阈值内原样返回，绝不改写短文本。
+    #[test]
+    fn short_content_is_untouched() {
+        let s = "结论：合规。";
+        assert_eq!(compress_reasoning(s, 800), s);
+    }
+
+    /// 超过阈值只保留结论尾段，前段换成省略标记；标记不含被截内容。
+    #[test]
+    fn long_content_keeps_tail_with_marker() {
+        let head = "事实".repeat(1000);
+        let tail = "结论：严重违约。";
+        let content = format!("{head}{tail}");
+        let compressed = compress_reasoning(&content, 20);
+        assert!(compressed.starts_with("[前段推理已省略"));
+        assert!(compressed.ends_with(tail));
+        assert!(!compressed.contains(head.as_str()), "冗长前段不应保留");
+        assert!(compressed.chars().count() < 200);
+    }
+
+    /// 尾段长度不超过 max_chars + 标记长度，且 UTF-8 边界安全（中文按字符计数）。
+    #[test]
+    fn tail_len_bounded_on_utf8() {
+        let content = "甲".repeat(3000);
+        let max = 500;
+        let compressed = compress_reasoning(&content, max);
+        let tail: String = compressed
+            .strip_prefix("[前段推理已省略，仅保留结论尾段]\n")
+            .unwrap()
+            .to_string();
+        assert_eq!(tail.chars().count(), max);
+        assert_eq!(tail, "甲".repeat(max));
     }
 }

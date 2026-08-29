@@ -1091,6 +1091,9 @@ pub struct CoordinatorConfig {
     pub blind_spot_fallback_enabled: bool,
     /// 最大并行审查条款数（同一 Agent 内并行处理的条款上限）
     pub max_parallel_clauses: usize,
+    /// P2 实验开关：压缩 assistant 冗长推理独白，只保留结论尾段重放。
+    /// A/B 分组由该开关驱动（on→transcript_compress，off→control）。
+    pub transcript_compression: bool,
 }
 
 impl Default for CoordinatorConfig {
@@ -1103,6 +1106,7 @@ impl Default for CoordinatorConfig {
             blind_spot_max_turns: 10,
             blind_spot_fallback_enabled: true,
             max_parallel_clauses: 3,
+            transcript_compression: false,
         }
     }
 }

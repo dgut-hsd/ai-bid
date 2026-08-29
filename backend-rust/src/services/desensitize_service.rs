@@ -47,7 +47,7 @@ pub struct DesensitizationSummary {
     pub preserved_fields: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RedactionVault {
     mode: DesensitizationMode,
     value_to_placeholder: HashMap<String, String>,
@@ -192,5 +192,20 @@ mod tests {
         let input = "电话13812345678";
         assert_eq!(vault.redact(input), input);
         assert_eq!(vault.summary().total_replacements, 0);
+    }
+
+    /// 部署 reload（c）依赖 vault 可跨进程持久化：序列化→反序列化后，
+    /// 解掩能力必须保留，否则重启后 findings 的正文无法还原原文。
+    #[test]
+    fn vault_serialization_round_trips() {
+        let mut vault = RedactionVault::new(DesensitizationMode::Low);
+        let input = "联系人电话13812345678，邮箱a@example.com，保证金5万元，截止2026年9月20日。";
+        let masked = vault.redact(input);
+
+        let json = serde_json::to_string(&vault).expect("vault 应可序列化");
+        let reloaded: RedactionVault = serde_json::from_str(&json).expect("vault 应可反序列化");
+
+        assert_eq!(reloaded.restore(&masked), input, "重启后解掩应还原原文");
+        assert_eq!(reloaded.summary().total_replacements, vault.summary().total_replacements);
     }
 }

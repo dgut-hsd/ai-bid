@@ -1170,6 +1170,7 @@ async fn main() -> Result<()> {
                 llm_model,
                 search_backend,
                 max_parallel_clauses: max_parallel,
+                transcript_compression: false,
             },
         };
 

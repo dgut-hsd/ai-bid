@@ -1229,6 +1229,7 @@ impl Coordinator {
             let llm_factory = self.llm_factory.clone();
             let tools_factory = self.tools_factory.clone();
             let max_parallel = self.config.max_parallel_clauses;
+            let transcript_compression = self.config.transcript_compression;
             let shared_search_cache = self.shared_search_cache.clone();
             let execution_control = execution_control.clone();
             let streamed_findings = streamed_findings.clone();
@@ -1261,7 +1262,8 @@ impl Coordinator {
                                     .with_bus(bus.clone())
                                     .with_graph(graph.clone())
                                     .with_print_lock(print_lock.clone())
-                                    .with_search_cache(search_cache.clone());
+                                    .with_search_cache(search_cache.clone())
+                                    .with_transcript_compression(transcript_compression);
                                 agent.trace = trace.clone();
                                 if let Some(ref events) = review_events {
                                     agent = agent.with_review_events(events.clone());

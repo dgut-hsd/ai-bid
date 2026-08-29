@@ -19,7 +19,7 @@ impl AgentTool for OutputFindingTool {
             "type": "function",
             "function": {
                 "name": "output_finding",
-                "description": "输出当前条款最终结论。逐项列出独立问题；无风险返回 findings=[]；最多5条，超出用 has_more=true。source_quote 只引用支撑该条的原文；reason 含事实→规则→结论；confidence<0.6 不得输出 high。",
+                "description": "输出当前条款最终结论。逐项列出独立问题；无风险返回 findings=[]；最多5条，超出用 has_more=true。source_quote 只引用支撑该条的原文；reason 含事实→规则→结论；confidence<0.6 不得输出 high。severity：high=必须修改/红线，medium=建议修改，low/info=优化提示。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -144,5 +144,15 @@ mod tests {
         assert!(desc.contains("has_more"), "必须保留多问题协议");
         assert!(desc.contains("source_quote"), "必须保留引用原文规范");
         assert!(desc.contains("confidence"), "必须保留 confidence 门槛");
+    }
+
+    /// severity 标定锚点（high=必须修改 / medium=建议修改）是全局评级的最后一道尺子，
+    /// 各 agent 提示词只有单点触发条件，没有这条总标尺容易把红线降级为 medium。
+    #[test]
+    fn severity_calibration_anchor_preserved() {
+        let v = schema();
+        let desc = v["function"]["description"].as_str().unwrap();
+        assert!(desc.contains("必须修改"), "必须保留 high=必须修改 锚点");
+        assert!(desc.contains("建议修改"), "必须保留 medium=建议修改 锚点");
     }
 }
