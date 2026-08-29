@@ -10,7 +10,6 @@ import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.nio.file.Files;
@@ -58,8 +57,14 @@ public class RustDocumentService {
      * @param bidId Java 侧 Tender 主键
      * @return Rust document_id（UUID）
      * @throws BizException 上传失败或文件不存在
+     *
+     * <p><b>注意：本方法不得加 {@code @Transactional}。</b>方法体内含外部 HTTP 调用
+     * （Rust 文档校验/上传），若整体置于事务中，会在 HTTP 调用期间长时间占用数据库
+     * 连接；连接一旦瞬断，最后的 commit 会抛 {@code Communications link failure}，
+     * 且失败会连同已成功上传的 Rust 文档一并回滚。改为每条 DB 读/写各自自动提交，
+     * 连接占用压缩到毫秒级。rustDocumentId 回写是幂等缓存（last-write-wins），
+     * 无需事务原子性。</p>
      */
-    @Transactional
     public String ensureUploaded(Long bidId) {
         Long tenantId = TenantScope.requiredTenantId();
         Tender tender = tenderMapper.selectOne(new QueryWrapper<Tender>()
