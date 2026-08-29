@@ -10,6 +10,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const DEFAULT_GLOBAL_CONCURRENCY: usize = 12;
 pub const DEFAULT_DOCUMENT_CONCURRENCY: usize = 3;
+/// 主分析（Execute / LegalVerify / Debate）共享的 Token 预算上限（输入+输出）。
+///
+/// 实测：约 85 条款标书消耗 ~2.03M token、120 条款标书在 20 分钟 Execute 硬墙内消耗
+/// ~2.75M token，成本仅 ~¥1.9（DashScope qwen-turbo 约 ¥0.7/M）。故该预算并非成本约束，
+/// 而是「到点交卷」的优雅降级阀：撞上限时各 Agent 快速失败并返回已完成的发现，避免被
+/// Execute 超时 abort 后把已完成结果一并丢弃。2M 偏低（85 条款标书差 3 条即被截断），
+/// 2.5M 是「覆盖正常大标书 + 在 20 分钟硬墙前优雅交卷」的甜点。
+/// 证据核验（EvidenceVerify）不占此预算（其调用使用裸 LLM 客户端）。
+pub const DEFAULT_BUDGET_TOTAL_TOKENS: u64 = 2_500_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionStage {
@@ -76,21 +85,26 @@ pub struct BudgetLimits {
 }
 
 impl BudgetLimits {
-    /// 预算（调用次数 / Token 总量）天花板已停用：审查是否中断只由 `pipeline_timeout`
-    /// （默认 60 分钟，`AIBID_PIPELINE_TIMEOUT_MINUTES` 可配）决定。
+    /// 按工作负载动态计算预算。Token 上限默认 2.5M（`AIBID_BUDGET_TOTAL_TOKENS` 可配，
+    /// 区间 100k~100M）。
     ///
-    /// 仍保留各计数（llm_calls / tool_calls / web_search_calls / total_tokens）用于可观测性，
-    /// 但上限设为极大值，使 `reserve_*` / `record_tokens` 永不触发「预算耗尽」拒绝。
-    ///
-    /// 背景：旧的 2M token 上限会在大标书的主分析阶段（Execute/LegalVerify/Debate）被打满，
-    /// 导致末尾的证据核验（EvidenceVerify）被 `reserve_llm_call` 前置拦截、误报无法降级，
-    /// 部分条款也被截断为「条款审查未完整结束」。故改为仅以时间上限截断。
-    pub fn for_workload(_effective_tasks: usize, _source_clauses: usize) -> Self {
+    /// Token 预算的角色是「到点交卷」的优雅降级阀，而非成本约束：主分析（Execute /
+    /// LegalVerify / Debate）共享该预算，撞上限时各 Agent 快速失败并返回已完成的发现；
+    /// 证据核验（EvidenceVerify）使用裸 LLM 客户端、不占此预算，因此不会被主分析打满
+    /// 预算后前置拦截、导致误报无法降级。
+    pub fn for_workload(effective_tasks: usize, source_clauses: usize) -> Self {
+        let token_cap = std::env::var("AIBID_BUDGET_TOTAL_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_BUDGET_TOTAL_TOKENS)
+            .clamp(100_000, 100_000_000);
         Self {
-            llm_calls: usize::MAX,
-            tool_calls: usize::MAX,
-            web_search_calls: usize::MAX,
-            total_tokens: u64::MAX,
+            llm_calls: (effective_tasks.saturating_mul(6)).clamp(30, 600),
+            tool_calls: (effective_tasks.saturating_mul(10)).clamp(60, 1_000),
+            web_search_calls: (source_clauses.saturating_mul(2)).clamp(10, 120),
+            total_tokens: (effective_tasks as u64)
+                .saturating_mul(28_000)
+                .clamp(100_000, token_cap),
         }
     }
 }
@@ -418,31 +432,41 @@ mod tests {
     }
 
     #[test]
-    fn budget_limits_are_disabled_and_unbounded() {
+    fn budget_limits_match_workload_formula() {
         let limits = BudgetLimits::for_workload(40, 20);
-        assert_eq!(limits.llm_calls, usize::MAX);
-        assert_eq!(limits.tool_calls, usize::MAX);
-        assert_eq!(limits.web_search_calls, usize::MAX);
-        assert_eq!(limits.total_tokens, u64::MAX);
+        assert_eq!(limits.llm_calls, 240, "40 任务 × 6 = 240（clamp 30..600 内）");
+        assert_eq!(limits.tool_calls, 400, "40 任务 × 10 = 400（clamp 60..1000 内）");
+        assert_eq!(limits.web_search_calls, 40, "20 条款 × 2 = 40（clamp 10..120 内）");
+        assert_eq!(
+            limits.total_tokens,
+            1_120_000,
+            "40 任务 × 28000 = 1.12M（未触 2.5M 上限也未低于 100k 下限）"
+        );
     }
 
     #[test]
-    fn budget_disabled_so_llm_calls_are_never_rejected() {
+    fn llm_call_budget_is_enforced() {
         let limiter = Arc::new(GlobalExecutionLimiter::new(ExecutionLimits::default()));
         let control = limiter.start_review(1, 1);
 
+        // start_review(1,1) → llm_calls = clamp(1*6, 30, 600) = 30
         for _ in 0..30 {
             control
                 .reserve_llm_call()
-                .expect("预算已停用，调用应始终被允许")
+                .expect("预算内调用应被允许")
                 .commit();
         }
-        // 预算已停用：超过旧动态上限后仍应成功，不应因「次数耗尽」被拒绝。
-        assert!(control.reserve_llm_call().is_ok(), "预算停用后调用不应被拒绝");
+        assert!(
+            control.reserve_llm_call().is_err(),
+            "超过 llm_calls 上限后应被拒绝"
+        );
         let usage = control.budget_usage();
         assert_eq!(usage.llm_calls, 30);
-        assert!(!usage.exhausted, "预算停用后不应标记耗尽");
-        assert!(usage.exhausted_reason.is_none());
+        assert!(usage.exhausted, "预算耗尽后应标记 exhausted");
+        assert_eq!(
+            usage.exhausted_reason.as_deref(),
+            Some("LLM 调用预算已耗尽")
+        );
     }
 
     #[test]
@@ -461,20 +485,22 @@ mod tests {
     }
 
     #[test]
-    fn budget_disabled_so_llm_and_tool_budgets_never_exhaust() {
+    fn tool_budget_is_independent_of_llm_budget() {
         let limiter = Arc::new(GlobalExecutionLimiter::new(ExecutionLimits::default()));
         let control = limiter.start_review(1, 1);
 
-        for _ in 0..30 {
+        // start_review(1,1) → tool_calls = clamp(1*10, 60, 1000) = 60
+        for _ in 0..60 {
             control
-                .reserve_llm_call()
-                .expect("预算已停用，调用应始终被允许")
+                .reserve_tool_call("read_section")
+                .expect("工具预算内应被允许")
                 .commit();
         }
-        // 预算已停用：LLM 与工具调用都永不耗尽、永不互相影响。
-        assert!(control.reserve_llm_call().is_ok());
-        assert!(control.reserve_tool_call("read_section").is_ok());
-        assert!(!control.budget_usage().exhausted);
+        assert!(control.reserve_tool_call("read_section").is_err());
+        assert!(
+            control.reserve_llm_call().is_ok(),
+            "工具预算耗尽不得影响 LLM 调用预算"
+        );
     }
 
     #[tokio::test]

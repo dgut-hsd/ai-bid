@@ -3025,12 +3025,16 @@ impl Coordinator {
             return 0;
         }
 
-        // 2) 多组并行裁决：Semaphore 有界并发 + 全局预算/单次超时兜底。
+        // 2) 多组并行裁决：Semaphore 有界并发 + 单次 tokio 超时兜底。
         //    串行时 79 组 × ~14s ≈ 18 分钟；并行后压到 ceil(N/并发度) 批（默认 6 并发）。
+        //    注意：证据核验是廉价的 NLI 三分类（~1k token/组），必须豁免主分析的 Token 预算，
+        //    否则主分析打满预算后证据核验被 `reserve_llm_call` 前置拦截、误报无法降级。
+        //    因此这里用裸 LLM 客户端 + `tokio::time::timeout`，而不是 `ControlledLlmClient`。
         let concurrency = execution_control
             .limits()
             .evidence_verify_concurrency
             .max(1);
+        let call_timeout = execution_control.limits().call_timeout;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let llm_factory = self.llm_factory.clone();
         let mut join_set: JoinSet<(String, Option<(String, String)>)> = JoinSet::new();
@@ -3038,17 +3042,18 @@ impl Coordinator {
         for (key, quote, risk_type) in reps {
             let semaphore = semaphore.clone();
             let factory = llm_factory.clone();
-            let control = execution_control.clone();
             join_set.spawn(async move {
                 let _guard = semaphore
                     .acquire_owned()
                     .await
                     .expect("EvidenceVerify 并发信号量未关闭");
-                let llm = crate::agents::execution_control::ControlledLlmClient::wrap(
-                    (factory)(),
-                    control,
-                );
-                let result = verify_evidence(llm.as_ref(), &quote, &risk_type).await;
+                let llm = (factory)();
+                let result = tokio::time::timeout(
+                    call_timeout,
+                    verify_evidence(llm.as_ref(), &quote, &risk_type),
+                )
+                .await
+                .unwrap_or(None);
                 (key, result)
             });
         }
