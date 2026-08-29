@@ -103,6 +103,9 @@ services:
       # 主分析 Token 预算上限（输入+输出，默认 2.5M）：撞上限时各 Agent 优雅交卷，
       # 而不是被 Execute 超时 abort 后丢弃已完成的发现。证据核验不占此预算。
       AIBID_BUDGET_TOTAL_TOKENS: "${AIBID_BUDGET_TOTAL_TOKENS:-2500000}"
+      # Execute 阶段超时（分钟，默认 30）。193 条款标书完整执行约 17 分钟，20 分钟曾
+      # 骑在边界上导致超时 abort 丢弃在途发现；条款级流式落库保证即使超时也只丢少量条款。
+      AIBID_EXECUTE_TIMEOUT_MINUTES: "${AIBID_EXECUTE_TIMEOUT_MINUTES:-30}"
       # Java ↔ Rust 内部签名密钥（必须与 Java 一致）
       RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
       # 向量库 / 图库

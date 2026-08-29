@@ -19,7 +19,7 @@
 //! 审查过程中支持动态升降级（turn 2 检测）。
 
 use crate::agents::bus::{AgentBus, BusMessage};
-use crate::agents::review_event::{ReviewEvent, ReviewEventBus};
+use crate::agents::review_event::{FindingLifecycle, ReviewEvent, ReviewEventBus};
 use crate::agents::risk_taxonomy;
 use crate::agents::session_graph::SessionGraph;
 use crate::agents::trace::{TraceEventType, TraceLog};
@@ -2356,6 +2356,7 @@ pub async fn review_clauses_parallel_report<F>(
     review_events: Option<Arc<ReviewEventBus>>,
     agent_name: &str,
     execution_control: Option<Arc<crate::agents::execution_control::ReviewExecutionControl>>,
+    streamed_findings: Option<Arc<std::sync::Mutex<Vec<RiskFinding>>>>,
 ) -> ClauseReviewReport
 where
     F: Fn(Box<dyn LlmClient>, crate::agents::tools::ToolRegistry) -> ReActLoop
@@ -2458,10 +2459,50 @@ where
     }
 
     // 收集结果，按原始顺序排列
+    let clause_blocks: HashMap<String, Vec<String>> = clauses
+        .iter()
+        .map(|c| (c.chunk_id.clone(), c.source_block_ids.clone()))
+        .collect();
     let mut findings: Vec<Option<Vec<RiskFinding>>> = (0..total).map(|_| None).collect();
     while let Some(result) = join_set.join_next().await {
         match result {
             Ok(Ok((idx, clause_findings))) => {
+                // 条款级流式落库 + 超时存活累积：一条条款一经完成立即：
+                // 1) 写入共享累积器，供 coordinator 在 Execute 超时 abort 后
+                //    仍能从 /result 带回已完成条款的发现；
+                // 2) 发射 FindingAdded（SSE 推向前端增量落库）。
+                for f in clause_findings.iter().filter(|f| !f.no_risk) {
+                    if let Some(ref acc) = streamed_findings {
+                        if let Ok(mut guard) = acc.lock() {
+                            guard.push(f.clone());
+                        }
+                    }
+                    if let Some(ref events) = review_events {
+                        let block_ids = collect_block_ids_for_clause_ids(
+                            &f.clause_ids,
+                            &clause_blocks,
+                            10,
+                        );
+                        events.emit(&ReviewEvent::FindingAdded {
+                            risk_id: f.risk_id.clone(),
+                            severity: f.severity.as_str().to_string(),
+                            is_critical: f.is_critical,
+                            critical_reason: f.critical_reason.clone(),
+                            risk_type: f.risk_type.clone(),
+                            agent: f.agent.clone(),
+                            confidence: f.confidence as f64,
+                            clause_ids: f.clause_ids.clone(),
+                            source_quote: f.source_quote.chars().take(500).collect(),
+                            legal_basis: f.legal_basis.clone(),
+                            reason: f.reason.chars().take(500).collect(),
+                            suggestion: f.suggestion.clone(),
+                            lifecycle: FindingLifecycle::Verified,
+                            page_number: f.page_number,
+                            section_path: f.section_path.clone(),
+                            block_ids,
+                        });
+                    }
+                }
                 findings[idx] = Some(clause_findings);
             }
             Ok(Err(e)) => {
@@ -2544,6 +2585,7 @@ where
         review_events,
         agent_name,
         execution_control,
+        None,
     )
     .await
     .findings
@@ -2642,6 +2684,7 @@ mod multi_finding_tests {
             None,
             None,
             "TestAgent",
+            None,
             None,
         )
         .await;
@@ -2750,6 +2793,7 @@ mod multi_finding_tests {
                 None,
                 "TestAgent",
                 None,
+                None,
             )
             .await
         });
@@ -2823,6 +2867,7 @@ mod multi_finding_tests {
             None,
             "TestAgent",
             Some(control),
+            None,
         )
         .await;
 

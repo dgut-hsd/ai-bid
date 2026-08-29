@@ -248,6 +248,47 @@ impl std::fmt::Display for RiskSeverity {
     }
 }
 
+impl RiskSeverity {
+    /// 返回不含 emoji 的纯字符串表示，用于 SSE 事件与 Java 侧映射。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RiskSeverity::High => "high",
+            RiskSeverity::Medium => "medium",
+            RiskSeverity::Low => "low",
+            RiskSeverity::Info => "info",
+        }
+    }
+}
+
+/// 从 `clause_ids` 按顺序聚合各条款的 `source_block_ids`（去重、保序、上限防爆）。
+///
+/// 用于流式 `finding_added` 阶段补发 block_ids——LLM 输出的是 clause_ids，
+/// block_ids 由框架从 clause.source_block_ids 确定性聚合，无需等待 /result
+/// 的 source_quote 反查。配合「块序回退」策略，保证正确页面上能画出 bbox。
+pub fn collect_block_ids_for_clause_ids(
+    clause_ids: &[String],
+    clause_blocks: &HashMap<String, Vec<String>>,
+    max_blocks: usize,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for cid in clause_ids {
+        if out.len() >= max_blocks {
+            break;
+        }
+        if let Some(ids) = clause_blocks.get(cid) {
+            for id in ids {
+                if out.len() >= max_blocks {
+                    break;
+                }
+                if !out.contains(id) {
+                    out.push(id.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 // ─── 风险发现 ──────────────────────────────────────────────────
 
 /// Agent output_finding 工具输出的结构化风险发现。

@@ -10,13 +10,19 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const DEFAULT_GLOBAL_CONCURRENCY: usize = 12;
 pub const DEFAULT_DOCUMENT_CONCURRENCY: usize = 3;
+/// Execute 阶段超时（分钟），`AIBID_EXECUTE_TIMEOUT_MINUTES` 可配。
+///
+/// 实测 193 条款标书（464 次条款审查）Execute 完整跑完约需 17 分钟，20 分钟硬超时
+/// 骑在完成时间边界上：LLM 延迟一波动就翻车，超时 abort 后在途 Agent 已完成条款发现
+/// 整体丢弃。默认上调到 30 分钟留足余量；条款级流式落库保证即便超时也只丢最后少量条款。
+pub const DEFAULT_EXECUTE_TIMEOUT_MINUTES: u64 = 30;
 /// 主分析（Execute / LegalVerify / Debate）共享的 Token 预算上限（输入+输出）。
 ///
-/// 实测：约 85 条款标书消耗 ~2.03M token、120 条款标书在 20 分钟 Execute 硬墙内消耗
+/// 实测：约 85 条款标书消耗 ~2.03M token、193 条款标书完整执行约需 20 分钟并消耗
 /// ~2.75M token，成本仅 ~¥1.9（DashScope qwen-turbo 约 ¥0.7/M）。故该预算并非成本约束，
-/// 而是「到点交卷」的优雅降级阀：撞上限时各 Agent 快速失败并返回已完成的发现，避免被
-/// Execute 超时 abort 后把已完成结果一并丢弃。2M 偏低（85 条款标书差 3 条即被截断），
-/// 2.5M 是「覆盖正常大标书 + 在 20 分钟硬墙前优雅交卷」的甜点。
+/// 而是「到点交卷」的优雅降级阀：撞上限时各 Agent 快速失败并返回已完成的发现。2M 偏低
+/// （85 条款标书差 3 条即被截断），2.5M 是「覆盖正常大标书 + 在 Execute 超时前优雅交卷」
+/// 的甜点；条款级流式落库保证无论撞预算还是撞超时，已完成的条款发现都不会丢失。
 /// 证据核验（EvidenceVerify）不占此预算（其调用使用裸 LLM 客户端）。
 pub const DEFAULT_BUDGET_TOTAL_TOKENS: u64 = 2_500_000;
 
@@ -67,7 +73,7 @@ impl Default for ExecutionLimits {
             call_timeout: Duration::from_secs(60),
             clause_timeout: Duration::from_secs(180),
             batch_search_timeout: Duration::from_secs(120),
-            execute_timeout: Duration::from_secs(20 * 60),
+            execute_timeout: Duration::from_secs(DEFAULT_EXECUTE_TIMEOUT_MINUTES * 60),
             legal_verify_timeout: Duration::from_secs(5 * 60),
             debate_timeout: Duration::from_secs(5 * 60),
             pipeline_timeout: Duration::from_secs(60 * 60),
@@ -155,6 +161,11 @@ impl GlobalExecutionLimiter {
         );
         // 证据核验的多组并行度：串行时 79 组 × ~14s ≈ 18 分钟，并行后按该上限分批。
         limits.evidence_verify_concurrency = env_usize("AIBID_EVIDENCE_VERIFY_CONCURRENCY", 6, 1, 32);
+        // Execute 阶段超时（分钟）。默认 30；大标书（如 193 条款 / 464 次条款审查）
+        // 完整执行约需 17 分钟，20 分钟曾骑在边界上导致超时 abort 丢弃在途发现。
+        limits.execute_timeout = Duration::from_secs(
+            env_usize("AIBID_EXECUTE_TIMEOUT_MINUTES", 30, 5, 1440) as u64 * 60,
+        );
         Self::new(limits)
     }
 
