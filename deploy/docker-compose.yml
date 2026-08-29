@@ -106,6 +106,9 @@ services:
       # Execute 阶段超时（分钟，默认 30）。193 条款标书完整执行约 17 分钟，20 分钟曾
       # 骑在边界上导致超时 abort 丢弃在途发现；条款级流式落库保证即使超时也只丢少量条款。
       AIBID_EXECUTE_TIMEOUT_MINUTES: "${AIBID_EXECUTE_TIMEOUT_MINUTES:-30}"
+      # P2 实验开关：压缩 assistant 冗长推理独白（只重放结论尾段）。=1/true/on 开启，
+      # 走 transcript_compress 实验组；关闭走 control 组。默认关（保守）。
+      AIBID_COMPRESS_TRANSCRIPT: "${AIBID_COMPRESS_TRANSCRIPT:-}"
       # Java ↔ Rust 内部签名密钥（必须与 Java 一致）
       RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
       # 向量库 / 图库
