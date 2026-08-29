@@ -76,14 +76,21 @@ pub struct BudgetLimits {
 }
 
 impl BudgetLimits {
-    pub fn for_workload(effective_tasks: usize, source_clauses: usize) -> Self {
+    /// 预算（调用次数 / Token 总量）天花板已停用：审查是否中断只由 `pipeline_timeout`
+    /// （默认 60 分钟，`AIBID_PIPELINE_TIMEOUT_MINUTES` 可配）决定。
+    ///
+    /// 仍保留各计数（llm_calls / tool_calls / web_search_calls / total_tokens）用于可观测性，
+    /// 但上限设为极大值，使 `reserve_*` / `record_tokens` 永不触发「预算耗尽」拒绝。
+    ///
+    /// 背景：旧的 2M token 上限会在大标书的主分析阶段（Execute/LegalVerify/Debate）被打满，
+    /// 导致末尾的证据核验（EvidenceVerify）被 `reserve_llm_call` 前置拦截、误报无法降级，
+    /// 部分条款也被截断为「条款审查未完整结束」。故改为仅以时间上限截断。
+    pub fn for_workload(_effective_tasks: usize, _source_clauses: usize) -> Self {
         Self {
-            llm_calls: (effective_tasks.saturating_mul(6)).clamp(30, 600),
-            tool_calls: (effective_tasks.saturating_mul(10)).clamp(60, 1_000),
-            web_search_calls: (source_clauses.saturating_mul(2)).clamp(10, 120),
-            total_tokens: (effective_tasks as u64)
-                .saturating_mul(28_000)
-                .clamp(100_000, 2_000_000),
+            llm_calls: usize::MAX,
+            tool_calls: usize::MAX,
+            web_search_calls: usize::MAX,
+            total_tokens: u64::MAX,
         }
     }
 }
@@ -411,39 +418,31 @@ mod tests {
     }
 
     #[test]
-    fn budget_scales_with_effective_workload_and_respects_hard_caps() {
-        let medium = BudgetLimits::for_workload(40, 20);
-        assert_eq!(medium.llm_calls, 240);
-        assert_eq!(medium.tool_calls, 400);
-        assert_eq!(medium.web_search_calls, 40);
-        assert_eq!(medium.total_tokens, 800_000);
-
-        let huge = BudgetLimits::for_workload(10_000, 10_000);
-        assert_eq!(huge.llm_calls, 600);
-        assert_eq!(huge.tool_calls, 1_000);
-        assert_eq!(huge.web_search_calls, 120);
-        assert_eq!(huge.total_tokens, 2_000_000);
+    fn budget_limits_are_disabled_and_unbounded() {
+        let limits = BudgetLimits::for_workload(40, 20);
+        assert_eq!(limits.llm_calls, usize::MAX);
+        assert_eq!(limits.tool_calls, usize::MAX);
+        assert_eq!(limits.web_search_calls, usize::MAX);
+        assert_eq!(limits.total_tokens, u64::MAX);
     }
 
     #[test]
-    fn budget_rejects_calls_after_dynamic_limit() {
+    fn budget_disabled_so_llm_calls_are_never_rejected() {
         let limiter = Arc::new(GlobalExecutionLimiter::new(ExecutionLimits::default()));
         let control = limiter.start_review(1, 1);
 
         for _ in 0..30 {
             control
                 .reserve_llm_call()
-                .expect("预算内调用应被允许")
+                .expect("预算已停用，调用应始终被允许")
                 .commit();
         }
-        assert!(control.reserve_llm_call().is_err(), "超过动态上限必须拒绝");
+        // 预算已停用：超过旧动态上限后仍应成功，不应因「次数耗尽」被拒绝。
+        assert!(control.reserve_llm_call().is_ok(), "预算停用后调用不应被拒绝");
         let usage = control.budget_usage();
         assert_eq!(usage.llm_calls, 30);
-        assert!(usage.exhausted);
-        assert_eq!(
-            usage.exhausted_reason.as_deref(),
-            Some("LLM 调用预算已耗尽")
-        );
+        assert!(!usage.exhausted, "预算停用后不应标记耗尽");
+        assert!(usage.exhausted_reason.is_none());
     }
 
     #[test]
@@ -462,21 +461,20 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_llm_budget_does_not_block_tool_budget() {
+    fn budget_disabled_so_llm_and_tool_budgets_never_exhaust() {
         let limiter = Arc::new(GlobalExecutionLimiter::new(ExecutionLimits::default()));
         let control = limiter.start_review(1, 1);
 
         for _ in 0..30 {
             control
                 .reserve_llm_call()
-                .expect("预算内调用应被允许")
+                .expect("预算已停用，调用应始终被允许")
                 .commit();
         }
-        assert!(control.reserve_llm_call().is_err());
-        assert!(
-            control.reserve_tool_call("read_section").is_ok(),
-            "LLM 预算耗尽不得熔断独立的工具预算"
-        );
+        // 预算已停用：LLM 与工具调用都永不耗尽、永不互相影响。
+        assert!(control.reserve_llm_call().is_ok());
+        assert!(control.reserve_tool_call("read_section").is_ok());
+        assert!(!control.budget_usage().exhausted);
     }
 
     #[tokio::test]
