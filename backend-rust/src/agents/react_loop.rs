@@ -426,6 +426,22 @@ fn canonical_category(value: &str) -> String {
     upper
 }
 
+/// 根据条款 tier 裁剪下发的工具清单。
+///
+/// L1（格式/信息类）提示词已禁止 read_section/web_search，这里同步停止为其
+/// 下发对应 schema——少发即少付费，且不改变审查行为；L2/L3 保持全量。
+/// 过滤保持原始顺序。
+fn tool_names_for_tier(all_tools: &[String], tier: RiskTier) -> Vec<String> {
+    match tier {
+        RiskTier::Low => all_tools
+            .iter()
+            .filter(|n| n.as_str() == "output_finding")
+            .cloned()
+            .collect(),
+        RiskTier::Medium | RiskTier::High => all_tools.to_vec(),
+    }
+}
+
 // ─── ReActLoop ─────────────────────────────────────────────────
 
 /// ReAct 循环引擎 — Agent 审查的运行时。
@@ -890,7 +906,9 @@ impl ReActLoop {
                 });
             }
 
-            let tool_defs = self.tools.definitions_filtered(&self.config.tool_names);
+            let tool_defs = self
+                .tools
+                .definitions_filtered(&tool_names_for_tier(&self.config.tool_names, tier));
             let api_start = std::time::Instant::now();
             let response = match self.llm.chat(&conversation, &tool_defs, &tool_choice).await {
                 Ok(r) => {
@@ -1434,7 +1452,7 @@ impl ReActLoop {
                 } else {
                     let available: Vec<String> = self
                         .tools
-                        .definitions_filtered(&self.config.tool_names)
+                        .definitions_filtered(&tool_names_for_tier(&self.config.tool_names, tier))
                         .iter()
                         .filter_map(|d| {
                             d.get("function")
@@ -2940,5 +2958,56 @@ mod multi_finding_tests {
     fn detects_numbered_multi_issue_chunk() {
         let text = "1.地域注册限制\n须本地注册\n2、保证金超限\n保证金5%\n3）单方变更";
         assert_eq!(numbered_item_count(text), 3);
+    }
+}
+
+#[cfg(test)]
+mod tool_gating_tests {
+    use super::*;
+
+    fn full_tools() -> Vec<String> {
+        vec![
+            "web_search".to_string(),
+            "search_document".to_string(),
+            "read_section".to_string(),
+            "output_finding".to_string(),
+            "search_contradiction".to_string(),
+        ]
+    }
+
+    /// L1（格式/信息类）只发终端工具：提示词已禁止 read_section/web_search，
+    /// schema 不应再被全量下发。
+    #[test]
+    fn low_tier_only_keeps_output_finding() {
+        let got = tool_names_for_tier(&full_tools(), RiskTier::Low);
+        assert_eq!(got, vec!["output_finding".to_string()]);
+    }
+
+    /// L2/L3 保持全量下发。
+    #[test]
+    fn medium_and_high_keep_all_tools() {
+        for tier in [RiskTier::Medium, RiskTier::High] {
+            let got = tool_names_for_tier(&full_tools(), tier);
+            assert_eq!(got, full_tools());
+        }
+    }
+
+    /// 边缘：如果工具集里没有 output_finding，L1 应得到空列表（不会 panic）。
+    #[test]
+    fn low_tier_without_output_finding_is_empty() {
+        let no_of = vec!["web_search".to_string(), "read_section".to_string()];
+        assert!(tool_names_for_tier(&no_of, RiskTier::Low).is_empty());
+    }
+
+    /// 保序：过滤不得改变原始顺序。
+    #[test]
+    fn filtering_preserves_order() {
+        let tools = vec![
+            "read_section".to_string(),
+            "output_finding".to_string(),
+            "web_search".to_string(),
+        ];
+        let got = tool_names_for_tier(&tools, RiskTier::Low);
+        assert_eq!(got, vec!["output_finding".to_string()]);
     }
 }
