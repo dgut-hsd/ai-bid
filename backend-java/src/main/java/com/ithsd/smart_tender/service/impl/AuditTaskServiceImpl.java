@@ -29,6 +29,9 @@ import com.ithsd.smart_tender.model.dto.rust.RustBlockBBoxResponse;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewResponse;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewResultResponse;
 import com.ithsd.smart_tender.model.dto.rust.RustRiskFinding;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.ithsd.smart_tender.sse.AuditTaskEventService;
 import com.ithsd.smart_tender.sse.ReplaySseEvent;
 import com.ithsd.smart_tender.sse.SseHub;
@@ -65,6 +68,10 @@ public class AuditTaskServiceImpl implements AuditTaskService {
     private final TenderMapper tenderMapper;
     private final KnowledgeFileMapper knowledgeFileMapper;
     private final RustApiClient rustApiClient;
+
+    /** DB 回退反序列化 bbox JSON 用；与 RustApiClient / AuditEngineServiceImpl 同为 SNAKE_CASE */
+    private static final ObjectMapper JSON = new ObjectMapper()
+            .setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
 
     public AuditTaskServiceImpl(
             AuditTaskMapper auditTaskMapper, AuditIssueMapper auditIssueMapper,
@@ -278,6 +285,9 @@ public class AuditTaskServiceImpl implements AuditTaskService {
                 }
                 f.setSectionPath(i.getSectionName() != null
                         ? java.util.List.of(i.getSectionName().split(" > ")) : null);
+                f.setConfidence(i.getConfidence() != null ? i.getConfidence().floatValue() : 0f);
+                f.setBlockIds(parseStringList(i.getBlockIds()));
+                f.setHighlightRects(parseHighlightRects(i.getHighlightRects()));
                 return f;
             }).collect(Collectors.toList());
             log.info("getResult: {} findings from DB for taskId={} (completed={})", allFindings.size(), taskId, completed);
@@ -482,6 +492,26 @@ public class AuditTaskServiceImpl implements AuditTaskService {
     }
 
     // ── 映射 ────────────────────────────────────────────────────────
+
+    private static List<String> parseStringList(String json) {
+        if (!StringUtils.hasText(json)) return new ArrayList<>();
+        try {
+            return JSON.readValue(json, new TypeReference<List<String>>() {});
+        } catch (Exception e) {
+            log.warn("parse blockIds JSON failed: {}", e.getMessage());
+            return new ArrayList<>();
+        }
+    }
+
+    private static List<RustRiskFinding.RustHighlightRect> parseHighlightRects(String json) {
+        if (!StringUtils.hasText(json)) return new ArrayList<>();
+        try {
+            return JSON.readValue(json, new TypeReference<List<RustRiskFinding.RustHighlightRect>>() {});
+        } catch (Exception e) {
+            log.warn("parse highlightRects JSON failed: {}", e.getMessage());
+            return new ArrayList<>();
+        }
+    }
 
     /**
      * 从 RustRiskFinding 直接映射为前端 IssueVO（不再经过 DB Entity）。

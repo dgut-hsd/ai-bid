@@ -573,10 +573,26 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                 .sectionName(finding.getSectionPath() != null
                         ? String.join(" > ", finding.getSectionPath()) : null)
                 .context(finding.getContext() != null ? finding.getContext() : finding.getSourceQuote())
+                .blockIds(toJsonOrNull(finding.getBlockIds()))
+                .highlightRects(toJsonOrNull(finding.getHighlightRects()))
                 .reference(finding.getLegalBasis() != null && !finding.getLegalBasis().isEmpty()
                         ? String.join("; ", finding.getLegalBasis()) : null)
+                .confidence(finding.getConfidence() > 0 ? (double) finding.getConfidence() : null)
                 .createTime(LocalDateTime.now())
                 .build();
+    }
+
+    /** 空集合归一为 null，避免给无 bbox 的 finding 落下无意义的 "[]" 噪声 */
+    private String toJsonOrNull(Object value) {
+        if (value instanceof java.util.Collection<?> c && c.isEmpty()) {
+            return null;
+        }
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (Exception e) {
+            log.warn("bbox 序列化失败: {}", e.getMessage());
+            return null;
+        }
     }
 
     private void persistFindingIncremental(AuditTask task, RustRiskFinding finding) {

@@ -44,10 +44,12 @@ public interface AuditIssueMapper extends BaseMapper<AuditIssue> {
     @Insert("""
         INSERT INTO audit_issue
             (tenant_id, audit_id, issue_no, risk_id, severity, is_critical, critical_reason,
-             category, description, suggestion, page_number, section_name, context, reference, create_time)
+             category, description, suggestion, page_number, section_name, context,
+             block_ids, highlight_rects, reference, confidence, create_time)
         VALUES
             (#{tenantId}, #{auditId}, #{issueNo}, #{riskId}, #{severity}, #{isCritical}, #{criticalReason},
-             #{category}, #{description}, #{suggestion}, #{pageNumber}, #{sectionName}, #{context}, #{reference}, #{createTime})
+             #{category}, #{description}, #{suggestion}, #{pageNumber}, #{sectionName}, #{context},
+             #{blockIds}, #{highlightRects}, #{reference}, #{confidence}, #{createTime})
         ON DUPLICATE KEY UPDATE
             issue_no = VALUES(issue_no),
             severity = VALUES(severity),
@@ -59,7 +61,10 @@ public interface AuditIssueMapper extends BaseMapper<AuditIssue> {
             page_number = VALUES(page_number),
             section_name = VALUES(section_name),
             context = VALUES(context),
-            reference = VALUES(reference)
+            block_ids = VALUES(block_ids),
+            highlight_rects = VALUES(highlight_rects),
+            reference = VALUES(reference),
+            confidence = VALUES(confidence)
         """)
     int upsert(AuditIssue issue);
 }
