@@ -19,7 +19,7 @@ impl AgentTool for OutputFindingTool {
             "type": "function",
             "function": {
                 "name": "output_finding",
-                "description": "输出当前条款最终结论。逐项列出独立问题；无风险返回 findings=[]；最多5条，超出用 has_more=true。source_quote 只引用支撑该条的原文；reason 含事实→规则→结论；confidence<0.6 不得输出 high。severity：high=必须修改/红线，medium=建议修改，low/info=优化提示。",
+                "description": "输出当前条款最终结论。findings 最多5条，无风险返回[]，超出 has_more=true；source_quote 逐字引用原文；confidence<0.6 不得输出 high；severity：high=必须修改，medium=建议修改，low/info=优化提示。",
                 "parameters": {
                     "type": "object",
                     "properties": {

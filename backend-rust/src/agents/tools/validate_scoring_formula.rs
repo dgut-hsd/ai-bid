@@ -309,14 +309,7 @@ impl AgentTool for ValidateScoringFormulaTool {
             "type": "function",
             "function": {
                 "name": "validate_scoring_formula",
-                "description": "【使用场景】校验价格分权重和评分公式类型是否符合《政府采购货物和服务招标投标管理办法》\
-                    第55条要求——① 货物/工程价格分权重 30%-60%，服务 10%-30%；\
-                    ② 最低价法在价格分>50%时正常、<30%时不合理；\
-                    ③ 平均价法存在围标风险；\
-                    ④ 基准价法应明确去极端值规则。\
-                    【不使用场景】不校验技术分/商务分权重分配（用 validate_weight_distribution）；\
-                    不校验评分细则的主观性（用 detect_subjective_scoring）。\
-                    【法条依据】《政府采购货物和服务招标投标管理办法》（财政部令第87号）第55条。",
+                "description": "校验价格分权重与公式类型合规(货物/工程30%-60%，服务10%-30%；基准价法应去极端值)。",
                 "parameters": {
                     "type": "object",
                     "properties": {

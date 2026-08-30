@@ -258,13 +258,7 @@ impl AgentTool for CheckCrossReferenceTool {
             "type": "function",
             "function": {
                 "name": "check_cross_reference",
-                "description": "【使用场景】条款中出现'详见附件X''按第Y章第Z条''参照前款'等引用表达式时，\
-                    验证引用目标是否存在且内容匹配。这是 Cursor 'Find References' 的标书版。\
-                    【不使用场景】纯语义关联查询（如'找相似条款'）——用 search_document。\
-                    【验证内容】\
-                    ① 引用目标是否存在（附件是否存在、章节是否在文档中）；\
-                    ② 引用目标的内容是否与引用上下文匹配（附件标题是否对得上、条款内容是否矛盾）。\
-                    【注意】reference_type 可选，如不提供则自动从 expression 中推断。",
+                "description": "验证引用表达式(详见附件X/按第Y章Z条)的目标是否存在且内容匹配。reference_type 不传则自动推断。",
                 "parameters": {
                     "type": "object",
                     "properties": {
