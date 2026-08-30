@@ -1707,14 +1707,26 @@ impl Coordinator {
         for vf in verified {
             let mut merged = false;
             for existing in stage1.iter_mut() {
-                let same_type = finding_category(existing) == finding_category(&vf);
+                let existing_cat = finding_category(existing);
+                let vf_cat = finding_category(&vf);
+                let same_type = existing_cat == vf_cat;
                 let same_clause = existing
                     .clause_ids
                     .iter()
                     .any(|c| vf.clause_ids.contains(c));
-                let same_evidence = evidence_similarity(existing, &vf) >= 0.70;
-                if same_type && same_clause && same_evidence {
-                    // 同风险类型 + 同条款 → 合并
+                let sim = evidence_similarity(existing, &vf);
+                // 精确同文（日期/空格归一化后逐字相同）→ 放宽去重：
+                //   · 同风险类型可跨 chunk 合并（同一句被重叠分块重复审出）；
+                //   · 同 chunk 且两个标签都没落进 15 类内置分类（均为 LLM 自造码的近义标签）也合并。
+                // 非精确同文仍走原逻辑：同风险类型 + 同条款 + 证据相似度 ≥ 0.70。
+                let exact_quote = sim >= 0.999;
+                let both_uncategorized = risk_taxonomy::display_name(&existing_cat).is_none()
+                    && risk_taxonomy::display_name(&vf_cat).is_none();
+                if (same_type && same_clause && sim >= 0.70)
+                    || (exact_quote && same_type)
+                    || (exact_quote && same_clause && both_uncategorized)
+                {
+                    // 同风险类型 + 同条款 → 合并（精确同文可跨 chunk）
                     merge_contributors(existing, &vf);
                     for cid in &vf.clause_ids {
                         if !existing.clause_ids.contains(cid) {
@@ -4047,6 +4059,94 @@ mod tests {
             merged.len(),
             2,
             "同一chunk中的不同风险类别不得因理由或证据文本相似而合并"
+        );
+    }
+
+    // 精确同文跨 chunk：同一句被重叠分块、同一风险被重复审出 → 合并为 1 条，clause 取并集。
+    #[test]
+    fn test_merge_v3_merges_exact_quote_across_chunks_same_category() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let quote = "本项目的液氧、医用氧产品仅限华润、林德、空气产品等品牌，其他品牌不得分。";
+        let mut f1 = make_test_finding("R_001", "ch_115", "ScoringAgent");
+        f1.category_code = "BRAND_LOCK".into();
+        f1.risk_type = "指定品牌且不接受同等产品".into();
+        f1.source_quote = quote.into();
+
+        let mut f2 = make_test_finding("R_002", "ch_116", "SemanticRiskAgent");
+        f2.category_code = "BRAND_LOCK".into();
+        f2.risk_type = "指定品牌且不接受同等产品".into();
+        f2.source_quote = quote.into();
+
+        let mut f3 = make_test_finding("R_003", "ch_122", "SemanticRiskAgent");
+        f3.category_code = "BRAND_LOCK".into();
+        f3.risk_type = "指定品牌且不接受同等产品".into();
+        f3.source_quote = quote.into();
+
+        let merged = coordinator
+            .merge_findings_v3(vec![f1, f2, f3], &|_| {})
+            .retained;
+        assert_eq!(
+            merged.len(),
+            1,
+            "同一句原文被重叠分块重复审出的同风险应合并为 1 条"
+        );
+        assert_eq!(
+            merged[0].clause_ids.len(),
+            3,
+            "跨 chunk 合并后 clause_ids 应取并集保留 3 处位置"
+        );
+    }
+
+    // 精确同文同 chunk、两个 LLM 自造码（未落入 15 类内置分类）的近义标签 → 合并为 1 条。
+    #[test]
+    fn test_merge_v3_merges_exact_quote_same_chunk_uncategorized_labels() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let quote = "（八）★投标文件中提供医用氧产品有效的《药品注册证》。";
+        let mut f1 = make_test_finding("R_001", "ch_014", "SemanticRiskAgent");
+        f1.category_code = "SR01".into();
+        f1.risk_type = "隐性排他性".into();
+        f1.source_quote = quote.into();
+
+        let mut f2 = make_test_finding("R_002", "ch_014", "DemandAgent");
+        f2.category_code = "DEMAND_EXCLUSIONARY".into();
+        f2.risk_type = "排他性条款/资格门槛过高".into();
+        f2.source_quote = quote.into();
+
+        let merged = coordinator
+            .merge_findings_v3(vec![f1, f2], &|_| {})
+            .retained;
+        assert_eq!(
+            merged.len(),
+            1,
+            "同 chunk 同原文、两个自造码近义标签应合并为 1 条"
+        );
+    }
+
+    // 精确同文但跨 chunk 且类别不同（即使都是自造码）→ 不合并，保留两个独立风险。
+    #[test]
+    fn test_merge_v3_keeps_distinct_uncategorized_issues_across_chunks() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let quote = "供应商负责对气瓶进行维护保养、定期检验并有第三方检测合格证明文件。";
+        let mut f1 = make_test_finding("R_001", "ch_032", "ContractAgent");
+        f1.category_code = "C3".into();
+        f1.risk_type = "责任转嫁/显失公平".into();
+        f1.source_quote = quote.into();
+
+        let mut f2 = make_test_finding("R_002", "ch_033", "DemandAgent");
+        f2.category_code = "CONTRACT_AMBIGUITY".into();
+        f2.risk_type = "合同履约风险".into();
+        f2.source_quote = quote.into();
+
+        let merged = coordinator
+            .merge_findings_v3(vec![f1, f2], &|_| {})
+            .retained;
+        assert_eq!(
+            merged.len(),
+            2,
+            "跨 chunk 且不同类别（即使精确同文）不得合并"
         );
     }
 
