@@ -83,6 +83,18 @@ fn review_event_capacity() -> usize {
         .unwrap_or(4096)
         .clamp(256, 32768)
 }
+
+/// P2 实验开关：`AIBID_COMPRESS_TRANSCRIPT=1` 时压缩 assistant 冗长推理独白。
+/// 非法值视为关闭——保守默认，A/B 基线组（control）不受影响。
+fn transcript_compression_enabled() -> bool {
+    parse_transcript_compression(std::env::var("AIBID_COMPRESS_TRANSCRIPT").ok().as_deref())
+}
+
+/// 纯解析函数（便于单测）：仅 `1`/`true`/`on` 视为开启。
+fn parse_transcript_compression(value: Option<&str>) -> bool {
+    matches!(value, Some("1") | Some("true") | Some("on"))
+}
+
 use crate::services::sectionize_service::{self, Section};
 
 /// Authenticated Java → Rust request identity made available to handlers via
@@ -259,6 +271,132 @@ impl AppState {
             review_errors: Arc::new(TokioMutex::new(HashMap::new())),
             active_reviews: Arc::new(TokioMutex::new(HashSet::new())),
         })
+    }
+}
+
+/// 单文档「重启后可重建内存态」的持久化清单。
+///
+/// 补上进程内才有、此前未落盘的字段：原文件名、脱敏副本、脱敏映射。
+/// raw_json / sections / chunks / embeddings 已各自落盘，由清单按 stem 串联恢复。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentManifest {
+    pub document_id: String,
+    pub filename: String,
+    pub stem: String,
+    pub desensitization_summary: DesensitizationSummary,
+    pub review_chunks: Vec<Chunk>,
+    pub redaction_vault: RedactionVault,
+}
+
+/// 从磁盘整体重建单个文档的内存态。任一份必要文件缺失/损坏即返回 None
+/// （跳过该文档，不阻塞其余文档恢复）。
+///
+/// `data_root` 为 `output/tenants`，目录约定与 process_document 写盘一致：
+/// ```text
+/// {data_root}/{tenant}/{raw_json|sections|chunks}/{stem}_*.json
+/// {data_root}/{tenant}/embeddings/{stem}_embedding_index/
+/// {data_root}/{tenant}/documents/{stem}_manifest.json
+/// ```
+pub(crate) fn rebuild_document_state(
+    data_root: &std::path::Path,
+    tenant_id: &str,
+    stem: &str,
+) -> Option<DocumentState> {
+    let tenant_dir = data_root.join(tenant_id);
+
+    let manifest_json =
+        std::fs::read_to_string(tenant_dir.join("documents").join(format!("{stem}_manifest.json")))
+            .ok()?;
+    let DocumentManifest {
+        document_id,
+        filename,
+        stem: manifest_stem,
+        desensitization_summary,
+        review_chunks,
+        redaction_vault,
+    } = serde_json::from_str(&manifest_json).ok()?;
+
+    let raw_path = tenant_dir.join("raw_json").join(format!("{stem}_raw.json"));
+    let sections_path = tenant_dir.join("sections").join(format!("{stem}_sections.json"));
+    let chunks_path = tenant_dir.join("chunks").join(format!("{stem}_chunks.json"));
+
+    let raw_doc: RawDocument =
+        serde_json::from_str(&std::fs::read_to_string(&raw_path).ok()?).ok()?;
+    let sections: Vec<Section> =
+        serde_json::from_str(&std::fs::read_to_string(&sections_path).ok()?).ok()?;
+    let chunks: Vec<Chunk> =
+        serde_json::from_str(&std::fs::read_to_string(&chunks_path).ok()?).ok()?;
+
+    let embeddings_dir = tenant_dir.join("embeddings");
+    let doc_index = crate::services::embedding_service::load_index(
+        embeddings_dir.to_string_lossy().as_ref(),
+        stem,
+    )
+    .ok()?;
+
+    let chunk_map: HashMap<String, Chunk> = chunks
+        .iter()
+        .map(|c| (c.chunk_id.clone(), c.clone()))
+        .collect();
+    let review_chunk_map: HashMap<String, Chunk> = review_chunks
+        .iter()
+        .map(|c| (c.chunk_id.clone(), c.clone()))
+        .collect();
+    let chunk_order: Vec<String> = chunks.iter().map(|c| c.chunk_id.clone()).collect();
+
+    Some(DocumentState {
+        tenant_id: tenant_id.to_string(),
+        id: document_id,
+        filename,
+        stem: manifest_stem,
+        raw_doc,
+        sections,
+        chunks,
+        review_chunks,
+        chunk_map: Arc::new(chunk_map),
+        review_chunk_map: Arc::new(review_chunk_map),
+        chunk_order: Arc::new(chunk_order),
+        doc_index: Arc::new(doc_index),
+        redaction_vault: Arc::new(redaction_vault),
+        desensitization_summary,
+    })
+}
+
+impl AppState {
+    /// 启动时扫描 `output/tenants/*/documents/*_manifest.json`，把已处理文档
+    /// 从磁盘恢复到内存注册表，避免容器重启后文档「丢失」触发 Java 重传、
+    /// 进而生成新 doc UUID 破坏 A/B 可比性。返回成功恢复的文档数。
+    pub async fn reload_persisted_documents(&self) -> usize {
+        let base = PathBuf::from(data_path_str("output/tenants"));
+        let mut restored = 0usize;
+        let Ok(tenants) = std::fs::read_dir(&base) else {
+            return 0;
+        };
+        for tenant in tenants.flatten() {
+            let tenant_id = tenant.file_name().to_string_lossy().to_string();
+            if !is_valid_tenant_id(&tenant_id) {
+                continue;
+            }
+            let docs_dir = tenant.path().join("documents");
+            let Ok(manifests) = std::fs::read_dir(&docs_dir) else {
+                continue;
+            };
+            for entry in manifests.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let Some(stem) = name.strip_suffix("_manifest.json") else {
+                    continue;
+                };
+                if !is_safe_document_id(stem) {
+                    continue;
+                }
+                if let Some(state) = rebuild_document_state(&base, &tenant_id, stem) {
+                    let key = DocumentKey::new(tenant_id.clone(), state.id.clone());
+                    self.documents.write().await.insert(key, Arc::new(state));
+                    restored += 1;
+                }
+            }
+        }
+        restored
     }
 }
 
@@ -719,6 +857,26 @@ pub async fn process_document(
         }
     }
 
+    // ── 写盘：documents manifest（供重启后恢复内存文档注册表）──
+    {
+        let dir = tenant_output_path(&tenant_id, "documents")
+            .ok_or_else(|| bad_request("tenant context is invalid"))?;
+        let _ = std::fs::create_dir_all(&dir);
+        let manifest = DocumentManifest {
+            document_id: doc_id.clone(),
+            filename: filename.clone(),
+            stem: disk_stem.clone(),
+            desensitization_summary: desensitization_summary.clone(),
+            review_chunks: review_chunks.clone(),
+            redaction_vault: redaction_vault.clone(),
+        };
+        let path = dir.join(format!("{}_manifest.json", disk_stem));
+        if let Ok(json) = serde_json::to_string_pretty(&manifest) {
+            let _ = std::fs::write(&path, json);
+            println!("[DISK] manifest → {}", path.display());
+        }
+    }
+
     let chunk_map: HashMap<String, Chunk> = chunks
         .iter()
         .map(|c| (c.chunk_id.clone(), c.clone()))
@@ -1061,6 +1219,9 @@ async fn run_review_pipeline(
     if let Some(agent_ids) = enabled_agents {
         coord_config.enabled_agents = agent_ids;
     }
+    // P2 A/B 开关：同一套流程，on/off 只差独白压缩。分组写入 run meta 便于对比。
+    let transcript_compression = transcript_compression_enabled();
+    coord_config.transcript_compression = transcript_compression;
 
     let llm_factory = Arc::new(move || create_llm_client().expect("创建 LLM 客户端失败"));
 
@@ -1320,7 +1481,14 @@ let max_blocks = 5usize;
                     run_id: run_id.clone(),
                     title: None,
                     notes: None,
-                    experiment_group: None,
+                    experiment_group: Some(
+                        if transcript_compression {
+                            "transcript_compress"
+                        } else {
+                            "control"
+                        }
+                        .to_string(),
+                    ),
                     timestamp: chrono::Local::now().to_rfc3339(),
                     git_commit: "unknown".to_string(),
                     git_branch: "unknown".to_string(),
@@ -1338,6 +1506,7 @@ let max_blocks = 5usize;
                         llm_model,
                         search_backend: search_backend.clone(),
                         max_parallel_clauses: coord_max_parallel,
+                        transcript_compression,
                     },
                 };
                 let run_metrics = collector.finalize(meta);
@@ -2652,6 +2821,134 @@ mod tests {
                 make_test_document(doc_id),
             );
         state
+    }
+
+    /// 按 process_document 的目录约定把一份 DocumentState 落地到临时目录。
+    fn write_document_artifacts(root: &std::path::Path, ds: &DocumentState) {
+        let tenant = root.join(ds.tenant_id.clone());
+        for sub in ["raw_json", "sections", "chunks", "documents", "embeddings"] {
+            std::fs::create_dir_all(tenant.join(sub)).unwrap();
+        }
+        std::fs::write(
+            tenant.join("raw_json").join(format!("{}_raw.json", ds.stem)),
+            serde_json::to_string(&ds.raw_doc).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            tenant.join("sections").join(format!("{}_sections.json", ds.stem)),
+            serde_json::to_string(&ds.sections).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            tenant.join("chunks").join(format!("{}_chunks.json", ds.stem)),
+            serde_json::to_string(&ds.chunks).unwrap(),
+        )
+        .unwrap();
+        let manifest = DocumentManifest {
+            document_id: ds.id.clone(),
+            filename: ds.filename.clone(),
+            stem: ds.stem.clone(),
+            desensitization_summary: ds.desensitization_summary.clone(),
+            review_chunks: ds.review_chunks.clone(),
+            redaction_vault: (*ds.redaction_vault).clone(),
+        };
+        std::fs::write(
+            tenant.join("documents").join(format!("{}_manifest.json", ds.stem)),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        crate::services::embedding_service::save_index(
+            &ds.doc_index,
+            tenant.join("embeddings").to_string_lossy().as_ref(),
+            &ds.stem,
+        )
+        .unwrap();
+    }
+
+    /// 重启恢复闭环：一份文档写盘后必须能原样重建内存态（filename/脱敏副本/向量/章节不丢）。
+    #[test]
+    fn rebuild_document_state_round_trips() {
+        let mut chunk = make_test_chunk();
+        chunk.text = "投标人须在东莞设有常驻服务机构".to_string();
+        let index = DocumentVectorIndex::new(
+            vec![crate::domain::vector_index::ChunkMeta {
+                chunk_id: chunk.chunk_id.clone(),
+                section_path: chunk.section_path.clone(),
+                embed_text: chunk.text.clone(),
+                text_len: chunk.text.chars().count(),
+                page_start: chunk.page_start,
+                page_end: chunk.page_end,
+            }],
+            vec![vec![1.0, 0.0]],
+        );
+        let ds = DocumentState {
+            tenant_id: "3".to_string(),
+            id: "doc-reload-1".to_string(),
+            filename: "MAOMING_mutated.pdf".to_string(),
+            stem: "docreload1".to_string(),
+            raw_doc: RawDocument {
+                document_id: "doc-reload-1".to_string(),
+                source_path: "src.pdf".to_string(),
+                pages: Vec::new(),
+            },
+            sections: vec![Section {
+                level: 1,
+                title: "第一章".to_string(),
+                pattern: "heading".to_string(),
+                page_start: 0,
+                page_end: 0,
+                block_ids: vec!["b_1".to_string()],
+                body_text: chunk.text.clone(),
+                children: Vec::new(),
+                body_page_start: 0,
+                body_page_end: 0,
+            }],
+            chunks: vec![chunk.clone()],
+            review_chunks: vec![chunk.clone()],
+            chunk_map: Arc::new(HashMap::new()),
+            review_chunk_map: Arc::new(HashMap::new()),
+            chunk_order: Arc::new(Vec::new()),
+            doc_index: Arc::new(index),
+            redaction_vault: Arc::new(RedactionVault::new(DesensitizationMode::Low)),
+            desensitization_summary: DesensitizationSummary::default(),
+        };
+
+        let root = std::env::temp_dir().join(format!("ai-bid-reload-{}", Uuid::new_v4()));
+        write_document_artifacts(&root, &ds);
+
+        let rebuilt =
+            rebuild_document_state(&root, "3", "docreload1").expect("应能从磁盘重建文档");
+        assert_eq!(rebuilt.id, "doc-reload-1");
+        assert_eq!(rebuilt.filename, "MAOMING_mutated.pdf");
+        assert_eq!(rebuilt.chunks.len(), 1);
+        assert_eq!(rebuilt.review_chunks.len(), 1);
+        assert_eq!(rebuilt.chunks[0].text, "投标人须在东莞设有常驻服务机构");
+        assert_eq!(rebuilt.doc_index.len(), 1);
+        assert_eq!(rebuilt.chunk_order.len(), 1);
+        assert_eq!(rebuilt.sections.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 缺 manifest（或任何一份必要文件）时优雅跳过，返回 None 而不是 panic。
+    #[test]
+    fn rebuild_document_state_missing_manifest_is_none() {
+        let root = std::env::temp_dir().join(format!("ai-bid-reload-missing-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("3").join("documents")).unwrap();
+        assert!(rebuild_document_state(&root, "3", "nosuchdoc").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P2 开关解析：只有 1/true/on 开启，其余（含未设置、空串、乱写）一律关闭，
+    /// 保证 A/B 基线组（control）不受脏环境变量影响。
+    #[test]
+    fn parse_transcript_compression_accepts_only_truthy() {
+        for v in [Some("1"), Some("true"), Some("on")] {
+            assert!(parse_transcript_compression(v), "{v:?} 应视为开启");
+        }
+        for v in [None, Some(""), Some("0"), Some("false"), Some("off"), Some("yes"), Some("TRUE")] {
+            assert!(!parse_transcript_compression(v), "{v:?} 应视为关闭");
+        }
     }
 
     #[tokio::test]

@@ -65,6 +65,9 @@ pub struct RunConfig {
     pub llm_model: String,
     pub search_backend: String,
     pub max_parallel_clauses: usize,
+    /// P2：是否启用 transcript 独白压缩（A/B 审计用）。
+    #[serde(default)]
+    pub transcript_compression: bool,
 }
 
 // ─── Layer 1: 端到端延迟 ──────────────────────────────────────

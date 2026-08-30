@@ -19,79 +19,27 @@ impl AgentTool for OutputFindingTool {
             "type": "function",
             "function": {
                 "name": "output_finding",
-                "description": "批量输出当前条款的最终审查结论。必须逐段检查并一次列出所有相互独立的问题；\
-                    例如同一条款同时存在地域限制、保证金超限、单方变更时，应输出3条finding。\
-                    没有风险时返回findings=[]，不要创建“无风险”占位项。\
-                    findings最多5条；若仍有独立问题未展开，has_more=true。\
-                    每条source_quote只引用支撑该风险的最小充分原文；每条reason独立说明事实、规则和结论。\
-                    confidence应诚实校准：≥0.9=法规与案例双支撑；0.75-0.89=有直接法规；\
-                    0.6-0.74=主要依赖语义判断；低于0.6不得输出high。",
+                "description": "输出当前条款最终结论。逐项列出独立问题；无风险返回 findings=[]；最多5条，超出用 has_more=true。source_quote 只引用支撑该条的原文；reason 含事实→规则→结论；confidence<0.6 不得输出 high。severity：high=必须修改/红线，medium=建议修改，low/info=优化提示。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "findings": {
                             "type": "array",
                             "maxItems": 5,
-                            "description": "相互独立的风险发现；无风险时为空数组。",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "no_risk": {
-                                        "type": "boolean",
-                                        "description": "批量格式中必须为false；无风险请返回空findings。"
-                                    },
-                                    "severity": {
-                                        "type": "string",
-                                        "enum": ["high", "medium", "low", "info"],
-                                        "description": "high=必须修改，medium=建议修改，low=优化建议，info=信息提示。"
-                                    },
-                                    "is_critical": {
-                                        "type": "boolean",
-                                        "description": "是否属于会造成不合理排除、投标无效或严重破坏公平竞争的重大/红线问题。重大问题仍使用severity=high。"
-                                    },
-                                    "critical_reason": {
-                                        "type": "string",
-                                        "description": "重大问题判定依据；非重大问题必须为空字符串。"
-                                    },
-                                    "risk_type": {
-                                        "type": "string",
-                                        "description": "面向用户的风险类型标签。"
-                                    },
-                                    "category_code": {
-                                        "type": "string",
-                                        "enum": [
-                                            "LOCAL_REGISTRATION", "BRAND_LOCK", "UNRELATED_CERT",
-                                            "REGIONAL_PERFORMANCE", "SCALE_THRESHOLD",
-                                            "SHORT_DEADLINE", "EXCESSIVE_DEPOSIT", "OEM_AUTHORIZATION",
-                                            "SUBJECTIVE_SCORING", "LOCAL_AWARD", "VAGUE_ACCEPTANCE",
-                                            "UNBOUNDED_IP", "UNILATERAL_CHANGE", "CONFLICTING_DATES",
-                                            "UNCLEAR_PENALTY", "OTHER"
-                                        ],
-                                        "description": "稳定风险分类编码。必须从枚举选择；确实不属于已知15类时使用OTHER。"
-                                    },
-                                    "source_quote": {
-                                        "type": "string",
-                                        "description": "从条款原文逐字摘录、只支撑本条风险的最小充分证据。"
-                                    },
-                                    "legal_basis": {
-                                        "type": "array",
-                                        "items": { "type": "string" },
-                                        "description": "直接支撑本条风险的法条引用列表。"
-                                    },
-                                    "reason": {
-                                        "type": "string",
-                                        "description": "针对本条风险的完整推理链：原文事实→适用规则→风险结论。"
-                                    },
-                                    "suggestion": {
-                                        "type": "string",
-                                        "description": "针对本条风险的可执行修改建议。"
-                                    },
-                                    "confidence": {
-                                        "type": "number",
-                                        "minimum": 0.0,
-                                        "maximum": 1.0,
-                                        "description": "本条风险的置信度。"
-                                    }
+                                    "no_risk": { "type": "boolean" },
+                                    "severity": { "type": "string", "enum": ["high", "medium", "low", "info"] },
+                                    "is_critical": { "type": "boolean" },
+                                    "critical_reason": { "type": "string" },
+                                    "risk_type": { "type": "string" },
+                                    "category_code": { "type": "string" },
+                                    "source_quote": { "type": "string" },
+                                    "legal_basis": { "type": "array", "items": { "type": "string" } },
+                                    "reason": { "type": "string" },
+                                    "suggestion": { "type": "string" },
+                                    "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
                                 },
                                 "required": [
                                     "no_risk", "severity", "is_critical", "critical_reason",
@@ -100,15 +48,8 @@ impl AgentTool for OutputFindingTool {
                                 ]
                             }
                         },
-                        "has_more": {
-                            "type": "boolean",
-                            "description": "是否仍有因5条上限或上下文不足而未展开的独立问题。"
-                        },
-                        "coverage": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "已检查的风险域，如qualification、procedure、scoring、demand、contract。"
-                        }
+                        "has_more": { "type": "boolean" },
+                        "coverage": { "type": "array", "items": { "type": "string" } }
                     },
                     "required": ["findings", "has_more", "coverage"]
                 }
@@ -118,5 +59,100 @@ impl AgentTool for OutputFindingTool {
 
     async fn execute(&self, args: serde_json::Value) -> Result<serde_json::Value> {
         Ok(args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema() -> serde_json::Value {
+        OutputFindingTool.definition()
+    }
+
+    /// 精简 schema 绝不能破坏解析契约：顶层与 findings 子项的 required 字段、
+    /// severity 枚举、confidence 边界都必须原样保留。
+    #[test]
+    fn keeps_parsing_contract() {
+        let v = schema();
+        let params = &v["function"]["parameters"];
+        let props = &params["properties"];
+
+        let top_req: Vec<&str> = params["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(top_req, vec!["findings", "has_more", "coverage"]);
+
+        let items_req: Vec<&str> = props["findings"]["items"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            items_req,
+            vec![
+                "no_risk", "severity", "is_critical", "critical_reason", "risk_type",
+                "category_code", "source_quote", "legal_basis", "reason", "suggestion",
+                "confidence"
+            ]
+        );
+
+        let sev: Vec<&str> = props["findings"]["items"]["properties"]["severity"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(sev, vec!["high", "medium", "low", "info"]);
+
+        let conf = &props["findings"]["items"]["properties"]["confidence"];
+        assert_eq!(conf["maximum"].as_f64(), Some(1.0));
+    }
+
+    /// category_code 的枚举清单应移除（已由条款级 checklist 注入），
+    /// 只保留普通 string，避免每轮重复下发 15 个分类码。
+    #[test]
+    fn category_code_is_plain_string_without_enum() {
+        let v = schema();
+        let cc = &v["function"]["parameters"]["properties"]["findings"]["items"]
+            ["properties"]["category_code"];
+        assert_eq!(cc["type"], "string");
+        assert!(
+            cc.get("enum").is_none(),
+            "category_code 不应再带 15 值枚举，应从 checklist 选值"
+        );
+    }
+
+    /// schema 必须足够短，堵住将来把描述重新写啰嗦的回归。
+    #[test]
+    fn schema_is_slim() {
+        let s = serde_json::to_string(&schema()).unwrap();
+        let n = s.chars().count();
+        assert!(n < 1500, "schema 应精简到 <1500 字符，当前 {n}");
+    }
+
+    /// 精简描述可以，但质量门槛不能丢。
+    #[test]
+    fn description_preserves_quality_rules() {
+        let v = schema();
+        let desc = v["function"]["description"].as_str().unwrap();
+        assert!(desc.contains("findings"), "必须说明无风险返回空数组");
+        assert!(desc.contains("has_more"), "必须保留多问题协议");
+        assert!(desc.contains("source_quote"), "必须保留引用原文规范");
+        assert!(desc.contains("confidence"), "必须保留 confidence 门槛");
+    }
+
+    /// severity 标定锚点（high=必须修改 / medium=建议修改）是全局评级的最后一道尺子，
+    /// 各 agent 提示词只有单点触发条件，没有这条总标尺容易把红线降级为 medium。
+    #[test]
+    fn severity_calibration_anchor_preserved() {
+        let v = schema();
+        let desc = v["function"]["description"].as_str().unwrap();
+        assert!(desc.contains("必须修改"), "必须保留 high=必须修改 锚点");
+        assert!(desc.contains("建议修改"), "必须保留 medium=建议修改 锚点");
     }
 }

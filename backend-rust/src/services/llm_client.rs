@@ -60,6 +60,14 @@ fn parse_usage(body: &Value) -> Option<TokenUsage> {
     None
 }
 
+/// 解析布尔型环境变量：`1`/`true`/`on`（忽略大小写/首尾空白）为真，其余为假。
+fn parse_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on"
+    )
+}
+
 // ── 工厂函数 ──────────────────────────────────────────────────────
 
 /// 根据 `AIBID_LLM_PROTOCOL` 环境变量创建对应的 LLM 客户端。
@@ -341,6 +349,7 @@ pub struct OpenAICompatibleClient {
     api_base: String,
     api_key: String,
     model: String,
+    disable_thinking: bool,
 }
 
 impl OpenAICompatibleClient {
@@ -358,7 +367,17 @@ impl OpenAICompatibleClient {
             api_base: api_base.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
+            disable_thinking: false,
         }
+    }
+
+    /// 是否关闭思考模式（请求体追加 `enable_thinking=false`）。
+    ///
+    /// qwen3.x 等混合思考模型默认输出大量 `reasoning` token（慢且费）。
+    /// 法律条款审查看重工具链+法条引用而非逐步推理，关闭思考可显著提速降本。
+    pub fn with_disable_thinking(mut self, disable: bool) -> Self {
+        self.disable_thinking = disable;
+        self
     }
 
     /// 使用环境变量创建（业务模型）。
@@ -367,7 +386,10 @@ impl OpenAICompatibleClient {
         let api_base = std::env::var("OPENAI_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
         let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
-        Ok(Self::new(&api_base, &api_key, &model))
+        let disable_thinking = std::env::var("AIBID_DISABLE_THINKING")
+            .map(|v| parse_truthy(&v))
+            .unwrap_or(false);
+        Ok(Self::new(&api_base, &api_key, &model).with_disable_thinking(disable_thinking))
     }
 
     fn message_to_json(msg: &ChatMessage) -> Value {
@@ -477,16 +499,18 @@ impl OpenAICompatibleClient {
             usage: parse_usage(body),
         })
     }
-}
 
-#[async_trait::async_trait]
-impl LlmClient for OpenAICompatibleClient {
-    async fn chat(
-        &self,
+    /// 构建 OpenAI 兼容 Chat Completions 请求体（纯函数，便于单测）。
+    ///
+    /// 当 `disable_thinking` 为真时追加 `"enable_thinking": false`，关闭
+    /// qwen3.x 等混合思考模型的推理阶段（省 token、提速度）。
+    fn build_chat_body(
+        model: &str,
+        disable_thinking: bool,
         messages: &[ChatMessage],
         tools: &[Value],
         tool_choice: &ToolChoice,
-    ) -> Result<LlmResponse> {
+    ) -> Value {
         let msg_array: Vec<Value> = messages.iter().map(Self::message_to_json).collect();
 
         let tool_array: Vec<Value> = tools
@@ -504,9 +528,13 @@ impl LlmClient for OpenAICompatibleClient {
             .collect();
 
         let mut body = serde_json::json!({
-            "model": self.model,
+            "model": model,
             "messages": msg_array,
         });
+
+        if disable_thinking {
+            body["enable_thinking"] = Value::Bool(false);
+        }
 
         if !tool_array.is_empty() {
             body["tools"] = Value::Array(tool_array);
@@ -516,6 +544,26 @@ impl LlmClient for OpenAICompatibleClient {
                 body["tool_choice"] = tc_value;
             }
         }
+
+        body
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for OpenAICompatibleClient {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        tool_choice: &ToolChoice,
+    ) -> Result<LlmResponse> {
+        let body = Self::build_chat_body(
+            &self.model,
+            self.disable_thinking,
+            messages,
+            tools,
+            tool_choice,
+        );
 
         let url = format!("{}/chat/completions", self.api_base);
         let response = self
@@ -540,5 +588,90 @@ impl LlmClient for OpenAICompatibleClient {
 
         let body: Value = response.json().await.context("解析 LLM 响应失败")?;
         Self::parse_response(&body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_msg(content: &str) -> ChatMessage {
+        ChatMessage::User {
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn disable_thinking_adds_enable_thinking_false() {
+        let body = OpenAICompatibleClient::build_chat_body(
+            "qwen3.7-plus",
+            true,
+            &[user_msg("hi")],
+            &[],
+            &ToolChoice::Auto,
+        );
+        assert_eq!(body["enable_thinking"], serde_json::Value::Bool(false));
+        assert_eq!(body["model"], "qwen3.7-plus");
+    }
+
+    #[test]
+    fn default_omits_enable_thinking() {
+        let body = OpenAICompatibleClient::build_chat_body(
+            "qwen3.7-plus",
+            false,
+            &[user_msg("hi")],
+            &[],
+            &ToolChoice::Auto,
+        );
+        assert!(body.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn parse_truthy_recognizes_true_variants() {
+        assert!(parse_truthy("1"));
+        assert!(parse_truthy("true"));
+        assert!(parse_truthy("ON"));
+        assert!(parse_truthy(" true "));
+        assert!(!parse_truthy("0"));
+        assert!(!parse_truthy("false"));
+        assert!(!parse_truthy(""));
+        assert!(!parse_truthy("yes"));
+    }
+
+    #[test]
+    fn tools_and_tool_choice_still_serialized() {
+        let tool = serde_json::json!({
+            "type": "function",
+            "function": {"name": "search", "parameters": {"type": "object"}}
+        });
+        // Auto 模式不显式带 tool_choice；但 tools 必须原样带上
+        let body = OpenAICompatibleClient::build_chat_body(
+            "m",
+            false,
+            &[user_msg("q")],
+            std::slice::from_ref(&tool),
+            &ToolChoice::Auto,
+        );
+        assert!(body["tools"].as_array().is_some());
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn specific_tool_choice_is_serialized() {
+        let tool = serde_json::json!({
+            "type": "function",
+            "function": {"name": "output_finding", "parameters": {"type": "object"}}
+        });
+        let body = OpenAICompatibleClient::build_chat_body(
+            "m",
+            true,
+            &[user_msg("q")],
+            std::slice::from_ref(&tool),
+            &ToolChoice::Specific {
+                name: "output_finding".to_string(),
+            },
+        );
+        assert!(body["tool_choice"].is_object());
+        assert_eq!(body["enable_thinking"], serde_json::Value::Bool(false));
     }
 }

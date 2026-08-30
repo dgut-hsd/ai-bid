@@ -100,6 +100,18 @@ services:
       AIBID_PIPELINE_TIMEOUT_MINUTES: "${AIBID_PIPELINE_TIMEOUT_MINUTES:-60}"
       # 证据核验多组并行度（默认 6），调大可加速、调小可避免 LLM 限流
       AIBID_EVIDENCE_VERIFY_CONCURRENCY: "${AIBID_EVIDENCE_VERIFY_CONCURRENCY:-6}"
+      # 主分析 Token 预算上限（输入+输出，默认 2.5M）：撞上限时各 Agent 优雅交卷，
+      # 而不是被 Execute 超时 abort 后丢弃已完成的发现。证据核验不占此预算。
+      AIBID_BUDGET_TOTAL_TOKENS: "${AIBID_BUDGET_TOTAL_TOKENS:-2500000}"
+      # Execute 阶段超时（分钟，默认 30）。193 条款标书完整执行约 17 分钟，20 分钟曾
+      # 骑在边界上导致超时 abort 丢弃在途发现；条款级流式落库保证即使超时也只丢少量条款。
+      AIBID_EXECUTE_TIMEOUT_MINUTES: "${AIBID_EXECUTE_TIMEOUT_MINUTES:-30}"
+      # P2 实验开关：压缩 assistant 冗长推理独白（只重放结论尾段）。=1/true/on 开启，
+      # 走 transcript_compress 实验组；关闭走 control 组。默认关（保守）。
+      AIBID_COMPRESS_TRANSCRIPT: "${AIBID_COMPRESS_TRANSCRIPT:-}"
+      # 关闭 qwen3.x 思考(reasoning)模式：请求体追加 enable_thinking=false，显著提速降本。
+      # 法律条款审查看重工具链+法条引用而非逐步推理。=1/true/on 开启。
+      AIBID_DISABLE_THINKING: "${AIBID_DISABLE_THINKING:-}"
       # Java ↔ Rust 内部签名密钥（必须与 Java 一致）
       RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
       # 向量库 / 图库

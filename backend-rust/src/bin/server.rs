@@ -39,7 +39,8 @@ async fn main() -> anyhow::Result<()> {
     // 初始化共享状态（加载 BGE-M3 模型等）
     println!("  正在加载模型...");
     let state = ai_bid::api::handlers::AppState::init().await?;
-    println!("  模型加载完成");
+    let restored = state.reload_persisted_documents().await;
+    println!("  模型加载完成，从磁盘恢复 {} 个已处理文档", restored);
 
     let router = ai_bid::api::router::build(state);
     let bind_addr = std::env::var("AIBID_RUST_BIND")

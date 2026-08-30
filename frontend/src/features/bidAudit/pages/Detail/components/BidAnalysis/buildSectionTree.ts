@@ -69,7 +69,7 @@ export function buildClauseMap(
           critical_reason: issue.criticalReason ?? '',
           risk_type: issue.category ?? '',
           agent: issue.agent ?? issue.agentName ?? '',
-          confidence: 0,
+          confidence: issue.confidence ?? 0,
           clause_ids: clauseIds,
           source_quote: '',
           legal_basis: [],

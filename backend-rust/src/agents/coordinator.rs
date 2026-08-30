@@ -30,7 +30,7 @@ use crate::agents::execution_control::{
 };
 use crate::agents::react_loop::{LlmClient, ReActLoop};
 use crate::agents::registry::AgentRegistry;
-use crate::agents::review_event::{FindingChange, FindingLifecycle, ReviewEvent, ReviewEventBus};
+use crate::agents::review_event::{FindingChange, ReviewEvent, ReviewEventBus};
 use crate::agents::risk_taxonomy;
 use crate::agents::session_graph::SessionGraph;
 use crate::agents::tools::ToolRegistry;
@@ -43,45 +43,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-
-/// 返回 RiskSeverity 的纯字符串表示（不含 emoji），用于 SSE 事件。
-fn severity_str(s: &RiskSeverity) -> &'static str {
-    match s {
-        RiskSeverity::High => "high",
-        RiskSeverity::Medium => "medium",
-        RiskSeverity::Low => "low",
-        RiskSeverity::Info => "info",
-    }
-}
-
-/// 从 `clause_ids` 按顺序聚合各条款的 `source_block_ids`（去重、保序、上限防爆）。
-///
-/// 用于流式 `finding_added` 阶段补发 block_ids——LLM 输出的是 clause_ids，
-/// block_ids 由框架从 clause.source_block_ids 确定性聚合，无需等待 /result
-/// 的 source_quote 反查。配合「块序回退」策略，保证正确页面上能画出 bbox。
-fn collect_block_ids_for_clause_ids(
-    clause_ids: &[String],
-    clause_blocks: &HashMap<String, Vec<String>>,
-    max_blocks: usize,
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for cid in clause_ids {
-        if out.len() >= max_blocks {
-            break;
-        }
-        if let Some(ids) = clause_blocks.get(cid) {
-            for id in ids {
-                if out.len() >= max_blocks {
-                    break;
-                }
-                if !out.contains(id) {
-                    out.push(id.clone());
-                }
-            }
-        }
-    }
-    out
-}
 
 struct AgentTaskOutput {
     findings: Vec<RiskFinding>,
@@ -1232,6 +1193,11 @@ impl Coordinator {
     ) -> Result<ExecuteAgentsOutput> {
         let mut join_set = JoinSet::new();
         let mut task_meta = HashMap::new();
+        // 条款发现累积器：review_clauses_parallel_report 逐条款完成时同步写入。
+        // Execute 超时 abort 在途 Agent 后，这里仍保留已完成条款的发现，供 /result
+        // 作为最终事实来源带回（Java 端以 /result 幂等重写 DB，否则这些发现会丢）。
+        let streamed_findings: Arc<std::sync::Mutex<Vec<RiskFinding>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
 
         for (agent_id, clauses) in routing {
             if clauses.is_empty() {
@@ -1263,8 +1229,10 @@ impl Coordinator {
             let llm_factory = self.llm_factory.clone();
             let tools_factory = self.tools_factory.clone();
             let max_parallel = self.config.max_parallel_clauses;
+            let transcript_compression = self.config.transcript_compression;
             let shared_search_cache = self.shared_search_cache.clone();
             let execution_control = execution_control.clone();
+            let streamed_findings = streamed_findings.clone();
 
             let abort_handle = join_set.spawn(async move {
                 let agent_name = agent_id.to_string();
@@ -1294,7 +1262,8 @@ impl Coordinator {
                                     .with_bus(bus.clone())
                                     .with_graph(graph.clone())
                                     .with_print_lock(print_lock.clone())
-                                    .with_search_cache(search_cache.clone());
+                                    .with_search_cache(search_cache.clone())
+                                    .with_transcript_compression(transcript_compression);
                                 agent.trace = trace.clone();
                                 if let Some(ref events) = review_events {
                                     agent = agent.with_review_events(events.clone());
@@ -1312,6 +1281,7 @@ impl Coordinator {
                         review_events.clone(),
                         &agent_name,
                         Some(execution_control),
+                        Some(streamed_findings),
                     )
                     .await;
 
@@ -1348,44 +1318,8 @@ impl Coordinator {
                         });
                     }
 
-                    // B-2 流式发射：每个 Agent 审查完成即把其发现推向前端
-                    // 不再等 MERGE/LEGAL_VERIFY，也不依赖 enable_legal_verify 开关
-                    // 重复/被合并项由 merge_findings_v3 后续发 finding_removed 自动清理
-                    //
-                    // 流式阶段即补发 block_ids（从 clause.source_block_ids 聚合），
-                    // 让前端无需等 /result 就能直接查 bbox 画高亮框；/result 仍会
-                    // 用 source_quote 反查做更精确的 block 筛选覆盖。
-                    if let Some(ref events) = review_events {
-                        let clause_blocks: HashMap<String, Vec<String>> = clauses
-                            .iter()
-                            .map(|c| (c.chunk_id.clone(), c.source_block_ids.clone()))
-                            .collect();
-                        for f in findings.iter().filter(|f| !f.no_risk) {
-                            let block_ids = collect_block_ids_for_clause_ids(
-                                &f.clause_ids,
-                                &clause_blocks,
-                                10,
-                            );
-                            events.emit(&ReviewEvent::FindingAdded {
-                                risk_id: f.risk_id.clone(),
-                                severity: severity_str(&f.severity).to_string(),
-                                is_critical: f.is_critical,
-                                critical_reason: f.critical_reason.clone(),
-                                risk_type: f.risk_type.clone(),
-                                agent: f.agent.clone(),
-                                confidence: f.confidence as f64,
-                                clause_ids: f.clause_ids.clone(),
-                                source_quote: f.source_quote.chars().take(500).collect(),
-                                legal_basis: f.legal_basis.clone(),
-                                reason: f.reason.chars().take(500).collect(),
-                                suggestion: f.suggestion.clone(),
-                                lifecycle: FindingLifecycle::Verified,
-                                page_number: f.page_number,
-                                section_path: f.section_path.clone(),
-                                block_ids,
-                            });
-                        }
-                    }
+                    // 发现已由 review_clauses_parallel_report 逐条款流式发射（FindingAdded），
+                    // 此处不再批量重发，避免重复；仅保留以下 SessionGraph 写入。
 
                     // 将发现写入 SessionGraph（共享工作区）
                     for finding in &findings {
@@ -1532,7 +1466,10 @@ impl Coordinator {
                     }
                     execution_control.record_stage_failure(
                         ExecutionStage::Execute,
-                        "Agent Execute 阶段超过 20 分钟",
+                        format!(
+                            "Agent Execute 阶段超过 {} 分钟",
+                            execute_timeout.as_secs() / 60
+                        ),
                     );
                     execution_control.record_pipeline_timeout_if_expired();
                     for (_task_id, (agent_id, clause_ids)) in task_meta.drain() {
@@ -1550,6 +1487,23 @@ impl Coordinator {
                         }));
                     }
                     break;
+                }
+            }
+        }
+
+        // 超时 abort 后，把已逐条款累积的发现并入 all_findings（按 risk_id 去重），
+        // 使 /result 作为最终事实来源时，仍能带回因超时被 abort 的 Agent 已完成条款的发现。
+        {
+            let mut seen: HashSet<String> = all_findings
+                .iter()
+                .map(|finding| finding.risk_id.clone())
+                .collect();
+            if let Ok(streamed) = streamed_findings.lock() {
+                for finding in streamed.iter() {
+                    if !seen.contains(&finding.risk_id) {
+                        seen.insert(finding.risk_id.clone());
+                        all_findings.push(finding.clone());
+                    }
                 }
             }
         }
@@ -3025,12 +2979,16 @@ impl Coordinator {
             return 0;
         }
 
-        // 2) 多组并行裁决：Semaphore 有界并发 + 全局预算/单次超时兜底。
+        // 2) 多组并行裁决：Semaphore 有界并发 + 单次 tokio 超时兜底。
         //    串行时 79 组 × ~14s ≈ 18 分钟；并行后压到 ceil(N/并发度) 批（默认 6 并发）。
+        //    注意：证据核验是廉价的 NLI 三分类（~1k token/组），必须豁免主分析的 Token 预算，
+        //    否则主分析打满预算后证据核验被 `reserve_llm_call` 前置拦截、误报无法降级。
+        //    因此这里用裸 LLM 客户端 + `tokio::time::timeout`，而不是 `ControlledLlmClient`。
         let concurrency = execution_control
             .limits()
             .evidence_verify_concurrency
             .max(1);
+        let call_timeout = execution_control.limits().call_timeout;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let llm_factory = self.llm_factory.clone();
         let mut join_set: JoinSet<(String, Option<(String, String)>)> = JoinSet::new();
@@ -3038,17 +2996,18 @@ impl Coordinator {
         for (key, quote, risk_type) in reps {
             let semaphore = semaphore.clone();
             let factory = llm_factory.clone();
-            let control = execution_control.clone();
             join_set.spawn(async move {
                 let _guard = semaphore
                     .acquire_owned()
                     .await
                     .expect("EvidenceVerify 并发信号量未关闭");
-                let llm = crate::agents::execution_control::ControlledLlmClient::wrap(
-                    (factory)(),
-                    control,
-                );
-                let result = verify_evidence(llm.as_ref(), &quote, &risk_type).await;
+                let llm = (factory)();
+                let result = tokio::time::timeout(
+                    call_timeout,
+                    verify_evidence(llm.as_ref(), &quote, &risk_type),
+                )
+                .await
+                .unwrap_or(None);
                 (key, result)
             });
         }

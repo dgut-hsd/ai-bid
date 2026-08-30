@@ -52,7 +52,14 @@ public class ChatService {
     private final RustApiClient rustApiClient;
     private final RustDocumentService rustDocumentService;
 
-    @Transactional
+    /**
+     * 同步对话：先落用户消息，再经 Rust 回答，最后落 AI 回复。
+     *
+     * <p><b>注意：本方法不得加 {@code @Transactional}。</b>流程中间夹着 Rust chat 的
+     * 外部 HTTP 往返（readTimeout 最长可达 5 分钟），若放在事务里会长时间占用数据库
+     * 连接，连接瞬断时 commit 会抛 {@code Communications link failure}。两条消息的
+     * 插入各自自动提交即可，聊天记录无需强原子性。</p>
+     */
     public ChatResponseVO chat(ChatRequestDTO requestDTO) {
         ChatResource resource = resolveChatResource(requestDTO.getProjectId(), requestDTO.getBidId());
         Long rawUserId = BaseContext.getCurrentId();

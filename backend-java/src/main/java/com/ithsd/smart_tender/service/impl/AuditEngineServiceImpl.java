@@ -198,6 +198,64 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                         .eq(AuditTask::getTenantId, TenantScope.requiredTenantId()));
     }
 
+    /**
+     * Stage 1 上传：对「瞬时」故障做有界重试（幂等）。
+     *
+     * <p>上传成功后仅剩 DB 回写/提交可能偶发瞬断（如 {@code Communications link failure}、
+     * {@code SocketTimeoutException}），此时任务不应直接判失败。只对瞬时异常重试，
+     * 业务性错误（文件不存在、资源不存在等）仍立即失败。</p>
+     */
+    private String uploadWithRetry(AuditTask task) {
+        final int maxAttempts = 3;
+        final long[] delaysMs = {1000, 2000};
+        Exception last = null;
+        for (int i = 0; i < maxAttempts; i++) {
+            try {
+                return rustDocumentService.ensureUploaded(task.getBidId());
+            } catch (Exception ex) {
+                last = ex;
+                if (!isTransient(ex) || i == maxAttempts - 1) {
+                    break;
+                }
+                log.warn("Stage 1 上传瞬时故障，重试 {}/{}: taskId={}, err={}",
+                        i + 1, maxAttempts - 1, task.getTaskId(), ex.getMessage());
+                sleepSafe(delaysMs[i]);
+            }
+        }
+        if (last instanceof RuntimeException runtimeEx) {
+            throw runtimeEx;
+        }
+        // 理论上不会触发（ensureUploaded 抛的都是 RuntimeException）；安全兜底。
+        throw new RuntimeException(last != null ? last.getMessage() : "Rust 上传失败", last);
+    }
+
+    /** 沿 cause 链判定是否为瞬时故障（DB 断连 / 网络超时），值得重试。 */
+    private boolean isTransient(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof org.springframework.dao.RecoverableDataAccessException) {
+                return true; // Spring 对 Communications link failure / 死连接 的分类
+            }
+            if (c instanceof java.sql.SQLRecoverableException) {
+                return true; // MySQL CommunicationsException 等可恢复连接错误
+            }
+            if (c instanceof java.net.SocketTimeoutException) {
+                return true; // socket 读超时
+            }
+            if (c instanceof java.io.IOException) {
+                return true; // Rust HTTP 网络异常
+            }
+        }
+        return false; // 业务异常（BizException、resourceNotFound 等）→ 不重试
+    }
+
+    private void sleepSafe(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private void runEngine(String taskId) {
         AuditTask task = loadTask(taskId);
         if (task == null) {
@@ -222,7 +280,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             updateStage(task, AuditStageEnum.UPLOADING, 10);
             String rustDocId;
             try {
-                rustDocId = rustDocumentService.ensureUploaded(task.getBidId());
+                rustDocId = uploadWithRetry(task);
                 log.info("═══ [审核 Stage 1/4] 文件上传完成 → rustDocId={} ═══", rustDocId);
             } catch (Exception ex) {
                 log.error("❌ [审核 Stage 1/4] Rust 上传失败: taskId={}, bidId={} — {}", taskId, task.getBidId(), ex.getMessage(), ex);
@@ -515,10 +573,26 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                 .sectionName(finding.getSectionPath() != null
                         ? String.join(" > ", finding.getSectionPath()) : null)
                 .context(finding.getContext() != null ? finding.getContext() : finding.getSourceQuote())
+                .blockIds(toJsonOrNull(finding.getBlockIds()))
+                .highlightRects(toJsonOrNull(finding.getHighlightRects()))
                 .reference(finding.getLegalBasis() != null && !finding.getLegalBasis().isEmpty()
                         ? String.join("; ", finding.getLegalBasis()) : null)
+                .confidence(finding.getConfidence() > 0 ? (double) finding.getConfidence() : null)
                 .createTime(LocalDateTime.now())
                 .build();
+    }
+
+    /** 空集合归一为 null，避免给无 bbox 的 finding 落下无意义的 "[]" 噪声 */
+    private String toJsonOrNull(Object value) {
+        if (value instanceof java.util.Collection<?> c && c.isEmpty()) {
+            return null;
+        }
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (Exception e) {
+            log.warn("bbox 序列化失败: {}", e.getMessage());
+            return null;
+        }
     }
 
     private void persistFindingIncremental(AuditTask task, RustRiskFinding finding) {
