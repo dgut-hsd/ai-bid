@@ -391,7 +391,14 @@ impl AgentTool for ExtractObligationsTool {
             "type": "function",
             "function": {
                 "name": "extract_obligations",
-                "description": "提取投标人全部硬性义务并按类别结构化，发现聚合排斥/萝卜标嫌疑。",
+                "description": "【使用场景】从文档中提取所有投标人必须满足的硬性条件，按类别结构化输出。\
+                    很多'隐性歧视'通过分散义务实现——单条看着合理，聚合后才发现只有特定供应商能满足。\
+                    ① 资格条件里的资质等级 → 人员要求里的证书 → 设备清单里的型号 → 三合一排斥；\
+                    ② 发现某供应商完美匹配所有义务项 → 存在'萝卜标'嫌疑。\
+                    【不使用场景】单条条款的合规判定——用 ReAct 审查流程。\
+                    【obligation_types】\
+                    可选值：资质、业绩、人员、设备、工期、付款条件、售后、保密、保险、其他。\
+                    不提供则提取全部类型。",
                 "parameters": {
                     "type": "object",
                     "properties": {

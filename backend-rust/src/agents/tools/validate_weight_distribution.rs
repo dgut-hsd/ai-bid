@@ -272,7 +272,13 @@ impl AgentTool for ValidateWeightDistributionTool {
             "type": "function",
             "function": {
                 "name": "validate_weight_distribution",
-                "description": "校验权重分配合规：各项权重和=总分、价格分在法定范围、必要评审维度齐全。",
+                "description": "【使用场景】校验评审因素权重分配是否合规——\
+                    ① 各项权重之和应等于总分（通常100分）；\
+                    ② 价格分在法定范围内（货物/工程30%-60%，服务10%-30%）；\
+                    ③ 必要评审维度是否缺失（货物须有技术分+商务分，服务须有服务分，工程须有技术分）。\
+                    【不使用场景】不校验价格分公式具体算法（用 validate_scoring_formula）；\
+                    不校验评分细则主观性（用 detect_subjective_scoring）。\
+                    【法条依据】《政府采购货物和服务招标投标管理办法》（财政部令第87号）第55条。",
                 "parameters": {
                     "type": "object",
                     "properties": {

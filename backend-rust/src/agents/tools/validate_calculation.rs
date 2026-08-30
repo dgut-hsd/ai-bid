@@ -335,7 +335,17 @@ impl AgentTool for ValidateCalculationTool {
             "type": "function",
             "function": {
                 "name": "validate_calculation",
-                "description": "执行确定性数值计算与阈值比较，支持 + - * / ()。只做算术不做法规正确性判断；法定期限/保证金/评分权重等规则校验请用 verify_* 专门工具。",
+                "description": "【使用场景】执行确定性数值计算与阈值比较——LLM 做数学不可靠，代码执行精确。\
+                    ① 数值重算（金额/数量/比例）；\
+                    ② 百分比计算；\
+                    ③ 总和计算（如各项分值合计）；\
+                    ④ 数值阈值比较（actual 是否满足 ≥ / ≤ / == / 区间）。\
+                    【不使用场景】需要语义理解的'合理性'判断——LLM 做推理，计算器做算术；\
+                    法定期限/保证金比例/评分权重等法规阈值判断——使用 verify_bid_preparation_period / \
+                    verify_announcement_period / verify_bid_deposit / validate_scoring_formula 等专门 verification 工具，\
+                    本工具不判断阈值本身的法律正确性。\
+                    【注意】formula 支持加减乘除和括号，不支持复杂函数。\
+                    变量名支持中文，会自动替换为 values 中对应的数值。",
                 "parameters": {
                     "type": "object",
                     "properties": {

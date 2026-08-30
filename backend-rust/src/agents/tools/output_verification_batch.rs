@@ -26,7 +26,7 @@ impl AgentTool for OutputVerificationBatchTool {
             "type": "function",
             "function": {
                 "name": "output_verification_batch",
-                "description": "输出全部法条验证的批量结论，调用后审查结束。",
+                "description": "输出所有法条验证的批量结论。每次调用必须包含所有待验证 finding 的完整结果。调用此工具后审查结束。",
                 "parameters": {
                     "type": "object",
                     "properties": {

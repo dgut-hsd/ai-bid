@@ -590,7 +590,15 @@ impl AgentTool for CompareWithTemplateTool {
             "type": "function",
             "function": {
                 "name": "compare_with_template",
-                "description": "与标准范本比对，发现缺失的法定必备条款。",
+                "description": "【使用场景】将当前条款与标准范本进行结构化比对。\
+                    语义搜索擅长找'写了什么'，模板比对擅长发现'没写什么'——\
+                    很多违规是该写的不写、不该写的写了。\
+                    ① 资格条件条款有没有缺失《政府采购法》第22条的必备六项？\
+                    ② 合同条款是否遗漏法定必须条款（违约责任、争议解决等）？\
+                    ③ 投标文件格式是否与标准模板一致？\
+                    ④ 评审标准是否遗漏必须公布的评分因素？\
+                    【不使用场景】判断条款内容是否'合理'——做语义审查用 web_search。\
+                    【注意】当前支持的模板类型见 template_type 的 enum 列表。",
                 "parameters": {
                     "type": "object",
                     "properties": {

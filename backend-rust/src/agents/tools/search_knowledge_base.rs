@@ -59,7 +59,18 @@ impl AgentTool for SearchKnowledgeBaseTool {
             "type": "function",
             "function": {
                 "name": "search_knowledge_base",
-                "description": "搜索本地法规/案例/负面清单/范本知识库，返回法规原文引用。",
+                "description": "搜索本地知识库——已入库的法规条文、案例判例、负面清单、标准范本。\n\
+                    与 web_search（全网搜索）不同，本工具搜索的是系统内部已向量化的权威文档，\n\
+                    能返回法规原文引用（document_name + section_path + 页码）。\n\
+                    \n\
+                    【使用场景】\n\
+                    ① 需要引用具体法规原文（如'财库〔2020〕46号 第X条'）\n\
+                    ② 查找某类条款的历史案例判例\n\
+                    ③ 确认负面清单是否包含某类行为\n\
+                    \n\
+                    【不使用场景】\n\
+                    ① 查实时新闻/最新政策 → 用 web_search\n\
+                    ② 搜当前标书内部 → 用 search_document",
                 "parameters": {
                     "type": "object",
                     "properties": {

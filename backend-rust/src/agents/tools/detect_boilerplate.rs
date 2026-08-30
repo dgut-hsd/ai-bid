@@ -366,7 +366,13 @@ impl AgentTool for DetectBoilerplateTool {
             "type": "function",
             "function": {
                 "name": "detect_boilerplate",
-                "description": "识别模板残骸：悬空引用/异常实体(他项目名、地名、金额)/多余空壳章节。",
+                "description": "【使用场景】扫描标书文本，识别从历史模板复制粘贴后残留的无关内容（模板残骸）。\
+                    ① 悬空引用 — '详见附件X'但附件X不存在；\
+                    ② 异常实体 — 残留其他项目的机构名/地名/金额；\
+                    ③ 多余章节 — '本项目不适用'但保留了模板中的空壳章节结构。\
+                    【不使用场景】判断条款内容是否'合理'——做语义审查用 ReAct 流程。\
+                    【注意】不指定 chunk_ids 则扫描全部文档。\
+                    用于发现照搬模板导致的碎片化错误，帮助投标人在提交前做最终清理。",
                 "parameters": {
                     "type": "object",
                     "properties": {

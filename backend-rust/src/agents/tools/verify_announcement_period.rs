@@ -355,7 +355,17 @@ impl AgentTool for VerifyAnnouncementPeriodTool {
             "type": "function",
             "function": {
                 "name": "verify_announcement_period",
-                "description": "校验公告期/文件发售期(公开招标≥20日、磋商≥10日、谈判·询价≥3工作日、发售≥5工作日)。日期格式 YYYY-MM-DD。",
+                "description": "【使用场景】校验采购公告期限和文件发售期限是否符合法定要求——\
+                    ① 公开招标公告期（等标期）≥ 20 日历日；\
+                    ② 竞争性磋商公告期 ≥ 10 日历日；\
+                    ③ 竞争性谈判公告期 ≥ 3 工作日；\
+                    ④ 询价公告期 ≥ 3 工作日；\
+                    ⑤ 文件发售期 ≥ 5 工作日。\
+                    【不使用场景】不校验公告内容是否完整、是否包含法定必要信息；\
+                    不校验公告发布媒介是否合规；不校验采购方式的适用条件（用 verify_procurement_method）。\
+                    【法条依据】《政府采购法》第35条、《政府采购法实施条例》第31条、\
+                    《政府采购竞争性磋商采购方式管理暂行办法》第10条、财政部令第74号。\
+                    【注意】日期支持 YYYY-MM-DD 和 YYYY/MM/DD 两种格式。",
                 "parameters": {
                     "type": "object",
                     "properties": {

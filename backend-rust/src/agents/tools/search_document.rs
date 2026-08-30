@@ -54,7 +54,17 @@ impl AgentTool for SearchDocumentTool {
             "type": "function",
             "function": {
                 "name": "search_document",
-                "description": "在招标文件内部语义搜索，返回最相关chunk及摘要(score排序)；用提炼关键词。",
+                "description": "在待审招标文件内部做语义搜索。\
+                    【使用场景】① 当前条款提到了某个特定要求（如'本地业绩'），\
+                    你想确认文档其他部分是否也有类似要求；\
+                    ② 你发现了一个风险模式，需要找其他章节验证是否构成组合排斥；\
+                    ③ 条款引用了另一个章节但你没有那个章节的原文。\
+                    【不使用场景】① 没有具体怀疑目标时的'随便搜搜'——这会浪费轮次；\
+                    ② 搜索外部知识库——请用 search_knowledge；\
+                    ③ 已精确知道 chunk_id——直接用 read_section。\
+                    【搜索技巧】用提炼后的关键词，不要把整个条款原文当作搜索 query。\
+                    好: '本地业绩 评分 加分'；坏: '投标人具有本地同类项目业绩...'\
+                    如果搜索结果相似度全部低于 0.5，说明搜索方向可能不对，换搜索词。",
                 "parameters": {
                     "type": "object",
                     "properties": {

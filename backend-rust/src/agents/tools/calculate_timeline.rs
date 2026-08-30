@@ -482,7 +482,19 @@ impl AgentTool for CalculateTimelineTool {
             "type": "function",
             "function": {
                 "name": "calculate_timeline",
-                "description": "提取文档日期并计算时间线合法性(公告期/等标期/开标顺序)；系统按 event_type 自动推断法定约束。mode=calendar日历日|workday工作日。",
+                "description": "【使用场景】提取文档中所有日期，计算关键时间线是否合法。\
+                    ① 公告期 ≥ 法定最低期限（公开招标 ≥ 20日，竞争性磋商 ≥ 10日）？\
+                    ② 等标期是否满足（招标文件发出→投标截止）？\
+                    ③ 开标日期是否在投标截止之后？\
+                    ④ 多个日期之间是否存在逻辑矛盾（如'中标通知书发出后30日内签合同'但实际只有20日）？\
+                    【不使用场景】\
+                    ① 条款没有日期信息——不要强行调用，没有日期本身就是发现；\
+                    ② 日期已经在前几轮 ReAct 中手动验证过——不要重复调用同一组日期；\
+                    ③ 需要语义判断的'时间是否合理'——LLM 做推理，计算器做算术。\
+                    【模式】支持 calendar（日历日，默认）和 workday（工作日，排除周末+法定节假日）。\
+                    对于'5个工作日内退还保证金'等场景，请指定 mode=workday。\
+                    系统会自动根据 event_type 推断常见约束（如开标应在投标截止之后），\
+                    你也可以显式传入 constraints 覆盖默认行为。",
                 "parameters": {
                     "type": "object",
                     "properties": {

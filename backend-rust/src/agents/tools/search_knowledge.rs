@@ -638,7 +638,7 @@ impl SearchKnowledgeTool {
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "联网搜索实时法规/案例/负面清单，返回法条原文与来源。question 用自然语言说明查什么及背景。",
+                "description": "联网搜索——调用 AI 研究助手查找实时法规/案例/负面清单。最多 5 次，连续 2 次无有效结果立即停止并输出结论。question 用自然语言描述问题与背景；search_context 选 法规/案例/负面清单/标准范本/历史审查记录。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -664,7 +664,7 @@ impl SearchKnowledgeTool {
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "联网搜索实时法规/案例/负面清单，返回法条原文与来源。question 用自然语言说明查什么及背景。",
+                "description": "搜索外部知识库——法规条文、财政部案例、负面清单、标准范本。最多 5 次，连续 2 次返回 0 条结果立即停止并输出结论。question 用自然语言描述查什么、为什么查；search_context 选 法规/案例/负面清单/标准范本/历史审查记录。",
                 "parameters": {
                     "type": "object",
                     "properties": {

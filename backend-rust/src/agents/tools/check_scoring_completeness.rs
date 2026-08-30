@@ -249,7 +249,14 @@ impl AgentTool for CheckScoringCompletenessTool {
             "type": "function",
             "function": {
                 "name": "check_scoring_completeness",
-                "description": "检查评分标准完整性：各评审项分值之和=总分、维度齐全、细则覆盖。",
+                "description": "【使用场景】检查评分标准是否完整——\
+                    ① 所有评审项分值之和应等于总分（分值闭合）；\
+                    ② 评审维度完整性（货物：价格/技术/商务；工程：价格/技术；服务：价格/服务/技术）；\
+                    ③ 评分细则覆盖率（has_detail=true 的比例）。\
+                    【不使用场景】不校验评分标准的主观性（用 detect_subjective_scoring）；\
+                    不校验价格分公式（用 validate_scoring_formula）；\
+                    不校验权重分配（用 validate_weight_distribution）。\
+                    【法条依据】《政府采购货物和服务招标投标管理办法》（财政部令第87号）。",
                 "parameters": {
                     "type": "object",
                     "properties": {

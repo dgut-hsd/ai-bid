@@ -319,7 +319,12 @@ impl AgentTool for CompareVersionsTool {
             "type": "function",
             "function": {
                 "name": "compare_versions",
-                "description": "对比标书新旧版本差异，分类 add/remove/modified，标记资格/评分/截止/保证金等高风险变更。",
+                "description": "【使用场景】对比标书新旧版本的差异，锁定变更条款。\
+                    当采购人修改标书后发布澄清公告，或同一项目不同批次版本需要对比时使用。\
+                    自动分类变更为 add/remove/modified，标记高风险变更（资格条件/评分标准/截止日期/保证金）。\
+                    【不使用场景】语义级别的'是否变得更严格'——做语义判断用 ReAct 审查流程。\
+                    【注意】需要提供 previous_chunks（旧版）和 current_chunks（新版）的 chunk 数据。\
+                    系统会自动对齐两个版本的章节路径，计算文本差异。",
                 "parameters": {
                     "type": "object",
                     "properties": {

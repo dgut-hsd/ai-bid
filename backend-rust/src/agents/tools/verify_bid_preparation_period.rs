@@ -325,7 +325,19 @@ impl AgentTool for VerifyBidPreparationPeriodTool {
             "type": "function",
             "function": {
                 "name": "verify_bid_preparation_period",
-                "description": "校验等标期(=准备时间，投诉第一高发)。公开招标≥20日、磋商≥10日、谈判·询价≥3工作日。日期格式 YYYY-MM-DD。",
+                "description": "【使用场景】校验投标人从公告发布到投标截止的准备时间（等标期）是否满足法定最低要求——\
+                    这是政府采购投诉的第一高发事由。\
+                    ① 公开招标 ≥ 20 日历日；\
+                    ② 竞争性磋商 ≥ 10 日历日；\
+                    ③ 竞争性谈判 ≥ 3 工作日；\
+                    ④ 询价 ≥ 3 工作日。\
+                    本工具提供风险等级评估和违反后果的详细说明，包括可能面临的质疑/投诉风险、\
+                    行政处罚依据和采购结果无效风险。\
+                    【不使用场景】不校验公告内容的完整性和规范性；\
+                    不校验文件发售期是否充足（用 verify_announcement_period）；\
+                    不校验保证金相关事项（用 verify_bid_deposit）。\
+                    【注意】这是投诉数量最高的单一审查事项，等标期不足一旦被投诉几乎必然成立。\
+                    日期支持 YYYY-MM-DD 和 YYYY/MM/DD 两种格式。",
                 "parameters": {
                     "type": "object",
                     "properties": {

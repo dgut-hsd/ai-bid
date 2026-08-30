@@ -296,7 +296,15 @@ impl AgentTool for DetectSubjectiveScoringTool {
             "type": "function",
             "function": {
                 "name": "detect_subjective_scoring",
-                "description": "检测主观评分表述(酌情/综合判断/优良中差等)及评分区间过宽。",
+                "description": "【使用场景】检测评分标准条款中是否存在主观性表述，判断是否违反\
+                    《政府采购货物和服务招标投标管理办法》第55条关于评审因素应当量化的规定——\
+                    ① 检测'评委酌情''自行掌握''综合判断''满意程度''优良中差''酌情打分''灵活掌握'等主观关键词；\
+                    ② 评分区间跨度超过5分标记过宽，超过10分标记严重；\
+                    ③ 检测'优良中差'等定性描述是否伴有量化细则。\
+                    【不使用场景】不校验评分标准完整性（用 check_scoring_completeness）；\
+                    不校验权重分配（用 validate_weight_distribution）。\
+                    【法条依据】《政府采购货物和服务招标投标管理办法》（财政部令第87号）第55条、\
+                    《政府采购法实施条例》第34条。",
                 "parameters": {
                     "type": "object",
                     "properties": {

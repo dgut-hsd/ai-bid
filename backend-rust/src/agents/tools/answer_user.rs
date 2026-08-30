@@ -27,7 +27,7 @@ impl AgentTool for AnswerUserTool {
             "type": "function",
             "function": {
                 "name": "answer_user",
-                "description": "向用户输出自然语言回答(Markdown)。证据充分时直接回答；引用原文用[b_xxx]标注高亮。",
+                "description": "向用户输出最终回答。用自然中文回答，像法律顾问在与采购专家对话。\n\n【何时使用】\n- 证据充分、逻辑完整时 → 直接输出回答\n- 问题超出标书审查范围 → 礼貌说明边界\n- 用户只是闲聊或确认 → 简短回应\n\n【何时不使用】\n- 还需要搜索法规确认 → 先用 web_search\n- 还需要精读某个章节 → 先用 read_section\n- 还需要在文档中搜索关联条款 → 先用 search_document\n\n【block_id 高亮】\n- 引用原文时在 answer 中用方括号标注：'[b_3_7]原文片段'\n- 前端自动将 [b_xxx] 渲染为 PDF 高亮链接\n\n【confidence】\n- 涉及合规判断时填写（0-1），纯信息性回答不需要\n\n【Markdown 格式（硬性要求）】\n- 标题层级用 ## 或 ###，禁止用「一、」「二、」纯中文序号当标题\n- 加粗 **文字** 中 ** 与文字之间不得留空格\n- 列表用 - 或 1.，标记后留一个空格\n- 表格必须包含 | --- | 表头分隔行，否则前端不渲染成表格\n- 禁止 emoji",
                 "parameters": {
                     "type": "object",
                     "properties": {
