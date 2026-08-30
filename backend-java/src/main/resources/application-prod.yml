@@ -11,6 +11,7 @@ security:
   jwt:
     secret: ${ST_JWT_SECRET}
     ttl-millis: ${ST_JWT_TTL_MILLIS:86400000}
+    session-ttl-millis: ${ST_SESSION_TTL_MILLIS:604800000}
     accept-legacy-user-id: false
 
 file:
