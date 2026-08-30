@@ -109,6 +109,9 @@ services:
       # P2 实验开关：压缩 assistant 冗长推理独白（只重放结论尾段）。=1/true/on 开启，
       # 走 transcript_compress 实验组；关闭走 control 组。默认关（保守）。
       AIBID_COMPRESS_TRANSCRIPT: "${AIBID_COMPRESS_TRANSCRIPT:-}"
+      # 关闭 qwen3.x 思考(reasoning)模式：请求体追加 enable_thinking=false，显著提速降本。
+      # 法律条款审查看重工具链+法条引用而非逐步推理。=1/true/on 开启。
+      AIBID_DISABLE_THINKING: "${AIBID_DISABLE_THINKING:-}"
       # Java ↔ Rust 内部签名密钥（必须与 Java 一致）
       RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
       # 向量库 / 图库
