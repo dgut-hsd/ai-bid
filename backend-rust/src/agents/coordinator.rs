@@ -35,7 +35,10 @@ use crate::agents::risk_taxonomy;
 use crate::agents::session_graph::SessionGraph;
 use crate::agents::tools::ToolRegistry;
 use crate::agents::trace::TraceLog;
-use crate::agents::evidence_verifier::{evidence_core_key, verify_evidence, EvidenceVerdict};
+use crate::agents::evidence_verifier::{
+    deterministic_weight_sum_check, evidence_core_key, fmt_weight_sum, is_weight_related,
+    verify_evidence, EvidenceVerdict,
+};
 use crate::agents::types::*;
 use crate::paths::data_path_str;
 use anyhow::Result;
@@ -185,6 +188,9 @@ pub struct Coordinator {
     metrics: Option<Arc<Mutex<crate::metrics::MetricsCollector>>>,
     /// ★ 跨 Agent 共享搜索缓存（避免不同 Agent 重复搜索相同的法规）
     pub shared_search_cache: Arc<Mutex<HashMap<(String, String), serde_json::Value>>>,
+    /// ★ 确定性数值核验用的 clause 全文缓存：(chunk_id → 全文)。
+    /// preload_chunks 时写入，evidence_verify 时读取做权重和求和。
+    clause_texts: Arc<std::sync::Mutex<HashMap<String, String>>>,
     global_execution_limiter: Arc<GlobalExecutionLimiter>,
 }
 
@@ -222,6 +228,7 @@ impl Coordinator {
             review_events: None,
             metrics: None,
             shared_search_cache,
+            clause_texts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             global_execution_limiter: Arc::new(GlobalExecutionLimiter::from_env()),
         };
 
@@ -1159,6 +1166,14 @@ impl Coordinator {
 
         let count = chunk_nodes.len();
         self.graph.add_chunks(chunk_nodes);
+        // 顺带缓存 clause 全文：证据核验阶段的确定性权重和校验依赖完整数字（graph 只存 200 字 preview）。
+        {
+            let mut full = self.clause_texts.lock().unwrap();
+            full.clear();
+            for c in clauses {
+                full.insert(c.chunk_id.clone(), c.text.clone());
+            }
+        }
         eprintln!("  [PRELOAD] SessionGraph ← {} 个 Chunk 节点", count);
     }
 
@@ -2961,6 +2976,25 @@ impl Coordinator {
         blind_findings
     }
 
+    /// 取 finding 关联 clause 的全文（多个 clause 换行拼接）；查不到则回退 source_quote。
+    fn clause_text_for(&self, f: &RiskFinding) -> String {
+        let guard = match self.clause_texts.lock() {
+            Ok(g) => g,
+            Err(_) => return f.source_quote.clone(),
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        for cid in &f.clause_ids {
+            if let Some(t) = guard.get(cid) {
+                parts.push(t.as_str());
+            }
+        }
+        if parts.is_empty() {
+            f.source_quote.clone()
+        } else {
+            parts.join("\n")
+        }
+    }
+
     // ── [6.5] EVIDENCE VERIFY: 证据核验（证伪导向 NLI 三分类）──
     /// 对每条 Verified finding 仅凭 source_quote + risk_type 做独立证据核验，不喂 reason。
     /// support → 放行；refute/insufficient → 降级 Info（疑似）。
@@ -2970,7 +3004,48 @@ impl Coordinator {
         findings: &mut [RiskFinding],
         execution_control: Arc<ReviewExecutionControl>,
     ) -> usize {
-        // 1) 去重：同一核心原文只裁决一次
+        // 0) 确定性权重/分值构成核验：按 clause 全文求和比 100，命中即定稿，不喂 LLM。
+        let mut det_cache: HashMap<String, EvidenceVerdict> = HashMap::new();
+        for f in findings.iter() {
+            if f.no_risk || f.source_quote.trim().is_empty() {
+                continue;
+            }
+            if !is_weight_related(&f.category_code, &f.risk_type) {
+                continue;
+            }
+            let full = self.clause_text_for(f);
+            if let Some(outcome) = deterministic_weight_sum_check(&full) {
+                let key = evidence_core_key(&f.source_quote);
+                let sum_text = fmt_weight_sum(outcome.sum);
+                if outcome.closed {
+                    det_cache.entry(key).or_insert_with(|| EvidenceVerdict {
+                        verdict: "refute".into(),
+                        reason: format!(
+                            "确定性数值核验：商务/技术/报价分值合计 {} = 100，权重闭合，疑似违规不成立。",
+                            sum_text
+                        ),
+                        severity: None,
+                    });
+                } else {
+                    det_cache.entry(key).or_insert_with(|| EvidenceVerdict {
+                        verdict: "support".into(),
+                        reason: format!(
+                            "确定性数值核验：商务/技术/报价分值合计 {} ≠ 100，权重和不闭合。",
+                            sum_text
+                        ),
+                        severity: Some("medium".into()),
+                    });
+                }
+            }
+        }
+        if !det_cache.is_empty() {
+            eprintln!(
+                "  [EVIDENCE_VERIFY] 确定性权重和核验定稿 {} 组（跳过 LLM）",
+                det_cache.len()
+            );
+        }
+
+        // 1) 去重：同一核心原文只裁决一次（已确定性定稿的 key 跳过）
         let mut reps: Vec<(String, String, String)> = Vec::new(); // (key, quote, risk_type)
         let mut seen: HashSet<String> = HashSet::new();
         for f in findings.iter() {
@@ -2978,16 +3053,20 @@ impl Coordinator {
                 continue;
             }
             let key = evidence_core_key(&f.source_quote);
+            if det_cache.contains_key(&key) {
+                continue;
+            }
             if seen.insert(key.clone()) {
                 reps.push((key, f.source_quote.clone(), f.risk_type.clone()));
             }
         }
         eprintln!(
-            "  [EVIDENCE_VERIFY] 收到 {} 条 findings，去重后 {} 组",
+            "  [EVIDENCE_VERIFY] 收到 {} 条 findings，去重后 {} 组（确定性定稿 {} 组）",
             findings.len(),
-            reps.len()
+            reps.len(),
+            det_cache.len()
         );
-        if reps.is_empty() {
+        if reps.is_empty() && det_cache.is_empty() {
             return 0;
         }
 
@@ -3041,7 +3120,12 @@ impl Coordinator {
                 continue;
             }
             let key = evidence_core_key(&f.source_quote);
-            if let Some(ev) = cache.get(&key) {
+            // 确定性数值核验优先，其次 NLI 缓存。
+            let ev = det_cache
+                .get(&key)
+                .cloned()
+                .or_else(|| cache.get(&key).cloned());
+            if let Some(ev) = ev {
                 f.evidence_verdict = Some(ev.verdict.clone());
                 f.verifier_reason = Some(ev.reason.clone());
                 if ev.verdict == "support" {
@@ -3552,6 +3636,7 @@ mod tests {
             review_events: None,
             metrics: None,
             shared_search_cache: Arc::new(Mutex::new(HashMap::new())),
+            clause_texts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             global_execution_limiter: Arc::new(GlobalExecutionLimiter::new(
                 crate::agents::execution_control::ExecutionLimits::default(),
             )),

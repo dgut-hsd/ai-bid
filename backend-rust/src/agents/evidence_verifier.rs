@@ -138,3 +138,119 @@ pub async fn verify_evidence(
         severity,
     })
 }
+
+// ─── 确定性权重/分值构成核验（零 LLM）──────────────────────────────
+
+/// 判定该 finding 是否属于"权重/总分/分值构成"类。
+/// 命中的会走确定性数值核验（按 clause 全文求和比 100），不必再喂 LLM。
+pub fn is_weight_related(category_code: &str, risk_type: &str) -> bool {
+    let cc = category_code.to_ascii_lowercase();
+    let code_hit = cc.contains("weight")
+        || cc.contains("total_score")
+        || cc.contains("score_sum")
+        || cc.contains("price_weight");
+    let text_hit = [
+        "权重", "总分", "分值构成", "评分构成", "分值占比",
+        "价格分", "商务分", "技术分", "报价分",
+    ]
+    .iter()
+    .any(|k| risk_type.contains(k));
+    code_hit || text_hit
+}
+
+/// 确定性数值核验结论：`closed=true` 表示组件分值合计 == 100（合规），
+/// `false` 表示合计 ≠ 100（权重和不闭合）。`sum` 为实际合计。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeightSumOutcome {
+    pub closed: bool,
+    pub sum: f64,
+}
+
+/// 从 clause 全文抽取"商务分/技术分/报价分(价格分)"三个组件分值并求和比 100。
+///
+/// 只有三类组件都能从原文稳定抽出时才给结论（return `Some`）；任一缺失则返回 `None`，
+/// 由调用方回退 NLI——避免把"只写了部分分值"误判成不合规，也避免把其他"X分"污染进来。
+pub fn deterministic_weight_sum_check(text: &str) -> Option<WeightSumOutcome> {
+    let biz = extract_component_score(text, &["商务"])?;
+    let tech = extract_component_score(text, &["技术"])?;
+    let price = extract_component_score(text, &["报价", "价格"])?;
+    let sum = biz + tech + price;
+    let closed = (sum - 100.0).abs() < 1e-6;
+    Some(WeightSumOutcome { closed, sum })
+}
+
+/// 格式化合计分值：整数不带小数，非整数保留一位。
+pub fn fmt_weight_sum(sum: f64) -> String {
+    if (sum - sum.round()).abs() < 1e-6 {
+        format!("{}", sum.round() as i64)
+    } else {
+        format!("{:.1}", sum)
+    }
+}
+
+/// 抽出"组件词 + (部分/得分/评分/分值/权重/占比/项)? + ≤4 个无关字符 + 数字 + 分"的第一个分值。
+/// 例："技术部分56.0分"→56.0；"报价得分25.0分"→25.0；"商务30分"→30.0。
+/// 故意限制组件词与数字之间的字符数，避免把"技术参数…共2项…15分"这类无关数字抓进来。
+fn extract_component_score(text: &str, aliases: &[&str]) -> Option<f64> {
+    for alias in aliases {
+        let pattern = format!(
+            r"{}(?:部分|得分|评分|分值|权重|占比|项)?[^0-9分]{{0,4}}(\d+(?:\.\d+)?)\s*分",
+            regex::escape(alias)
+        );
+        let re = regex::Regex::new(&pattern).ok()?;
+        if let Some(caps) = re.captures(text) {
+            if let Some(m) = caps.get(1) {
+                if let Ok(v) = m.as_str().parse::<f64>() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weight_sum_mismatch_95() {
+        let t = "评审因素分值构成：商务部分14.0分、技术部分56.0分、报价得分25.0分";
+        let o = deterministic_weight_sum_check(t).expect("应能抽出三类组件");
+        assert!(!o.closed, "95 不应闭合");
+        assert!((o.sum - 95.0).abs() < 1e-6, "合计应为 95，实际 {}", o.sum);
+        assert_eq!(fmt_weight_sum(o.sum), "95");
+    }
+
+    #[test]
+    fn weight_sum_closed_100() {
+        let t = "商务部分30分、技术部分30分、报价得分40分";
+        let o = deterministic_weight_sum_check(t).expect("应能抽出三类组件");
+        assert!(o.closed);
+        assert!((o.sum - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn weight_sum_missing_component_indeterminate() {
+        // 只有报价分，缺商务/技术 → 无法判断 → None（退回 NLI）
+        assert!(deterministic_weight_sum_check("报价得分25.0分").is_none());
+        assert!(deterministic_weight_sum_check("商务部分14分").is_none());
+        assert!(deterministic_weight_sum_check("技术部分56分 报价得分25分").is_none());
+    }
+
+    #[test]
+    fn weight_sum_ignores_unrelated_scores() {
+        // 完整 ch_122 原文：含 ★号 15分/7.5分/共2项 等无关数字，必须只取 14/56/25
+        let t = "3.详细评审采购包1(广东省第二中医院各类医用气体采购项目):评审因评审标准素分值构商务部分14.0分成技术部分56.0分报价得分25.0分技术部所投货物对采购需求中根据投标人对“第二章采购需求”中“具体技术(参数)要分带▲号的重要技术参数求”的重要技术参数（带“▲”技术参数，共2项，总共的符合性(15.0分)15分）的响应程度进行评审：标注“▲”的重要技术参数，该项为“正偏离”或“符合”或“无偏离”的，该项得7.5分；响应为“负偏离”或不响应的，该项不得分。";
+        let o = deterministic_weight_sum_check(t).expect("应能抽出三类组件");
+        assert!(!o.closed);
+        assert!((o.sum - 95.0).abs() < 1e-6, "无关的 15/7.5/2 不应污染合计，实际 {}", o.sum);
+    }
+
+    #[test]
+    fn is_weight_related_matches_code_and_text() {
+        assert!(is_weight_related("SCORING_PRICE_WEIGHT_VIOLATION", "价格分权重违规"));
+        assert!(is_weight_related("SOMETHING_ELSE", "技术分权重违规"));
+        assert!(!is_weight_related("BRAND_LOCK", "指定品牌"));
+    }
+}
