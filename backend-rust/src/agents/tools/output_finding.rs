@@ -33,7 +33,7 @@ impl AgentTool for OutputFindingTool {
                                     "severity": { "type": "string", "enum": ["high", "medium", "low", "info"] },
                                     "is_critical": { "type": "boolean" },
                                     "critical_reason": { "type": "string" },
-                                    "risk_type": { "type": "string" },
+                                    "risk_type": { "type": "string", "description": "用中文短语，例：品牌指定/排他条款/违约责任不对等" },
                                     "category_code": { "type": "string" },
                                     "source_quote": { "type": "string" },
                                     "legal_basis": { "type": "array", "items": { "type": "string" } },

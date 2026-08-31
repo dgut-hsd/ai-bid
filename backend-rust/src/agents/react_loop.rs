@@ -745,7 +745,7 @@ impl ReActLoop {
                     在调用 output_finding 前必须逐段复核，不得只挑最严重的一条。\
                     使用 findings 数组逐条输出；不同事实、不同风险类别或不同修改建议应拆成不同 finding。\
                     无风险返回 findings=[]；最多5条，仍有遗漏可能时 has_more=true。\
-                    每条必须填写稳定 category_code 和只支撑该问题的 source_quote。\
+                    每条必须填写稳定 category_code 和只支撑该问题的 source_quote。risk_type 用中文短语，category_code 用英文稳定码。\
                     【工具使用规范】web_search 按条款等级设硬性上限(L1≤1/L2≤2/L3≤4)，连续2次空结果立即停止；\
                     source_quote 必须逐字截取条款原文，禁止改写、禁止凭记忆拼凑；\
                     search_document 用提炼关键词，勿粘贴整段原文；\
