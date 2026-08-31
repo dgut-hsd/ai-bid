@@ -35,7 +35,7 @@ use crate::agents::risk_taxonomy;
 use crate::agents::session_graph::SessionGraph;
 use crate::agents::tools::ToolRegistry;
 use crate::agents::trace::TraceLog;
-use crate::agents::evidence_verifier::{evidence_core_key, verify_evidence};
+use crate::agents::evidence_verifier::{evidence_core_key, verify_evidence, EvidenceVerdict};
 use crate::agents::types::*;
 use crate::paths::data_path_str;
 use anyhow::Result;
@@ -3003,7 +3003,7 @@ impl Coordinator {
         let call_timeout = execution_control.limits().call_timeout;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let llm_factory = self.llm_factory.clone();
-        let mut join_set: JoinSet<(String, Option<(String, String)>)> = JoinSet::new();
+        let mut join_set: JoinSet<(String, Option<EvidenceVerdict>)> = JoinSet::new();
 
         for (key, quote, risk_type) in reps {
             let semaphore = semaphore.clone();
@@ -3025,12 +3025,12 @@ impl Coordinator {
         }
 
         // 汇总结果：全部在途任务完成后才回写，保持"超时即不落半成品"的原子语义。
-        let mut cache: HashMap<String, (String, String)> = HashMap::new();
+        let mut cache: HashMap<String, EvidenceVerdict> = HashMap::new();
         let mut verified = 0usize;
         while let Some(res) = join_set.join_next().await {
-            if let Ok((key, Some((verdict, reason)))) = res {
+            if let Ok((key, Some(verdict))) = res {
                 verified += 1;
-                cache.insert(key, (verdict, reason));
+                cache.insert(key, verdict);
             }
         }
 
@@ -3041,21 +3041,30 @@ impl Coordinator {
                 continue;
             }
             let key = evidence_core_key(&f.source_quote);
-            if let Some((verdict, reason)) = cache.get(&key) {
-                f.evidence_verdict = Some(verdict.clone());
-                f.verifier_reason = Some(reason.clone());
-                if verdict == "support" {
+            if let Some(ev) = cache.get(&key) {
+                f.evidence_verdict = Some(ev.verdict.clone());
+                f.verifier_reason = Some(ev.reason.clone());
+                if ev.verdict == "support" {
                     f.reason.push_str(&format!(
                         "\n[EvidenceVerify] ✅ 证据核验通过: {}。",
-                        reason
+                        ev.reason
                     ));
+                    // severity 校准：只降不升——核验器判 medium 时，把 high 拉回 medium。
+                    if ev.severity.as_deref() == Some("medium")
+                        && f.severity == RiskSeverity::High
+                    {
+                        f.severity = RiskSeverity::Medium;
+                        f.reason.push_str(
+                            "\n[EvidenceVerify] 🔻 severity 校准：证据成立但非红线级，high 降为 medium。",
+                        );
+                    }
                 } else {
                     dropped += 1;
                     f.severity = RiskSeverity::Info;
                     f.clear_criticality();
                     f.reason.push_str(&format!(
                         "\n[EvidenceVerify] ❓ 证据核验未通过（{}）: {}。已降级为疑似。",
-                        verdict, reason
+                        ev.verdict, ev.reason
                     ));
                 }
             }

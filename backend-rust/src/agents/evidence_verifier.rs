@@ -2,7 +2,7 @@
 //!
 //! 在 LegalVerify / Debate 之后、Triage 之前，对每条 Verified finding
 //! 仅凭 source_quote + risk_type 做独立裁决（不喂 Agent 的 reason，避免被错误论证带偏）：
-//! - support      → 证据成立，放行（保留原 severity）
+//! - support      → 证据成立，放行（保留原 severity；severity=medium 时"只降不升"）
 //! - refute       → 原文相反/合规，降级 Info（"疑似"，折叠不默认展示）
 //! - insufficient → 证据不足，降级 Info（"疑似"）
 //!
@@ -26,11 +26,13 @@ pub const EVIDENCE_VERIFIER_SYSTEM_PROMPT: &str = r#"你是政府采购招标文
 3. 严禁脑补、联想，判断必须落到原文具体字句。
 4. 论证与结论必须一致：若你的 reason 承认"原文未明确/未细化/未提及/无法判断/属常规正当条款"，则 verdict 只能 insufficient，严禁判 support。
 5. 判断"口径不清/标准模糊/未细化量化/不明确"类风险时，只要原文已给出具体量化公式、明确数字或明确例外情形，就判 refute 或 insufficient，严禁因"表述复杂/未逐字解释"判 support。
+6. 遇到"权重/总分/分值占比/价格分/商务分/技术分/报价分"类风险，必须把原文中的数字逐项相加核对：合计=100 判 refute，合计≠100 判 support。严禁因原文未逐字写出"不闭合/不等于100"就判 insufficient。
+7. verdict=support 时必须给出 severity：只有"必须修改/红线级"（指定品牌、地域歧视、主观评分完全无量化、无限责任、权重和≠100）才判 high；有据但不致命的（连带扣分、免责措辞过宽、价格扣除比例按重要性确定、★号设置不当、逻辑矛盾）一律 medium。
 
 【已由人工复核的判例，供你校准】：
 1. "供应商注册地为茂名市的，每提供一个业绩另加1分" → support（注册地直接作差异化加分，构成地域歧视）
-2. "仅限华润、林德、空气产品等品牌，其他品牌不得分" → support（明确指定品牌且排斥同等产品）
-3. "酌情给分，最高2分，且不设具体量化标准" → support（明确主观、未量化）
+2. "仅限华润、林德、空气产品等品牌，其他品牌不得分" → support、severity=high（明确指定品牌且排斥同等产品）
+3. "酌情给分，最高2分，且不设具体量化标准" → support、severity=high（明确主观、未量化）
 4. "本采购包不接受联合体投标" → refute（采购人有权不接受联合体，不构成排斥供应商）
 5. "本项目气体产品不允许采购进口产品" → insufficient（不允许进口是本国产品政策的合规方向，非违规）
 6. "给予1%-5%的价格扣除，具体比例根据重要性确定" → refute（1-5%是法定政策区间，非标准不明确）
@@ -38,8 +40,11 @@ pub const EVIDENCE_VERIFIER_SYSTEM_PROMPT: &str = r#"你是政府采购招标文
 8. "投标人漏报的单价均视为此项费用已包含在投标报价中，如中标不得再收取任何费用" → insufficient（总价包干/漏报不追加是合法常规商务条款，非违约责任违规）
 9. "评价情况至少须为满意或好评或打分制为85分" → insufficient（85分是客观量化门槛，非主观评分，不得判主观评分未细化）
 10. "采购人逾期付款按逾期金额×LPR÷365 逐日偿付违约金，中标人自身原因除外" → refute（违约计算方式明确且双向，不构成口径不清）
+11. "评审因素分值构成：商务部分14分、技术部分56分、报价得分25分" → support、severity=high（14+56+25=95≠100，权重和不闭合）
+12. "对获得节能产品认证证书的产品给予1%的价格扣除，具体扣除比例根据重要性、所占比重等因素确定" → support、severity=medium（比例依据主观裁量，但属政策区间内，非红线）
+13. "因国家政策或不可抗力导致采购人不能执行所购货物时，合同终止，采购人及采购代理机构不承担任何责任" → support、severity=medium（免责措辞过宽，但不构成无限责任红线）
 
-只输出一行 JSON，禁止任何多余文字：{"verdict":"support|refute|insufficient","reason":"一句话"}"#;
+只输出一行 JSON，禁止任何多余文字：{"verdict":"support|refute|insufficient","severity":"high|medium","reason":"一句话"}"#;
 
 /// 提取原文核心句作为去重 key（同一处原文只裁决一次）。
 /// 简化实现：按句分隔符切分，取包含关键违规词的最长段；无匹配则用全文前 120 字符。
@@ -64,13 +69,24 @@ pub fn evidence_core_key(q: &str) -> String {
     best.chars().take(120).collect()
 }
 
-/// 单次 LLM 调用做证据核验，返回 (verdict, reason)。
+/// 证据核验裁决：verdict 三分类 + 一句话依据 + 可选的 severity 降级建议。
+#[derive(Debug, Clone)]
+pub struct EvidenceVerdict {
+    /// support | refute | insufficient
+    pub verdict: String,
+    /// 一句话理由
+    pub reason: String,
+    /// 仅 verdict=support 时有效：high | medium，用于"只降不升"的 severity 校准。
+    pub severity: Option<String>,
+}
+
+/// 单次 LLM 调用做证据核验，返回 EvidenceVerdict。
 /// verdict ∈ {"support", "refute", "insufficient"}；调用/解析失败返回 None。
 pub async fn verify_evidence(
     llm: &dyn LlmClient,
     quote: &str,
     risk_type: &str,
-) -> Option<(String, String)> {
+) -> Option<EvidenceVerdict> {
     let quote_trunc: String = quote.chars().take(800).collect();
     let messages = vec![
         ChatMessage::System {
@@ -112,5 +128,13 @@ pub async fn verify_evidence(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    Some((verdict, reason))
+    let severity = parsed
+        .get("severity")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Some(EvidenceVerdict {
+        verdict,
+        reason,
+        severity,
+    })
 }
