@@ -48,7 +48,7 @@ __pycache__/
 env/
 data/
 dump.rdb
-agents/
+/agents/
 
 # ── Python 缓存 ──
 __pycache__/
