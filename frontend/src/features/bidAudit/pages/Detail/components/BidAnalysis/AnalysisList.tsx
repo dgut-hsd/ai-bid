@@ -571,8 +571,20 @@ async function fetchBlockBboxes(taskId: string, blockIds: string[]): Promise<BBo
 export const AnalysisList: React.FC<AnalysisListProps> = React.memo(
    ({ issues, isComplete, onLocateIssuePage, currentFileName, currentFileId, onIssueClick, taskId, onLocateBboxes }) => {
       const { theme, styles } = useStyles();
-      const [queryParams, setQueryParams] = useUrlState({ tab: 'all' });
+      // 初始 tab：若进入时审核已完成，默认直接落在「高风险」；审核进行中进入则默认「全部」。
+      const [queryParams, setQueryParams] = useUrlState({ tab: isComplete ? 'high' : 'all' });
       const currentTab = queryParams.tab;
+
+      // 「未完成 → 完成」瞬间自动切「高风险」（适用于审核中已停留在结果页的场景），
+      // 只在转换时刻切一次，之后尊重用户手动切换。
+      const prevCompleteRef = useRef(isComplete);
+      useEffect(() => {
+         if (isComplete && !prevCompleteRef.current) {
+            setQueryParams({ tab: 'high' });
+         }
+         prevCompleteRef.current = isComplete;
+      }, [isComplete]);
+
       const visibleIssues = useMemo(
          () => (issues || []).filter((i) => i && shouldRenderIssue(i)),
          [issues]
