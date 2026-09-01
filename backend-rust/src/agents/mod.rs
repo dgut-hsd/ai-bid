@@ -1,9 +1,11 @@
 pub mod bus;
 pub mod chat_agent;
 pub mod coordinator;
+pub mod evidence_verifier;
 pub mod execution_control;
 pub mod fact_check;
 pub mod procedure;
+pub mod procurement_context;
 pub mod prompts;
 pub mod react_loop;
 pub mod registry;

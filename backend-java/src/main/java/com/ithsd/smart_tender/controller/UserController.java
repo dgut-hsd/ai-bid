@@ -1,14 +1,16 @@
 package com.ithsd.smart_tender.controller;
 
+import com.ithsd.smart_tender.common.TenantAuthException;
 import com.ithsd.smart_tender.common.TenantContext;
 import com.ithsd.smart_tender.common.TenantRequestContext;
+import com.ithsd.smart_tender.model.dto.ChangePasswordRequest;
 import com.ithsd.smart_tender.model.dto.TenantSwitchDTO;
 import com.ithsd.smart_tender.model.dto.UserLoginDTO;
-import com.ithsd.smart_tender.model.dto.UserRegisterDTO;
 import com.ithsd.smart_tender.model.result.Result;
 import com.ithsd.smart_tender.model.vo.UserLoginVO;
 import com.ithsd.smart_tender.service.TenantAuthService;
 import com.ithsd.smart_tender.service.UserService;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -24,8 +26,8 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class UserController {
 
-    private final UserService userService;
     private final TenantAuthService tenantAuthService;
+    private final UserService userService;
 
     @PostMapping("/login")
     public Result<UserLoginVO> login(@RequestBody UserLoginDTO userLoginDTO) {
@@ -59,9 +61,13 @@ public class UserController {
                 authorization, request, resolveRequestId(requestId)));
     }
 
-    @PostMapping("/register")
-    public Result<Void> register(@RequestBody UserRegisterDTO userRegisterDTO) {
-        userService.register(userRegisterDTO);
+    @PostMapping("/change-password")
+    public Result<Void> changePassword(@Valid @RequestBody ChangePasswordRequest request) {
+        TenantRequestContext context = TenantContext.get();
+        if (context == null || context.userId() == null) {
+            throw new TenantAuthException(401, "AUTH_REQUIRED", "请先登录", resolveRequestId(null));
+        }
+        userService.changePassword(context.userId(), request.getOldPassword(), request.getNewPassword());
         return Result.success();
     }
 

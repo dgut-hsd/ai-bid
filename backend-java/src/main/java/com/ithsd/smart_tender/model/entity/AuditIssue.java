@@ -21,9 +21,15 @@ public class AuditIssue implements Serializable {
     @TableId(value = "id", type = IdType.AUTO)
     private Long id;
 
+    @TableField("tenant_id")
+    private Long tenantId;
+
     private Long auditId;
 
     private String issueNo;
+
+    @TableField("risk_id")
+    private String riskId;
 
     private String severity;
 
@@ -45,7 +51,16 @@ public class AuditIssue implements Serializable {
 
     private String context;
 
+    @TableField("block_ids")
+    private String blockIds;
+
+    @TableField("highlight_rects")
+    private String highlightRects;
+
     private String reference;
+
+    /** 置信度 [0,1]；审核完成后 GET /result 从 DB 回退读取时保证不丢 */
+    private Double confidence;
 
     private LocalDateTime createTime;
 }

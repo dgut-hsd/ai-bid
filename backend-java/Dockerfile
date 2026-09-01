@@ -1,0 +1,38 @@
+# ── Java 后端多阶段构建：Maven 构建 → JRE 运行 ──
+FROM maven:3.9-eclipse-temurin-17 AS build
+
+# 构建期内存上限：宿主机 7.7G 无 swap，限制 Maven/JVM 避免构建 OOM
+ENV MAVEN_OPTS="-Xmx1024m -XX:MaxMetaspaceSize=512m"
+
+WORKDIR /app
+
+# 先复制 pom，利用依赖缓存（pom 已配置阿里云 Maven 镜像，加速下载）
+COPY pom.xml ./
+RUN mvn -B dependency:go-offline
+
+# 复制源码并打包（跳过测试；Flyway 迁移文件会打进 jar）
+COPY src ./src
+RUN mvn -B clean package -DskipTests
+
+# ── 运行阶段 ──
+FROM eclipse-temurin:17-jre
+
+WORKDIR /app
+
+# 拷贝可执行 fat jar（名称 = artifactId-version.jar）
+COPY --from=build /app/target/smart_tender-0.0.1-SNAPSHOT.jar app.jar
+
+# LibreOffice 用于 DOCX → PDF 转换（含中文字体，否则中文标书转 PDF 乱码）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libreoffice-core libreoffice-writer fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
+# 专用非 root 系统用户：DocumentPreviewService 以该用户身份运行 soffice（安全加固）
+RUN useradd -r -s /usr/sbin/nologin -m -d /home/soffice soffice
+
+# 数据目录（上传文件、预览缓存），宿主机挂卷
+VOLUME /data
+
+EXPOSE 3000
+
+ENTRYPOINT ["java", "-jar", "app.jar"]

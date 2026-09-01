@@ -17,22 +17,19 @@ class TenantContextTest {
     }
 
     @Test
-    void context_shouldExposeImmutableSnapshotAndLegacyUserIdBridge() {
+    void context_shouldExposeLegacyUserIdBridge() {
         TenantRequestContext context = new TenantRequestContext(10001L, 20001L, "ADMIN", 3L, "request-1");
 
         TenantContext.set(context);
 
         assertThat(TenantContext.get()).isEqualTo(context);
         assertThat(BaseContext.getCurrentId()).isEqualTo(10001L);
-        TenantContextSnapshot snapshot = TenantContext.snapshot();
-        assertThat(snapshot).isNotNull();
-        assertThat(snapshot.toContext()).isEqualTo(context);
     }
 
     @Test
     void wrapper_shouldPropagateContextAndRestoreWorkerState() throws Exception {
         TenantRequestContext outer = new TenantRequestContext(10001L, 20001L, "ADMIN", 1L, "outer");
-        TenantRequestContext workerState = new TenantRequestContext(10002L, 20002L, "VIEWER", 2L, "worker");
+        TenantRequestContext workerState = new TenantRequestContext(10002L, 20002L, "MEMBER", 2L, "worker");
         TenantContext.set(outer);
 
         Callable<TenantRequestContext> wrapped = TenantContext.wrap(() -> {

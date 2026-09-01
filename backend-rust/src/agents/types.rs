@@ -182,6 +182,8 @@ pub struct ReviewClause {
     pub tier: RiskTier,
     /// 该级别的最大 ReAct 轮次
     pub tier_max_turns: usize,
+    /// 来源 block ID（透传 Chunk.source_block_ids，用于流式阶段补发 block_ids）
+    pub source_block_ids: Vec<String>,
 }
 
 impl ReviewClause {
@@ -202,6 +204,7 @@ impl ReviewClause {
             page_end: chunk.page_end,
             tier,
             tier_max_turns,
+            source_block_ids: chunk.source_block_ids.clone(),
         }
     }
 
@@ -239,6 +242,47 @@ impl std::fmt::Display for RiskSeverity {
             RiskSeverity::Info => write!(f, "ℹ️ info"),
         }
     }
+}
+
+impl RiskSeverity {
+    /// 返回不含 emoji 的纯字符串表示，用于 SSE 事件与 Java 侧映射。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RiskSeverity::High => "high",
+            RiskSeverity::Medium => "medium",
+            RiskSeverity::Low => "low",
+            RiskSeverity::Info => "info",
+        }
+    }
+}
+
+/// 从 `clause_ids` 按顺序聚合各条款的 `source_block_ids`（去重、保序、上限防爆）。
+///
+/// 用于流式 `finding_added` 阶段补发 block_ids——LLM 输出的是 clause_ids，
+/// block_ids 由框架从 clause.source_block_ids 确定性聚合，无需等待 /result
+/// 的 source_quote 反查。配合「块序回退」策略，保证正确页面上能画出 bbox。
+pub fn collect_block_ids_for_clause_ids(
+    clause_ids: &[String],
+    clause_blocks: &HashMap<String, Vec<String>>,
+    max_blocks: usize,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for cid in clause_ids {
+        if out.len() >= max_blocks {
+            break;
+        }
+        if let Some(ids) = clause_blocks.get(cid) {
+            for id in ids {
+                if out.len() >= max_blocks {
+                    break;
+                }
+                if !out.contains(id) {
+                    out.push(id.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 // ─── 风险发现 ──────────────────────────────────────────────────
@@ -344,6 +388,12 @@ pub struct RiskFinding {
     /// 哪些 Agent 验证了此发现（Verified 来源）
     #[serde(default)]
     pub verified_by: Vec<String>,
+    /// 证据核验器结论（support/refute/insufficient），EvidenceVerifier 阶段回写
+    #[serde(default)]
+    pub evidence_verdict: Option<String>,
+    /// 证据核验器的理由
+    #[serde(default)]
+    pub verifier_reason: Option<String>,
 
     // ── 框架自动填充的定位字段（用于 Java 侧映射 AuditIssueEntity） ──
     /// 起始页码 (0-based)，框架从关联 ReviewClause 自动填充
@@ -355,6 +405,32 @@ pub struct RiskFinding {
     /// 条款原文上下文（截取前 500 字符），框架自动填充
     #[serde(default)]
     pub context: Option<String>,
+    /// 词级精确高亮矩形（按 source_quote 命中的词逐行合并）。
+    /// 非空时前端优先渲染这些紧致框，跳过段落级 block 高亮与文本层收敛。
+    /// 框架在审核完成阶段自动填充。
+    #[serde(default)]
+    pub highlight_rects: Vec<HighlightRect>,
+}
+
+/// 词级精确高亮矩形。
+///
+/// 坐标与 `RawBlock.bbox` / `/blocks` 端点的 `BBoxDto` 一致：PDF points，
+/// 原点在页面左上角，Y 轴向下。`page` 为 0-based 页码。`page_width` 为
+/// 该页原生宽度 (pt)，供前端计算 scale = renderedWidth / pageWidth。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HighlightRect {
+    /// 所在页码 (0-based)
+    pub page: usize,
+    /// 矩形左上角 X（PDF points）
+    pub x0: f64,
+    /// 矩形上边界 Y（距页面顶部距离）
+    pub top: f64,
+    /// 矩形右下角 X
+    pub x1: f64,
+    /// 矩形下边界 Y
+    pub bottom: f64,
+    /// 原始 PDF 页面宽度 (pt)
+    pub page_width: f64,
 }
 
 // ─── 发现角色 ──────────────────────────────────────────────────
@@ -426,6 +502,7 @@ impl RiskFinding {
             risk_id,
             clause_ids: vec![clause_id],
             block_ids: Vec::new(),
+            highlight_rects: Vec::new(),
             agent: agent.to_string(),
             no_risk: true,
             severity: RiskSeverity::Info,
@@ -450,6 +527,8 @@ impl RiskFinding {
             verification_required: Vec::new(),
             hypothesized_by: Vec::new(),
             verified_by: Vec::new(),
+            evidence_verdict: None,
+            verifier_reason: None,
             page_number: None,
             section_path: None,
             context: None,
@@ -469,6 +548,7 @@ impl RiskFinding {
             risk_id,
             clause_ids: vec![clause_id],
             block_ids: Vec::new(),
+            highlight_rects: Vec::new(),
             agent: agent.to_string(),
             no_risk: true,
             severity: RiskSeverity::Info,
@@ -496,6 +576,8 @@ impl RiskFinding {
             verification_required: Vec::new(),
             hypothesized_by: Vec::new(),
             verified_by: Vec::new(),
+            evidence_verdict: None,
+            verifier_reason: None,
             page_number: None,
             section_path: None,
             context: None,
@@ -995,6 +1077,8 @@ pub struct CoordinatorConfig {
     pub enabled_agents: Vec<AgentId>,
     /// 是否启用 Legal Verify 对抗法条验证
     pub enable_legal_verify: bool,
+    /// 是否启用 Evidence Verifier 证据核验（证伪导向 NLI 三分类，Triage 前）
+    pub enable_evidence_verify: bool,
     /// Legal Verify 的最大 ReAct 轮次
     pub legal_verify_max_turns: usize,
     /// BlindSpot ReAct 的最大轮次
@@ -1003,6 +1087,9 @@ pub struct CoordinatorConfig {
     pub blind_spot_fallback_enabled: bool,
     /// 最大并行审查条款数（同一 Agent 内并行处理的条款上限）
     pub max_parallel_clauses: usize,
+    /// P2 实验开关：压缩 assistant 冗长推理独白，只保留结论尾段重放。
+    /// A/B 分组由该开关驱动（on→transcript_compress，off→control）。
+    pub transcript_compression: bool,
 }
 
 impl Default for CoordinatorConfig {
@@ -1010,10 +1097,12 @@ impl Default for CoordinatorConfig {
         Self {
             enabled_agents: AgentId::all_reviewers(),
             enable_legal_verify: false, // 成本优化：关闭 LLM 法条验证
+            enable_evidence_verify: true, // 证据核验：离线实验 precision 100%，默认开启
             legal_verify_max_turns: 3,
             blind_spot_max_turns: 10,
             blind_spot_fallback_enabled: true,
             max_parallel_clauses: 3,
+            transcript_compression: false,
         }
     }
 }
@@ -1883,7 +1972,7 @@ mod tests {
     #[test]
     fn test_agent_id_all_reviewers_count() {
         let reviewers = AgentId::all_reviewers();
-        assert_eq!(reviewers.len(), 5);
+        assert_eq!(reviewers.len(), 7);
         // BlindSpot / LegalVerify / Debate 不在 reviewers 中
         assert!(!reviewers.contains(&AgentId::BlindSpot));
         assert!(!reviewers.contains(&AgentId::LegalVerify));
@@ -1938,6 +2027,7 @@ mod tests {
             risk_id: "R_003".into(),
             clause_ids: vec!["ch_003".into()],
             block_ids: Vec::new(),
+            highlight_rects: Vec::new(),
             agent: "SemanticRiskAgent".into(),
             no_risk: false,
             severity: RiskSeverity::High,
@@ -1971,6 +2061,8 @@ mod tests {
             verification_required: vec!["《政府采购法》".into()],
             hypothesized_by: vec!["ScoutAgent".into()],
             verified_by: vec!["SemanticRiskAgent".into()],
+            evidence_verdict: None,
+            verifier_reason: None,
             page_number: Some(0),
             section_path: Some(vec!["测试章节".into()]),
             context: Some("须采用XX品牌 测试上下文".into()),
@@ -2135,6 +2227,7 @@ mod tests {
             page_end: 0,
             tier: RiskTier::High,
             tier_max_turns: 14,
+            source_block_ids: vec![],
         };
         // agent 能力只有 4 轮 → 取 4
         assert_eq!(clause.effective_max_turns(4), 4);
@@ -2217,7 +2310,7 @@ mod tests {
     #[test]
     fn test_coordinator_config_defaults() {
         let config = CoordinatorConfig::default();
-        assert_eq!(config.enabled_agents.len(), 5);
+        assert_eq!(config.enabled_agents.len(), 7);
         assert!(!config.enable_legal_verify); // 成本优化：默认关闭 LLM 法条验证
         assert_eq!(config.legal_verify_max_turns, 3);
         assert_eq!(config.blind_spot_max_turns, 10);

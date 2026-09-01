@@ -1,20 +1,26 @@
 # ── 生产环境配置覆盖 ──
+spring:
+  sql:
+    init:
+      mode: never
+
 server:
   port: 3000
 
 security:
   jwt:
-    secret: ${ST_JWT_SECRET:5f71d068faffaa7e5cac07c803f4673fe64c37fbb6c395e7c02747873ba9225d}
+    secret: ${ST_JWT_SECRET}
     ttl-millis: ${ST_JWT_TTL_MILLIS:86400000}
+    session-ttl-millis: ${ST_SESSION_TTL_MILLIS:604800000}
     accept-legacy-user-id: false
 
 file:
   storage:
-    path: /opt/smart-tender/data/uploads
+    path: ${FILE_STORAGE_PATH:/opt/smart-tender/data/uploads}
 
 preview:
   cache:
-    path: /opt/smart-tender/data/preview-cache
+    path: ${PREVIEW_CACHE_PATH:/opt/smart-tender/data/preview-cache}
 
 rag:
   base-url: http://127.0.0.1:8000

@@ -48,6 +48,7 @@ export const BidLibraryPage: React.FC = () => {
    const [editSubmitting, setEditSubmitting] = useState(false);
    const editSubmittingRef = useRef(false);
    const [selectedFile, setSelectedFile] = useState<KnowledgeFile | null>(null);
+   const [filterDrawerOpen, setFilterDrawerOpen] = useState(false);
 
    const categoryCounts = statsData || {
       all: 0,
@@ -87,6 +88,12 @@ export const BidLibraryPage: React.FC = () => {
       });
    };
 
+   const activeFilterCount = [
+      queryParams.applicableScope,
+      queryParams.status,
+      queryParams.startDate,
+   ].filter(Boolean).length;
+
    return (
       <div className={styles.pageContainer}>
          <Modal
@@ -111,6 +118,8 @@ export const BidLibraryPage: React.FC = () => {
                   searchKeyword={queryParams.keyword || ''}
                   onSearchChange={(keyword) => handleFilterChange({ keyword })}
                   onUploadClick={() => setUploadVisible(true)}
+                  onFilterClick={() => setFilterDrawerOpen(true)}
+                  activeFilterCount={activeFilterCount}
                />
 
                {/* 左侧的下部分：Tab + 筛选器 (新增了一层 div 包裹) */}
@@ -150,6 +159,8 @@ export const BidLibraryPage: React.FC = () => {
                         }
                      }}
                      onReset={handleReset}
+                     drawerOpen={filterDrawerOpen}
+                     onDrawerClose={() => setFilterDrawerOpen(false)}
                   />
                </div>
             </div>

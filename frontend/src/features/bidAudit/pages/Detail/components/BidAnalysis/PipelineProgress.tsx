@@ -5,6 +5,7 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   ArrowRightOutlined,
+  ExclamationCircleOutlined,
 } from '@ant-design/icons';
 
 const { Text } = Typography;
@@ -12,6 +13,8 @@ const { Text } = Typography;
 interface PipelineProgressProps {
   currentStage: string;
   isComplete: boolean;
+  /** 部分失败阶段名（如 evidence_verify），非空表示结果经过降级、未经完整核验 */
+  failedStages?: string[];
   /** 审核完成后手动跳转到「审核结果」的回调（不传则不显示入口） */
   onViewResults?: () => void;
 }
@@ -29,42 +32,84 @@ const stageLabel = (stage: string, isComplete: boolean): string => {
   return stage;
 };
 
+/** 将失败阶段名映射为中文（与 Rust/Java failed_stages 阶段名对齐） */
+const failedStageLabel = (stage: string): string => {
+  switch (stage) {
+    case 'evidence_verify': return '证据核验';
+    case 'pipeline': return '审核管线超时';
+    case 'execute': return '多智能体审查';
+    case 'legal_verify': return '法条验证';
+    case 'debate': return '对抗辩论';
+    case 'batch_search': return '批量检索';
+    case 'blind_spot': return '盲点扫描';
+    default: return stage;
+  }
+};
+
 /**
  * 审核进度指示 — 后端审核是同步阻塞调用，无细粒度进度，
  * 因此使用不间断旋转动画表示"进行中"。
  */
-const PipelineProgress: React.FC<PipelineProgressProps> = ({ currentStage, isComplete, onViewResults }) => {
+const PipelineProgress: React.FC<PipelineProgressProps> = ({ currentStage, isComplete, failedStages, onViewResults }) => {
   const label = stageLabel(currentStage, isComplete);
 
   // 审核完成：不自动跳页，改为在「审核过程」页给一条醒目的完成横幅 + 手动入口，
   // 用户可以继续看当前卡片，想看结果时自己点。
   if (isComplete) {
+    const partialStages = (failedStages || []).filter(Boolean);
     return (
-      <div
-        style={{
-          padding: '12px 14px',
-          marginBottom: 6,
-          display: 'flex',
-          alignItems: 'center',
-          gap: 10,
-          background: '#f6ffed',
-          border: '1px solid #b7eb8f',
-          borderRadius: 8,
-        }}
-      >
-        <CheckCircleOutlined style={{ color: '#52c41a', fontSize: 26 }} />
-        <Text strong style={{ fontSize: 20, lineHeight: 1.2, color: '#389e0d', letterSpacing: 1 }}>
-          {label}
-        </Text>
-        {onViewResults && (
-          <Button
-            type="link"
-            size="small"
-            style={{ marginLeft: 'auto', padding: 0, color: '#389e0d' }}
-            onClick={onViewResults}
+      <div>
+        <div
+          style={{
+            padding: '12px 14px',
+            marginBottom: 6,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            background: '#f6ffed',
+            border: '1px solid #b7eb8f',
+            borderRadius: 8,
+          }}
+        >
+          <CheckCircleOutlined style={{ color: '#52c41a', fontSize: 26 }} />
+          <Text strong style={{ fontSize: 20, lineHeight: 1.2, color: '#389e0d', letterSpacing: 1 }}>
+            {label}
+          </Text>
+          {onViewResults && (
+            <Button
+              type="link"
+              size="small"
+              style={{ marginLeft: 'auto', padding: 0, color: '#389e0d' }}
+              onClick={onViewResults}
+            >
+              查看审核结果 <ArrowRightOutlined />
+            </Button>
+          )}
+        </div>
+
+        {partialStages.length > 0 && (
+          <div
+            style={{
+              padding: '10px 14px',
+              marginBottom: 6,
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: 10,
+              background: '#fffbe6',
+              border: '1px solid #ffe58f',
+              borderRadius: 8,
+            }}
           >
-            查看审核结果 <ArrowRightOutlined />
-          </Button>
+            <ExclamationCircleOutlined style={{ color: '#faad14', fontSize: 18, marginTop: 2 }} />
+            <div style={{ flex: 1 }}>
+              <Text strong style={{ fontSize: 14, color: '#ad6800' }}>
+                审核完成（部分核验未完成）
+              </Text>
+              <div style={{ fontSize: 12, color: '#ad6800', marginTop: 2, lineHeight: 1.6 }}>
+                以下阶段未完成：{partialStages.map(failedStageLabel).join('、')}。部分风险发现未经独立核验即输出，结果仅供参考，建议人工复核后使用。
+              </div>
+            </div>
+          </div>
         )}
       </div>
     );

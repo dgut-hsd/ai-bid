@@ -25,6 +25,10 @@
 //! 每个 Agent 获得独立的 LLM 客户端和工具集。
 
 use crate::agents::bus::AgentBus;
+use crate::agents::evidence_verifier::{
+    EvidenceVerdict, deterministic_weight_sum_check, evidence_core_key, fmt_weight_sum,
+    is_weight_related, verify_evidence,
+};
 use crate::agents::execution_control::{
     ExecutionStage, GlobalExecutionLimiter, ReviewExecutionControl,
 };
@@ -412,7 +416,6 @@ fn replace_dynamic_agent_file_with_backup(
     }
     Ok(())
 }
-
 struct AgentTaskOutput {
     findings: Vec<RiskFinding>,
     successful_clauses: usize,
@@ -599,6 +602,9 @@ pub struct Coordinator {
     metrics: Option<Arc<Mutex<crate::metrics::MetricsCollector>>>,
     /// ★ 跨 Agent 共享搜索缓存（避免不同 Agent 重复搜索相同的法规）
     pub shared_search_cache: Arc<Mutex<HashMap<(String, String), serde_json::Value>>>,
+    /// ★ 确定性数值核验用的 clause 全文缓存：(chunk_id → 全文)。
+    /// preload_chunks 时写入，evidence_verify 时读取做权重和求和。
+    clause_texts: Arc<std::sync::Mutex<HashMap<String, String>>>,
     global_execution_limiter: Arc<GlobalExecutionLimiter>,
     /// 同一 Coordinator 的 BlindSpot 后台扫描必须完整串行，避免 attempt 集合互相污染。
     blind_spot_scan_lock: Mutex<()>,
@@ -640,6 +646,7 @@ impl Coordinator {
             review_events: None,
             metrics: None,
             shared_search_cache,
+            clause_texts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             global_execution_limiter: Arc::new(GlobalExecutionLimiter::from_env()),
             blind_spot_scan_lock: Mutex::new(()),
             dynamic_agent_store: DynamicAgentStore::global(),
@@ -1061,6 +1068,34 @@ impl Coordinator {
             collector.record_sub_phase("Debate", debate_duration);
         }
         phase_start = std::time::Instant::now();
+
+        // [6.5] EVIDENCE VERIFY: 证据核验（证伪导向 NLI 三分类）
+        execution_control.record_pipeline_timeout_if_expired();
+        if self.config.enable_evidence_verify && !execution_control.pipeline_expired() {
+            emit(&ReviewEvent::Phase {
+                phase: crate::agents::review_event::PipelinePhase::Triage,
+                phase_index: 6,
+                total_phases: 7,
+                message: "证据核验中（证伪导向 NLI 三分类）...".to_string(),
+            });
+            let ev_timeout = execution_control.pipeline_remaining().unwrap_or_default();
+            if tokio::time::timeout(
+                ev_timeout,
+                self.evidence_verify(&mut merged[..], execution_control.clone()),
+            )
+            .await
+            .is_err()
+            {
+                eprintln!("  [EVIDENCE_VERIFY] 阶段超时，跳过");
+                // 证据核验被跳过后，未验证的发现仍会原样输出 → 结果必须标记为
+                // partial_failed，避免把降级质量的结果当成 completed 静默交付。
+                execution_control.record_stage_failure(
+                    ExecutionStage::EvidenceVerify,
+                    "证据核验阶段未在剩余时长内完成，相关发现未经核验即输出",
+                );
+                execution_control.record_pipeline_timeout_if_expired();
+            }
+        }
 
         // [7] TRIAGE: 按 severity + confidence 分流
         emit(&ReviewEvent::Phase {
@@ -1644,6 +1679,14 @@ impl Coordinator {
 
         let count = chunk_nodes.len();
         self.graph.add_chunks(chunk_nodes);
+        // 顺带缓存 clause 全文：证据核验阶段的确定性权重和校验依赖完整数字（graph 只存 200 字 preview）。
+        {
+            let mut full = self.clause_texts.lock().unwrap();
+            full.clear();
+            for c in clauses {
+                full.insert(c.chunk_id.clone(), c.text.clone());
+            }
+        }
         eprintln!("  [PRELOAD] SessionGraph ← {} 个 Chunk 节点", count);
     }
 
@@ -1678,6 +1721,11 @@ impl Coordinator {
     ) -> Result<ExecuteAgentsOutput> {
         let mut join_set = JoinSet::new();
         let mut task_meta = HashMap::new();
+        // 条款发现累积器：review_clauses_parallel_report 逐条款完成时同步写入。
+        // Execute 超时 abort 在途 Agent 后，这里仍保留已完成条款的发现，供 /result
+        // 作为最终事实来源带回（Java 端以 /result 幂等重写 DB，否则这些发现会丢）。
+        let streamed_findings: Arc<std::sync::Mutex<Vec<RiskFinding>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
 
         for (agent_id, clauses) in routing {
             if clauses.is_empty() {
@@ -1712,8 +1760,10 @@ impl Coordinator {
             let llm_factory = self.llm_factory.clone();
             let tools_factory = self.tools_factory.clone();
             let max_parallel = self.config.max_parallel_clauses;
+            let transcript_compression = self.config.transcript_compression;
             let shared_search_cache = self.shared_search_cache.clone();
             let execution_control = execution_control.clone();
+            let streamed_findings = streamed_findings.clone();
 
             let abort_handle = join_set.spawn(async move {
                 let agent_name = agent_id.to_string();
@@ -1744,7 +1794,8 @@ impl Coordinator {
                                         .with_bus(bus.clone())
                                         .with_graph(graph.clone())
                                         .with_print_lock(print_lock.clone())
-                                        .with_search_cache(search_cache.clone());
+                                        .with_search_cache(search_cache.clone())
+                                        .with_transcript_compression(transcript_compression);
                                     agent.trace = trace.clone();
                                     if let Some(ref events) = review_events {
                                         agent = agent.with_review_events(events.clone());
@@ -1763,6 +1814,7 @@ impl Coordinator {
                             agent_id.clone(),
                             Some(execution_control),
                             Some(agent_progress),
+                            Some(streamed_findings),
                         )
                         .await;
 
@@ -1799,30 +1851,8 @@ impl Coordinator {
                         });
                     }
 
-                    // B-2 流式发射：每个 Agent 审查完成即把其发现推向前端
-                    // 不再等 MERGE/LEGAL_VERIFY，也不依赖 enable_legal_verify 开关
-                    // 重复/被合并项由 merge_findings_v3 后续发 finding_removed 自动清理
-                    if let Some(ref events) = review_events {
-                        for f in findings.iter().filter(|f| !f.no_risk) {
-                            events.emit(&ReviewEvent::FindingAdded {
-                                risk_id: f.risk_id.clone(),
-                                severity: severity_str(&f.severity).to_string(),
-                                is_critical: f.is_critical,
-                                critical_reason: f.critical_reason.clone(),
-                                risk_type: f.risk_type.clone(),
-                                agent: f.agent.clone(),
-                                confidence: f.confidence as f64,
-                                clause_ids: f.clause_ids.clone(),
-                                source_quote: f.source_quote.chars().take(500).collect(),
-                                legal_basis: f.legal_basis.clone(),
-                                reason: f.reason.chars().take(500).collect(),
-                                suggestion: f.suggestion.clone(),
-                                lifecycle: FindingLifecycle::Verified,
-                                page_number: f.page_number,
-                                section_path: f.section_path.clone(),
-                            });
-                        }
-                    }
+                    // 发现已由 review_clauses_parallel_report 逐条款流式发射（FindingAdded），
+                    // 此处不再批量重发，避免重复；仅保留以下 SessionGraph 写入。
 
                     AgentTaskOutput {
                         findings,
@@ -1994,7 +2024,10 @@ impl Coordinator {
                     }
                     execution_control.record_stage_failure(
                         ExecutionStage::Execute,
-                        "Agent Execute 阶段超过 20 分钟",
+                        format!(
+                            "Agent Execute 阶段超过 {} 分钟",
+                            execute_timeout.as_secs() / 60
+                        ),
                     );
                     execution_control.record_pipeline_timeout_if_expired();
                     for (_task_id, (agent_id, clause_ids, progress)) in task_meta.drain() {
@@ -2029,6 +2062,7 @@ impl Coordinator {
                                     lifecycle: FindingLifecycle::Verified,
                                     page_number: finding.page_number,
                                     section_path: finding.section_path.clone(),
+                                    block_ids: finding.block_ids.clone(),
                                 });
                             }
                         }
@@ -2078,6 +2112,23 @@ impl Coordinator {
                         }));
                     }
                     break;
+                }
+            }
+        }
+
+        // 超时 abort 后，把已逐条款累积的发现并入 all_findings（按 risk_id 去重），
+        // 使 /result 作为最终事实来源时，仍能带回因超时被 abort 的 Agent 已完成条款的发现。
+        {
+            let mut seen: HashSet<String> = all_findings
+                .iter()
+                .map(|finding| finding.risk_id.clone())
+                .collect();
+            if let Ok(streamed) = streamed_findings.lock() {
+                for finding in streamed.iter() {
+                    if !seen.contains(&finding.risk_id) {
+                        seen.insert(finding.risk_id.clone());
+                        all_findings.push(finding.clone());
+                    }
                 }
             }
         }
@@ -2288,14 +2339,26 @@ impl Coordinator {
         for vf in verified {
             let mut merged = false;
             for existing in stage1.iter_mut() {
-                let same_type = finding_category(existing) == finding_category(&vf);
+                let existing_cat = finding_category(existing);
+                let vf_cat = finding_category(&vf);
+                let same_type = existing_cat == vf_cat;
                 let same_clause = existing
                     .clause_ids
                     .iter()
                     .any(|c| vf.clause_ids.contains(c));
-                let same_evidence = evidence_similarity(existing, &vf) >= 0.70;
-                if same_type && same_clause && same_evidence {
-                    // 同风险类型 + 同条款 → 合并
+                let sim = evidence_similarity(existing, &vf);
+                // 精确同文（日期/空格归一化后逐字相同）→ 放宽去重：
+                //   · 同风险类型可跨 chunk 合并（同一句被重叠分块重复审出）；
+                //   · 同 chunk 且两个标签都没落进 15 类内置分类（均为 LLM 自造码的近义标签）也合并。
+                // 非精确同文仍走原逻辑：同风险类型 + 同条款 + 证据相似度 ≥ 0.70。
+                let exact_quote = sim >= 0.999;
+                let both_uncategorized = risk_taxonomy::display_name(&existing_cat).is_none()
+                    && risk_taxonomy::display_name(&vf_cat).is_none();
+                if (same_type && same_clause && sim >= 0.70)
+                    || (exact_quote && same_type)
+                    || (exact_quote && same_clause && both_uncategorized)
+                {
+                    // 同风险类型 + 同条款 → 合并（精确同文可跨 chunk）
                     merge_contributors(existing, &vf);
                     for cid in &vf.clause_ids {
                         if !existing.clause_ids.contains(cid) {
@@ -2508,6 +2571,7 @@ impl Coordinator {
                     page_end: 0,
                     tier: RiskTier::Medium,
                     tier_max_turns: 4, // 批量模式 4 轮即可（共享搜索结果，效率更高）
+                    source_block_ids: vec![],
                 };
 
                 let mut config = def.to_agent_config();
@@ -2635,6 +2699,7 @@ impl Coordinator {
                     page_end: 0,
                     tier: RiskTier::Medium,
                     tier_max_turns: 3, // fallback 模式减到 3 轮
+                    source_block_ids: vec![],
                 };
 
                 let config = def.to_agent_config();
@@ -2945,6 +3010,7 @@ impl Coordinator {
                     page_end: 0,
                     tier: RiskTier::High,
                     tier_max_turns: 8,
+                    source_block_ids: vec![],
                 };
 
                 let def = debate_def.unwrap().clone();
@@ -3187,6 +3253,7 @@ impl Coordinator {
                     page_end: chunk.page_end,
                     tier: chunk.tier,
                     tier_max_turns: chunk.tier.max_turns(),
+                    source_block_ids: vec![],
                 })
             })
             .collect();
@@ -3472,6 +3539,7 @@ impl Coordinator {
                     risk_id: format!("BLIND_{}", cid),
                     clause_ids: vec![(*cid).clone()],
                     block_ids: Vec::new(),
+                    highlight_rects: Vec::new(),
                     agent: "BlindSpotAgent".to_string(),
                     no_risk: false,
                     severity: RiskSeverity::Info,
@@ -3496,6 +3564,8 @@ impl Coordinator {
                     verification_required: Vec::new(),
                     hypothesized_by: Vec::new(),
                     verified_by: Vec::new(),
+                    evidence_verdict: None,
+                    verifier_reason: None,
                     page_number: Some(chunk.page_start + 1),
                     section_path: Some(chunk.section_path.clone()),
                     context: Some(chunk.text_preview.chars().take(500).collect()),
@@ -3526,6 +3596,7 @@ impl Coordinator {
                     risk_id: format!("BLIND_NO_RISK_{}", cid),
                     clause_ids: vec![(*cid).clone()],
                     block_ids: Vec::new(),
+                    highlight_rects: Vec::new(),
                     agent: "BlindSpotAgent".to_string(),
                     no_risk: true,
                     severity: RiskSeverity::Info,
@@ -3554,6 +3625,8 @@ impl Coordinator {
                     verification_required: Vec::new(),
                     hypothesized_by: Vec::new(),
                     verified_by: Vec::new(),
+                    evidence_verdict: None,
+                    verifier_reason: None,
                     page_number: Some(chunk.page_start + 1),
                     section_path: Some(chunk.section_path.clone()),
                     context: Some(chunk.text_preview.chars().take(500).collect()),
@@ -3570,6 +3643,189 @@ impl Coordinator {
             return Vec::new();
         }
         blind_findings
+    }
+
+    /// 取 finding 关联 clause 的全文（多个 clause 换行拼接）；查不到则回退 source_quote。
+    fn clause_text_for(&self, f: &RiskFinding) -> String {
+        let guard = match self.clause_texts.lock() {
+            Ok(g) => g,
+            Err(_) => return f.source_quote.clone(),
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        for cid in &f.clause_ids {
+            if let Some(t) = guard.get(cid) {
+                parts.push(t.as_str());
+            }
+        }
+        if parts.is_empty() {
+            f.source_quote.clone()
+        } else {
+            parts.join("\n")
+        }
+    }
+
+    // ── [6.5] EVIDENCE VERIFY: 证据核验（证伪导向 NLI 三分类）──
+    /// 对每条 Verified finding 仅凭 source_quote + risk_type 做独立证据核验，不喂 reason。
+    /// support → 放行；refute/insufficient → 降级 Info（疑似）。
+    /// 同一原文（去重 key）只调用一次 LLM，结果复用。
+    async fn evidence_verify(
+        &self,
+        findings: &mut [RiskFinding],
+        execution_control: Arc<ReviewExecutionControl>,
+    ) -> usize {
+        // 0) 确定性权重/分值构成核验：按 clause 全文求和比 100，命中即定稿，不喂 LLM。
+        let mut det_cache: HashMap<String, EvidenceVerdict> = HashMap::new();
+        for f in findings.iter() {
+            if f.no_risk || f.source_quote.trim().is_empty() {
+                continue;
+            }
+            if !is_weight_related(&f.category_code, &f.risk_type) {
+                continue;
+            }
+            let full = self.clause_text_for(f);
+            if let Some(outcome) = deterministic_weight_sum_check(&full) {
+                let key = evidence_core_key(&f.source_quote);
+                let sum_text = fmt_weight_sum(outcome.sum);
+                if outcome.closed {
+                    det_cache.entry(key).or_insert_with(|| EvidenceVerdict {
+                        verdict: "refute".into(),
+                        reason: format!(
+                            "确定性数值核验：商务/技术/报价分值合计 {} = 100，权重闭合，疑似违规不成立。",
+                            sum_text
+                        ),
+                        severity: None,
+                    });
+                } else {
+                    det_cache.entry(key).or_insert_with(|| EvidenceVerdict {
+                        verdict: "support".into(),
+                        reason: format!(
+                            "确定性数值核验：商务/技术/报价分值合计 {} ≠ 100，权重和不闭合。",
+                            sum_text
+                        ),
+                        severity: Some("medium".into()),
+                    });
+                }
+            }
+        }
+        if !det_cache.is_empty() {
+            eprintln!(
+                "  [EVIDENCE_VERIFY] 确定性权重和核验定稿 {} 组（跳过 LLM）",
+                det_cache.len()
+            );
+        }
+
+        // 1) 去重：同一核心原文只裁决一次（已确定性定稿的 key 跳过）
+        let mut reps: Vec<(String, String, String)> = Vec::new(); // (key, quote, risk_type)
+        let mut seen: HashSet<String> = HashSet::new();
+        for f in findings.iter() {
+            if f.no_risk || f.source_quote.trim().is_empty() {
+                continue;
+            }
+            let key = evidence_core_key(&f.source_quote);
+            if det_cache.contains_key(&key) {
+                continue;
+            }
+            if seen.insert(key.clone()) {
+                reps.push((key, f.source_quote.clone(), f.risk_type.clone()));
+            }
+        }
+        eprintln!(
+            "  [EVIDENCE_VERIFY] 收到 {} 条 findings，去重后 {} 组（确定性定稿 {} 组）",
+            findings.len(),
+            reps.len(),
+            det_cache.len()
+        );
+        if reps.is_empty() && det_cache.is_empty() {
+            return 0;
+        }
+
+        // 2) 多组并行裁决：Semaphore 有界并发 + 单次 tokio 超时兜底。
+        //    串行时 79 组 × ~14s ≈ 18 分钟；并行后压到 ceil(N/并发度) 批（默认 6 并发）。
+        //    注意：证据核验是廉价的 NLI 三分类（~1k token/组），必须豁免主分析的 Token 预算，
+        //    否则主分析打满预算后证据核验被 `reserve_llm_call` 前置拦截、误报无法降级。
+        //    因此这里用裸 LLM 客户端 + `tokio::time::timeout`，而不是 `ControlledLlmClient`。
+        let concurrency = execution_control
+            .limits()
+            .evidence_verify_concurrency
+            .max(1);
+        let call_timeout = execution_control.limits().call_timeout;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let llm_factory = self.llm_factory.clone();
+        let mut join_set: JoinSet<(String, Option<EvidenceVerdict>)> = JoinSet::new();
+
+        for (key, quote, risk_type) in reps {
+            let semaphore = semaphore.clone();
+            let factory = llm_factory.clone();
+            join_set.spawn(async move {
+                let _guard = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("EvidenceVerify 并发信号量未关闭");
+                let llm = (factory)();
+                let result = tokio::time::timeout(
+                    call_timeout,
+                    verify_evidence(llm.as_ref(), &quote, &risk_type),
+                )
+                .await
+                .unwrap_or(None);
+                (key, result)
+            });
+        }
+
+        // 汇总结果：全部在途任务完成后才回写，保持"超时即不落半成品"的原子语义。
+        let mut cache: HashMap<String, EvidenceVerdict> = HashMap::new();
+        let mut verified = 0usize;
+        while let Some(res) = join_set.join_next().await {
+            if let Ok((key, Some(verdict))) = res {
+                verified += 1;
+                cache.insert(key, verdict);
+            }
+        }
+
+        // 3) 回写每条 finding：support 放行，其余降级 Info
+        let mut dropped = 0usize;
+        for f in findings.iter_mut() {
+            if f.no_risk || f.source_quote.trim().is_empty() {
+                continue;
+            }
+            let key = evidence_core_key(&f.source_quote);
+            // 确定性数值核验优先，其次 NLI 缓存。
+            let ev = det_cache
+                .get(&key)
+                .cloned()
+                .or_else(|| cache.get(&key).cloned());
+            if let Some(ev) = ev {
+                f.evidence_verdict = Some(ev.verdict.clone());
+                f.verifier_reason = Some(ev.reason.clone());
+                if ev.verdict == "support" {
+                    f.reason.push_str(&format!(
+                        "\n[EvidenceVerify] ✅ 证据核验通过: {}。",
+                        ev.reason
+                    ));
+                    // severity 校准：只降不升——核验器判 medium 时，把 high 拉回 medium。
+                    if ev.severity.as_deref() == Some("medium") && f.severity == RiskSeverity::High
+                    {
+                        f.severity = RiskSeverity::Medium;
+                        f.reason.push_str(
+                            "\n[EvidenceVerify] 🔻 severity 校准：证据成立但非红线级，high 降为 medium。",
+                        );
+                    }
+                } else {
+                    dropped += 1;
+                    f.severity = RiskSeverity::Info;
+                    f.clear_criticality();
+                    f.reason.push_str(&format!(
+                        "\n[EvidenceVerify] ❓ 证据核验未通过（{}）: {}。已降级为疑似。",
+                        ev.verdict, ev.reason
+                    ));
+                }
+            }
+        }
+        eprintln!(
+            "  [EVIDENCE_VERIFY] 独立裁决 {} 组原文，{} 条降级为疑似",
+            verified, dropped
+        );
+        verified
     }
 
     // ── [7] TRIAGE: 按 severity + confidence 分流 ────────────
@@ -3844,6 +4100,46 @@ mod tests {
     use crate::agents::react_loop::{ChatMessage, LlmResponse, ToolCall, ToolChoice};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn test_collect_block_ids_for_clause_ids_aggregates_dedups() {
+        let mut clause_blocks: HashMap<String, Vec<String>> = HashMap::new();
+        clause_blocks.insert(
+            "ch_1".to_string(),
+            vec!["b_1_0".to_string(), "b_1_1".to_string()],
+        );
+        clause_blocks.insert(
+            "ch_2".to_string(),
+            vec!["b_2_0".to_string(), "b_1_1".to_string()], // b_1_1 与 ch_1 重复
+        );
+        let clause_ids = vec!["ch_1".to_string(), "ch_2".to_string()];
+        let result = collect_block_ids_for_clause_ids(&clause_ids, &clause_blocks, 10);
+        assert_eq!(result, vec!["b_1_0", "b_1_1", "b_2_0"]);
+    }
+
+    #[test]
+    fn test_collect_block_ids_for_clause_ids_respects_cap() {
+        let mut clause_blocks: HashMap<String, Vec<String>> = HashMap::new();
+        clause_blocks.insert(
+            "ch_1".to_string(),
+            vec![
+                "b_1_0".to_string(),
+                "b_1_1".to_string(),
+                "b_1_2".to_string(),
+            ],
+        );
+        let clause_ids = vec!["ch_1".to_string()];
+        let result = collect_block_ids_for_clause_ids(&clause_ids, &clause_blocks, 2);
+        assert_eq!(result, vec!["b_1_0", "b_1_1"]);
+    }
+
+    #[test]
+    fn test_collect_block_ids_for_clause_ids_unknown_clause() {
+        let clause_blocks: HashMap<String, Vec<String>> = HashMap::new();
+        let clause_ids = vec!["ch_unknown".to_string()];
+        let result = collect_block_ids_for_clause_ids(&clause_ids, &clause_blocks, 10);
+        assert!(result.is_empty());
+    }
+
     struct NoRiskLlm;
 
     struct ConditionalPanicLlm;
@@ -4110,6 +4406,7 @@ mod tests {
             review_events: None,
             metrics: None,
             shared_search_cache: Arc::new(Mutex::new(HashMap::new())),
+            clause_texts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             global_execution_limiter: Arc::new(GlobalExecutionLimiter::new(
                 crate::agents::execution_control::ExecutionLimits::default(),
             )),
@@ -4142,6 +4439,7 @@ mod tests {
             page_end: 0,
             tier: RiskTier::from_clause_text(text),
             tier_max_turns: RiskTier::from_clause_text(text).max_turns(),
+            source_block_ids: vec![],
         }
     }
 
@@ -4150,6 +4448,7 @@ mod tests {
             risk_id: risk_id.to_string(),
             clause_ids: vec![clause_id.to_string()],
             block_ids: Vec::new(),
+            highlight_rects: Vec::new(),
             agent: agent.to_string(),
             no_risk: false,
             severity: RiskSeverity::High,
@@ -4174,6 +4473,8 @@ mod tests {
             verification_required: Vec::new(),
             hypothesized_by: Vec::new(),
             verified_by: Vec::new(),
+            evidence_verdict: None,
+            verifier_reason: None,
             page_number: None,
             section_path: None,
             context: None,
@@ -5514,6 +5815,94 @@ mod tests {
             assert_eq!(node.finding.legal_basis, finding.legal_basis);
             assert_eq!(node.finding.clause_ids, finding.clause_ids);
         }
+    }
+
+    // 精确同文跨 chunk：同一句被重叠分块、同一风险被重复审出 → 合并为 1 条，clause 取并集。
+    #[test]
+    fn test_merge_v3_merges_exact_quote_across_chunks_same_category() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let quote = "本项目的液氧、医用氧产品仅限华润、林德、空气产品等品牌，其他品牌不得分。";
+        let mut f1 = make_test_finding("R_001", "ch_115", "ScoringAgent");
+        f1.category_code = "BRAND_LOCK".into();
+        f1.risk_type = "指定品牌且不接受同等产品".into();
+        f1.source_quote = quote.into();
+
+        let mut f2 = make_test_finding("R_002", "ch_116", "SemanticRiskAgent");
+        f2.category_code = "BRAND_LOCK".into();
+        f2.risk_type = "指定品牌且不接受同等产品".into();
+        f2.source_quote = quote.into();
+
+        let mut f3 = make_test_finding("R_003", "ch_122", "SemanticRiskAgent");
+        f3.category_code = "BRAND_LOCK".into();
+        f3.risk_type = "指定品牌且不接受同等产品".into();
+        f3.source_quote = quote.into();
+
+        let merged = coordinator
+            .merge_findings_v3(vec![f1, f2, f3], &|_| {})
+            .retained;
+        assert_eq!(
+            merged.len(),
+            1,
+            "同一句原文被重叠分块重复审出的同风险应合并为 1 条"
+        );
+        assert_eq!(
+            merged[0].clause_ids.len(),
+            3,
+            "跨 chunk 合并后 clause_ids 应取并集保留 3 处位置"
+        );
+    }
+
+    // 精确同文同 chunk、两个 LLM 自造码（未落入 15 类内置分类）的近义标签 → 合并为 1 条。
+    #[test]
+    fn test_merge_v3_merges_exact_quote_same_chunk_uncategorized_labels() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let quote = "（八）★投标文件中提供医用氧产品有效的《药品注册证》。";
+        let mut f1 = make_test_finding("R_001", "ch_014", "SemanticRiskAgent");
+        f1.category_code = "SR01".into();
+        f1.risk_type = "隐性排他性".into();
+        f1.source_quote = quote.into();
+
+        let mut f2 = make_test_finding("R_002", "ch_014", "DemandAgent");
+        f2.category_code = "DEMAND_EXCLUSIONARY".into();
+        f2.risk_type = "排他性条款/资格门槛过高".into();
+        f2.source_quote = quote.into();
+
+        let merged = coordinator
+            .merge_findings_v3(vec![f1, f2], &|_| {})
+            .retained;
+        assert_eq!(
+            merged.len(),
+            1,
+            "同 chunk 同原文、两个自造码近义标签应合并为 1 条"
+        );
+    }
+
+    // 精确同文但跨 chunk 且类别不同（即使都是自造码）→ 不合并，保留两个独立风险。
+    #[test]
+    fn test_merge_v3_keeps_distinct_uncategorized_issues_across_chunks() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let quote = "供应商负责对气瓶进行维护保养、定期检验并有第三方检测合格证明文件。";
+        let mut f1 = make_test_finding("R_001", "ch_032", "ContractAgent");
+        f1.category_code = "C3".into();
+        f1.risk_type = "责任转嫁/显失公平".into();
+        f1.source_quote = quote.into();
+
+        let mut f2 = make_test_finding("R_002", "ch_033", "DemandAgent");
+        f2.category_code = "CONTRACT_AMBIGUITY".into();
+        f2.risk_type = "合同履约风险".into();
+        f2.source_quote = quote.into();
+
+        let merged = coordinator
+            .merge_findings_v3(vec![f1, f2], &|_| {})
+            .retained;
+        assert_eq!(
+            merged.len(),
+            2,
+            "跨 chunk 且不同类别（即使精确同文）不得合并"
+        );
     }
 
     // ── [4b] LINK 测试 ───────────────────────────────────────

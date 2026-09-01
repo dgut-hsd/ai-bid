@@ -1,7 +1,9 @@
 import React from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
-import { Result, Button, Typography } from 'antd';
+import { Result, Button, Typography, Segmented } from 'antd';
+import { FileTextOutlined, SearchOutlined } from '@ant-design/icons';
 import { useStyles } from './style';
+import { useIsMobile } from '@/hooks/useMediaQuery';
 import PdfPreview from './components/PDFPreview/PdfPreview';
 import type { PdfPreviewRef, BBoxData } from './components/PDFPreview/PdfPreview';
 import BidAnalysis from './components/BidAnalysis/BidAnalysis';
@@ -50,14 +52,20 @@ export const DetailPage: React.FC = () => {
    const { id: bidId } = useParams<{ id: string }>();
    const navigate = useNavigate();
    const isMock = useIsMock();
+   const isMobile = useIsMobile();
+   // 移动端全屏视图切换：'pdf'（标书文档）| 'analysis'（审核分析）
+   const [mobileView, setMobileView] = React.useState<'pdf' | 'analysis'>('pdf');
    const pdfPreviewRef = React.useRef<PdfPreviewRef>(null);
    const handleLocateIssuePage = React.useCallback((page: number, highlightText?: string, fallbackTokens?: string[]) => {
       pdfPreviewRef.current?.jumpToPage(page, highlightText, fallbackTokens);
-   }, []);
+      // 移动端：从分析页定位某条风险时，自动切回文档视图以便查看高亮
+      if (isMobile) setMobileView('pdf');
+   }, [isMobile]);
 
-   const handleLocateBboxes = React.useCallback((page: number, bboxes: BBoxData[]) => {
-      pdfPreviewRef.current?.highlightBboxes(page, bboxes);
-   }, []);
+   const handleLocateBboxes = React.useCallback((page: number, bboxes: BBoxData[], highlightText?: string, fallbackTokens?: string[]) => {
+      pdfPreviewRef.current?.highlightBboxes(page, bboxes, highlightText, fallbackTokens);
+      if (isMobile) setMobileView('pdf');
+   }, [isMobile]);
 
    // 真实 API 请求（mock 模式下跳过）
    const {
@@ -97,6 +105,7 @@ export const DetailPage: React.FC = () => {
       phaseEvent,
       statsEvent,
       liveFindings,
+      failedStages,
    } = isMock ? mockAudit : realAudit;
 
    if (isLoading) {
@@ -140,17 +149,35 @@ export const DetailPage: React.FC = () => {
 
    return (
       <div className={styles.container}>
+         {isMobile && (
+            <div className={styles.mobileSwitcher}>
+               <Segmented
+                  block
+                  value={mobileView}
+                  onChange={(value) => setMobileView(value as 'pdf' | 'analysis')}
+                  options={[
+                     { label: '标书文档', value: 'pdf', icon: <FileTextOutlined /> },
+                     { label: '审核分析', value: 'analysis', icon: <SearchOutlined /> },
+                  ]}
+               />
+            </div>
+         )}
+
          <div className={styles.mainContent}>
-            <div className={styles.leftPanel}>
+            <div
+               className={styles.leftPanel}
+               style={isMobile ? { display: mobileView === 'pdf' ? 'flex' : 'none' } : undefined}
+            >
                <PdfPreview
                   ref={pdfPreviewRef}
-                  fileUrl={`/api/bid-documents/${bidData.id}/download`}
+                  fileUrl={`${import.meta.env.VITE_API_BASE_URL}/api/bid-documents/${bidData.id}/download`}
                   fileType={bidData.fileType}
                   isComplete={isComplete}
                />
             </div>
 
             <BidAnalysis
+               style={isMobile ? { display: mobileView === 'analysis' ? 'flex' : 'none' } : undefined}
                onAudit={(options) =>
                   startAudit({
                      bidId: bidData.id,
@@ -177,6 +204,7 @@ export const DetailPage: React.FC = () => {
                phaseEvent={phaseEvent}
                statsEvent={statsEvent}
                liveFindings={liveFindings}
+               failedStages={failedStages}
             />
          </div>
       </div>

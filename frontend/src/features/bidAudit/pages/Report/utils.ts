@@ -20,26 +20,26 @@ export const MOCK_REPORT: Report = {
 
 ---
 # 审核结论
-本项目标书整体结构完整，但在**预算合规性**和**法律风险**维度存在关键阻断性问题。  
+本项目标书整体结构完整，但在**品牌指定**和**程序违规**维度存在关键阻断性问题。  
 **结论建议**：修改后复审。
 
 ---
 # 问题汇总
-| 审核维度 | 严重风险 (Severe) | 警告风险 (Warning) | 提示建议 (Info) |
+| 风险类型 | 严重风险 (Severe) | 警告风险 (Warning) | 提示建议 (Info) |
 | :--- | :---: | :---: | :---: |
-| 预算合规性 | 2 | 1 | 0 |
-| 格式规范性 | 0 | 5 | 12 |
-| 法律风险 | 1 | 0 | 0 |
+| 品牌指定 | 2 | 1 | 0 |
+| 需求不清 | 0 | 5 | 12 |
+| 程序违规 | 1 | 0 | 0 |
 
 ---
 # 详细列表
 ### 1. [严重] 硬件报价超标 (第12页)
-* **维度**：预算合规性
+* **风险类型**：品牌指定
 * **问题描述**：核心交换机报价超过发改委指导价上限 15%。
 * **修改建议**：请参照《2026政务采购指导目录》调整单价，或提供特殊定价说明函。
 
 ### 2. [严重] 缺席反商业贿赂条款 (第145页)
-* **维度**：法律风险
+* **风险类型**：程序违规
 * **问题描述**：法务合规性扫描未发现标准的《反商业贿赂承诺书》。
 * **修改建议**：请在附件章节补充标准模板的承诺书并加盖公章。
 
@@ -153,6 +153,20 @@ export function parseReportSections(
    return parseMarkdownToSections(report.docContent);
 }
 
+/**
+ * 从 Markdown 报告内容中提取项目名称，用于推导默认导出文件名。
+ * 兼容两种格式：
+ *   - 后端生成："**项目名称：** 2026年度..."（冒号在星号内）
+ *   - Mock 数据："**项目名称**：2026年度..."（冒号在星号外）
+ */
+export function extractBidName(docContent: string): string | null {
+   if (!docContent) return null;
+   const match = docContent.match(/项目名称\**\s*[：:]\s*\**\s*([^\n\r]+)/);
+   if (!match) return null;
+   const value = match[1].trim().replace(/\*+$/, '').trim();
+   return value || null;
+}
+
 export async function generateWordDocument(
    htmlContent: string,
    fileName: string
@@ -170,6 +184,9 @@ export async function generateWordDocument(
              table { border-collapse: collapse; width: 100%; margin: 12pt 0; }
              th, td { border: 1px solid #000000; padding: 6pt; text-align: left; }
              th { background-color: #f2f2f2; font-weight: bold; }
+             /* 长 URL 在导出文档内换行，避免溢出页面宽度 */
+             body { overflow-wrap: break-word; }
+             a { word-break: break-all; overflow-wrap: anywhere; }
            </style>
          </head>
          <body>

@@ -76,3 +76,107 @@ impl AgentTool for OutputVerificationBatchTool {
         Ok(serde_json::json!({"status": "batch_verification_received"}))
     }
 }
+
+// ─── 测试 ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_name() {
+        let tool = OutputVerificationBatchTool;
+        assert_eq!(tool.name(), "output_verification_batch");
+    }
+
+    #[test]
+    fn test_definition_has_required_fields() {
+        let tool = OutputVerificationBatchTool;
+        let def = tool.definition();
+        let func = def.get("function").expect("缺少 function");
+        assert_eq!(func["name"], "output_verification_batch");
+        assert!(!func["description"].as_str().unwrap().is_empty());
+        let params = &func["parameters"];
+        assert_eq!(params["type"], "object");
+        let required = params["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "verifications"));
+    }
+
+    #[test]
+    fn test_execute_always_returns_received() {
+        let tool = OutputVerificationBatchTool;
+        // 即使传空 JSON，execute 也应正常返回（不做实际解析）
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(tool.execute(serde_json::json!({})));
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["status"], "batch_verification_received");
+    }
+
+    #[test]
+    fn test_execute_with_valid_batch() {
+        let tool = OutputVerificationBatchTool;
+        let args = serde_json::json!({
+            "verifications": [
+                {
+                    "risk_id": "R_001",
+                    "is_valid": true,
+                    "corrected_legal_basis": ["《政府采购法》第22条"],
+                    "confidence": 0.95,
+                    "reason": "法条引用正确，条款号匹配，时效性有效"
+                },
+                {
+                    "risk_id": "R_002",
+                    "is_valid": false,
+                    "corrected_legal_basis": ["《招标投标法》第41条"],
+                    "confidence": 0.60,
+                    "reason": "原引用的87号令第55条不适用此场景，应引用招标投标法第41条"
+                }
+            ]
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(tool.execute(args));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap()["status"], "batch_verification_received");
+    }
+
+    #[test]
+    fn test_execute_with_empty_verifications() {
+        let tool = OutputVerificationBatchTool;
+        let args = serde_json::json!({"verifications": []});
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(tool.execute(args));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap()["status"], "batch_verification_received");
+    }
+
+    #[test]
+    fn test_definition_verification_item_has_required_fields() {
+        let tool = OutputVerificationBatchTool;
+        let def = tool.definition();
+        let items = &def["function"]["parameters"]["properties"]["verifications"]["items"];
+        let required = items["required"].as_array().unwrap();
+        let required_fields: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(required_fields.contains(&"risk_id"));
+        assert!(required_fields.contains(&"is_valid"));
+        assert!(required_fields.contains(&"corrected_legal_basis"));
+        assert!(required_fields.contains(&"confidence"));
+        assert!(required_fields.contains(&"reason"));
+    }
+
+    #[test]
+    fn test_definition_confidence_bounds() {
+        let tool = OutputVerificationBatchTool;
+        let def = tool.definition();
+        let conf = &def["function"]["parameters"]["properties"]["verifications"]["items"]["properties"]["confidence"];
+        assert_eq!(conf["minimum"], 0.0);
+        assert_eq!(conf["maximum"], 1.0);
+    }
+
+    /// AgentTool trait 的基本语义测试
+    #[test]
+    fn test_tool_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<OutputVerificationBatchTool>();
+    }
+}

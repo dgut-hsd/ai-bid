@@ -12,8 +12,29 @@ export const useHeaderStyle = createStyles(({ token, css }) => ({
       height: 6vh;
       min-height: 50px !important;
       max-height: 60px !important;
+      /* 覆盖 antd Header 默认 line-height:64px，避免头像与左侧信息不在同一水平线 */
+      line-height: normal;
       top: 0;
       z-index: 999;
+   `,
+   // 左侧容器（折叠按钮 + 面包屑）：可收缩、不挤压右侧工具栏
+   headerLeft: css`
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow: hidden;
+   `,
+   // 面包屑单个条目：长文件名在此截断为省略号，而不是把顶栏撑爆
+   crumbLabel: css`
+      display: inline-block;
+      max-width: 260px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: middle;
+
+      @media (max-width: 768px) {
+         max-width: 120px;
+      }
    `,
    trigger: css`
       font-size: 1.5rem;
@@ -27,6 +48,17 @@ export const useHeaderStyle = createStyles(({ token, css }) => ({
       &:hover {
          color: ${token.colorPrimary}; /* Hover 时变为主题绿 */
          background-color: ${token.colorFillTertiary}; /* Hover 时加一点极浅的底色反馈 */
+      }
+   `,
+   userTrigger: css`
+      cursor: pointer;
+      padding: 4px 8px;
+      line-height: 1;
+      border-radius: 6px;
+      transition: background-color 0.2s ease;
+
+      &:hover {
+         background-color: ${token.colorFillTertiary};
       }
    `,
 }));

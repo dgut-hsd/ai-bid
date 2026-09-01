@@ -17,6 +17,7 @@ import com.ithsd.smart_tender.model.vo.TenantSummaryVO;
 import com.ithsd.smart_tender.model.vo.UserInfoVO;
 import com.ithsd.smart_tender.model.vo.UserLoginVO;
 import com.ithsd.smart_tender.service.TenantAuthService;
+import com.ithsd.smart_tender.service.TenantAuthorizationService;
 import com.ithsd.smart_tender.service.TenantSessionStore;
 import com.ithsd.smart_tender.service.UserService;
 import lombok.RequiredArgsConstructor;
@@ -24,7 +25,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.time.Duration;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -35,7 +35,6 @@ import java.util.UUID;
 public class TenantAuthServiceImpl implements TenantAuthService {
 
     private static final String ACTIVE = "ACTIVE";
-    private static final Map<String, List<String>> ROLE_PERMISSIONS = rolePermissions();
 
     private final UserService userService;
     private final UserMapper userMapper;
@@ -59,24 +58,37 @@ public class TenantAuthServiceImpl implements TenantAuthService {
         TenantSessionStateVO previous = currentSession(user.getId()).orElse(null);
         TenantAccess current = chooseCurrentTenant(activeTenants, previous);
         long version = nextVersion(previous);
-        TenantSessionStateVO session = sessionState(user.getId(), current, version);
-        tenantSessionStore.save(session, Duration.ofMillis(jwtTokenService.getTtlMillis()));
+        TenantSessionStateVO session = sessionState(user.getId(), current, version, UUID.randomUUID().toString());
+        tenantSessionStore.save(session, sessionTtl());
         return sessionResponse(user, activeTenants, current, session);
     }
 
     @Override
     public UserLoginVO refresh(String authorization, String requestId) {
-        TenantRequestContext context = authenticate(authorization, requestId);
-        TenantSessionStateVO previous = requireCurrentSession(context.userId(), requestId);
-        User user = activeUser(context.userId(), requestId);
+        // 容忍 access token 已过期（签名仍有效），凭 Redis 会话续期。
+        // 会话 TTL 即续期窗口上限：会话一旦过期，任何旧 token 都无法再续期。
+        TenantJwtClaims claims = parsePermissiveClaims(authorization, requestId);
+        TenantSessionStateVO previous = requireCurrentSession(claims.userId(), requestId);
+        User user = activeUser(claims.userId(), requestId);
+
+        // 会话身份必须一致才允许续期，防止用「已切租户 / 已重新登录」的旧 token 无限续期。
+        if (!java.util.Objects.equals(claims.sessionId(), previous.getSessionId())) {
+            throw error(401, "AUTH_INVALID", "会话已失效", requestId);
+        }
+        if (!java.util.Objects.equals(claims.tenantId(), previous.getCurrentTenantId())) {
+            throw error(401, "TENANT_SESSION_STALE", "租户会话已失效", requestId);
+        }
+
         List<TenantAccess> activeTenants = activeTenantsFor(user.getId());
         TenantAccess current = findTenant(activeTenants, previous.getCurrentTenantId());
         if (previous.getCurrentTenantId() != null && current == null) {
             throw error(401, "TENANT_SESSION_STALE", "租户会话已失效", requestId);
         }
 
-        TenantSessionStateVO next = sessionState(user.getId(), current, nextVersion(previous));
-        tenantSessionStore.save(next, Duration.ofMillis(jwtTokenService.getTtlMillis()));
+        // session 身份（sessionId + version）保持不变，仅重签 token 并续期会话
+        long version = previous.getSessionVersion() == null ? 1L : previous.getSessionVersion();
+        TenantSessionStateVO next = sessionState(user.getId(), current, version, previous.getSessionId());
+        tenantSessionStore.save(next, sessionTtl());
         return sessionResponse(user, activeTenants, current, next);
     }
 
@@ -102,8 +114,8 @@ public class TenantAuthServiceImpl implements TenantAuthService {
             throw error(404, "TENANT_NOT_FOUND", "租户不存在", requestId);
         }
         TenantSessionStateVO previous = requireCurrentSession(user.getId(), requestId);
-        TenantSessionStateVO next = sessionState(user.getId(), current, nextVersion(previous));
-        tenantSessionStore.save(next, Duration.ofMillis(jwtTokenService.getTtlMillis()));
+        TenantSessionStateVO next = sessionState(user.getId(), current, nextVersion(previous), UUID.randomUUID().toString());
+        tenantSessionStore.save(next, sessionTtl());
         return sessionResponse(user, activeTenants, current, next);
     }
 
@@ -130,9 +142,10 @@ public class TenantAuthServiceImpl implements TenantAuthService {
         }
 
         User user = activeUser(claims.userId(), normalizedRequestId);
+        boolean platformAdmin = isPlatformAdmin(user);
         if (claims.tenantId() == null) {
             return new TenantRequestContext(
-                    user.getId(), null, null, claims.sessionVersion(), normalizedRequestId);
+                    user.getId(), null, null, claims.sessionVersion(), normalizedRequestId, platformAdmin);
         }
 
         Tenant tenant = tenantMapper.selectById(claims.tenantId());
@@ -143,7 +156,8 @@ public class TenantAuthServiceImpl implements TenantAuthService {
             throw error(401, "TENANT_SESSION_STALE", "租户会话已失效", normalizedRequestId);
         }
         return new TenantRequestContext(
-                user.getId(), tenant.getId(), member.getRole(), claims.sessionVersion(), normalizedRequestId);
+                user.getId(), tenant.getId(), member.getRole(), claims.sessionVersion(), normalizedRequestId,
+                platformAdmin);
     }
 
     private User activeUser(Long userId, String requestId) {
@@ -184,7 +198,7 @@ public class TenantAuthServiceImpl implements TenantAuthService {
         if (tenant == null || member.getTenantId() == null || !member.getTenantId().equals(tenant.getId())) {
             return null;
         }
-        List<String> permissions = ROLE_PERMISSIONS.getOrDefault(member.getRole(), List.of());
+        List<String> permissions = TenantAuthorizationService.permissionsFor(member.getRole());
         return new TenantAccess(tenant, member, permissions);
     }
 
@@ -208,15 +222,31 @@ public class TenantAuthServiceImpl implements TenantAuthService {
                 .orElse(null);
     }
 
-    private TenantSessionStateVO sessionState(Long userId, TenantAccess current, long version) {
+    private TenantSessionStateVO sessionState(Long userId, TenantAccess current, long version, String sessionId) {
         return TenantSessionStateVO.builder()
                 .userId(userId)
                 .currentTenantId(current == null ? null : current.tenant().getId())
                 .role(current == null ? "" : current.member().getRole())
                 .permissions(current == null ? List.of() : current.permissions())
                 .sessionVersion(version)
-                .sessionId(UUID.randomUUID().toString())
+                .sessionId(sessionId)
                 .build();
+    }
+
+    /** 续期窗口上限：access token 可有 24h，但会话只需在 7 天内续期一次即可维持登录。 */
+    private Duration sessionTtl() {
+        return Duration.ofMillis(jwtTokenService.getSessionTtlMillis());
+    }
+
+    /** 解析 refresh 用的 bearer token，容忍「签名有效、仅 exp 过期」；签名/格式错误仍抛 401。 */
+    private TenantJwtClaims parsePermissiveClaims(String authorization, String requestId) {
+        String normalizedRequestId = normalizeRequestId(requestId);
+        String token = bearerToken(authorization, normalizedRequestId);
+        try {
+            return jwtTokenService.parsePermissive(token);
+        } catch (RuntimeException ex) {
+            throw error(401, "AUTH_INVALID", "token 无效", normalizedRequestId);
+        }
     }
 
     private UserLoginVO sessionResponse(
@@ -245,6 +275,7 @@ public class TenantAuthServiceImpl implements TenantAuthService {
                         .id(user.getId())
                         .username(user.getUsername())
                         .realName(user.getRealName())
+                        .isPlatformAdmin(isPlatformAdmin(user))
                         .build())
                 .currentTenant(current == null ? null : summary(current, true))
                 .tenants(summaries)
@@ -309,21 +340,8 @@ public class TenantAuthServiceImpl implements TenantAuthService {
         return new TenantAuthException(status, code, message, normalizeRequestId(requestId), Map.of());
     }
 
-    private static Map<String, List<String>> rolePermissions() {
-        Map<String, List<String>> permissions = new LinkedHashMap<>();
-        permissions.put("OWNER", List.of(
-                "tenant.read", "tenant.settings.write", "tenant.members.invite", "tenant.members.remove",
-                "tenant.members.role.write", "tenant.owner.transfer", "tender.write", "audit.start",
-                "audit.report.read", "knowledge.write", "tenant.delete"));
-        permissions.put("ADMIN", List.of(
-                "tenant.read", "tenant.settings.write", "tenant.members.invite", "tenant.members.remove",
-                "tenant.members.role.write", "tender.write", "audit.start", "audit.report.read", "knowledge.write"));
-        permissions.put("AUDITOR", List.of(
-                "tenant.read", "tender.write", "audit.start", "audit.report.read", "knowledge.write"));
-        permissions.put("MEMBER", List.of(
-                "tenant.read", "tender.write", "audit.start", "audit.report.read", "knowledge.write"));
-        permissions.put("VIEWER", List.of("tenant.read", "audit.report.read"));
-        return Map.copyOf(permissions);
+    private static boolean isPlatformAdmin(User user) {
+        return user != null && Boolean.TRUE.equals(user.getIsPlatformAdmin());
     }
 
     private record TenantAccess(Tenant tenant, TenantMember member, List<String> permissions) {

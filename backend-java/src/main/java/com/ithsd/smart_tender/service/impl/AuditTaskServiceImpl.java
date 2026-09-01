@@ -4,8 +4,6 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.ithsd.smart_tender.common.BaseContext;
 import com.ithsd.smart_tender.common.BizException;
 import com.ithsd.smart_tender.common.TenantAuthException;
-import com.ithsd.smart_tender.common.TenantContext;
-import com.ithsd.smart_tender.common.TenantContextSnapshot;
 import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
 import com.ithsd.smart_tender.mapper.KnowledgeFileMapper;
@@ -25,11 +23,15 @@ import com.ithsd.smart_tender.model.vo.SummaryVO;
 import com.ithsd.smart_tender.service.AuditTaskService;
 import com.ithsd.smart_tender.service.TenderService;
 import com.ithsd.smart_tender.service.engine.queue.AuditTaskDispatcher;
+import com.ithsd.smart_tender.service.engine.queue.AuditTaskEnvelope;
 import com.ithsd.smart_tender.service.engine.rust.RustApiClient;
 import com.ithsd.smart_tender.model.dto.rust.RustBlockBBoxResponse;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewResponse;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewResultResponse;
 import com.ithsd.smart_tender.model.dto.rust.RustRiskFinding;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.ithsd.smart_tender.sse.AuditTaskEventService;
 import com.ithsd.smart_tender.sse.ReplaySseEvent;
 import com.ithsd.smart_tender.sse.SseHub;
@@ -67,6 +69,10 @@ public class AuditTaskServiceImpl implements AuditTaskService {
     private final KnowledgeFileMapper knowledgeFileMapper;
     private final RustApiClient rustApiClient;
 
+    /** DB 回退反序列化 bbox JSON 用；与 RustApiClient / AuditEngineServiceImpl 同为 SNAKE_CASE */
+    private static final ObjectMapper JSON = new ObjectMapper()
+            .setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
+
     public AuditTaskServiceImpl(
             AuditTaskMapper auditTaskMapper, AuditIssueMapper auditIssueMapper,
             TenderService tenderService,
@@ -95,6 +101,15 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         if (tender == null) {
             throw TenantScope.resourceNotFound();
         }
+        // 去重：同一标书若已有「进行中/待调度」的审核任务，直接复用该任务，
+        // 避免前端重复点击 / 重复提交制造出多个并发任务，进而在 Rust 侧撞
+        // 「该文档已有进行中的审核任务」冲突而被快速失败。
+        AuditTask inProgress = findInProgressTaskByBidId(request.getBidId(), tenantId);
+        if (inProgress != null) {
+            log.info("重复提交已拦截：同一标书已有进行中的审核任务，复用 taskId={}, bidId={}",
+                    inProgress.getTaskId(), request.getBidId());
+            return new AuditTaskCreateVO(inProgress.getTaskId());
+        }
         LocalDateTime now = LocalDateTime.now();
         AuditTask entity = AuditTask.builder()
                 .tenantId(tenantId)
@@ -117,16 +132,11 @@ public class AuditTaskServiceImpl implements AuditTaskService {
 
         // 必须在当前事务提交后再 dispatch，否则 @Async 线程查不到刚插入的 task
         final String taskId = entity.getTaskId();
-        final TenantContextSnapshot ctxSnapshot = TenantContext.snapshot();
+        final AuditTaskEnvelope envelope = AuditTaskEnvelope.capture(taskId);
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                TenantContext.set(ctxSnapshot != null ? ctxSnapshot.toContext() : null);
-                try {
-                    taskDispatcher.dispatch(taskId);
-                } finally {
-                    TenantContext.clear();
-                }
+                taskDispatcher.dispatch(envelope);
             }
         });
         return new AuditTaskCreateVO(entity.getTaskId());
@@ -136,6 +146,39 @@ public class AuditTaskServiceImpl implements AuditTaskService {
     @Transactional(readOnly = true)
     public AuditTaskStatusVO getStatus(String taskId) {
         AuditTask task = loadTask(taskId);
+        return buildStatusVO(task);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public AuditTaskStatusVO getStatusByBid(Long bidId) {
+        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                .eq(Tender::getId, bidId)
+                .eq(Tender::getTenantId, TenantScope.requiredTenantId()));
+        if (tender == null) {
+            throw TenantScope.resourceNotFound();
+        }
+        AuditTask task = findLatestTaskByBidId(bidId);
+        if (task == null) {
+            // 该文档从未发起过审核：返回空任务标识，前端据此显示「准备审核」
+            AuditTaskStatusVO vo = new AuditTaskStatusVO();
+            vo.setStatus("pending");
+            vo.setStage(null);
+            vo.setProgress(0);
+            vo.setIssueCount(0);
+            vo.setFailedStages(List.of());
+            fillCounts(vo);
+            return vo;
+        }
+        // 复用 loadTask 的归属校验：任务创建者或标书上传者
+        Long currentUserId = BaseContext.getCurrentId();
+        if (currentUserId != null && !isTaskOwner(task, currentUserId)) {
+            throw new BizException(403, "无权访问该任务");
+        }
+        return buildStatusVO(task);
+    }
+
+    private AuditTaskStatusVO buildStatusVO(AuditTask task) {
         AuditTaskStatusVO vo = new AuditTaskStatusVO();
         vo.setTaskId(task.getTaskId());
         vo.setStatus(AuditTaskStatusEnum.fromCode(task.getTaskStatus()).getValue());
@@ -143,6 +186,11 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         vo.setProgress(task.getProgress());
         vo.setIssueCount(0); // 不再从 DB 读 issue count，前端从 /result 获取
         vo.setFailedStages(task.getFailedStages() == null ? List.of() : task.getFailedStages());
+        fillCounts(vo);
+        return vo;
+    }
+
+    private void fillCounts(AuditTaskStatusVO vo) {
         Long tenantId = TenantScope.requiredTenantId();
         vo.setTotalFileCount(auditTaskMapper.selectCount(new LambdaQueryWrapper<AuditTask>()
                 .eq(AuditTask::getTenantId, tenantId)));
@@ -155,49 +203,55 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         vo.setFailedFileCount(defLong(auditTaskMapper.selectCount(new LambdaQueryWrapper<AuditTask>()
                 .eq(AuditTask::getTenantId, tenantId)
                 .eq(AuditTask::getTaskStatus, AuditTaskStatusEnum.FAILED.getCode()))));
-        return vo;
+    }
+
+    private AuditTask findLatestTaskByBidId(Long bidId) {
+        return auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getBidId, bidId)
+                .eq(AuditTask::getTenantId, TenantScope.requiredTenantId())
+                .orderByDesc(AuditTask::getCreateTime)
+                .last("LIMIT 1"));
+    }
+
+    /**
+     * 查找同一标书下「待调度(PENDING)/进行中(PROCESSING)」的审核任务。
+     * 用于 {@link #createTask} 去重：存在则复用，不再新建。
+     */
+    private AuditTask findInProgressTaskByBidId(Long bidId, Long tenantId) {
+        return auditTaskMapper.selectOne(new LambdaQueryWrapper<AuditTask>()
+                .eq(AuditTask::getBidId, bidId)
+                .eq(AuditTask::getTenantId, tenantId)
+                .in(AuditTask::getTaskStatus,
+                        AuditTaskStatusEnum.PENDING.getCode(),
+                        AuditTaskStatusEnum.PROCESSING.getCode())
+                .orderByDesc(AuditTask::getCreateTime)
+                .last("LIMIT 1"));
     }
 
     @Override
     @Transactional(readOnly = true)
     public ResultVO getResult(String taskId, Integer page, Integer size, String sinceIssueNo) {
         AuditTask task = loadTask(taskId);
+        boolean completed = AuditTaskStatusEnum.COMPLETED.getCode().equals(task.getTaskStatus());
 
-        // 任务未完成 → 返回空结果，由前端 polling 刷新
-        if (!AuditTaskStatusEnum.COMPLETED.getCode().equals(task.getTaskStatus())) {
-            ResultVO vo = new ResultVO();
-            vo.setTaskId(task.getTaskId());
-            vo.setAuditResult("pending");
-            vo.setSummary(new SummaryVO());
-            vo.setIssues(List.of());
-            return vo;
-        }
-
-        // 获取 Rust 侧 document_id
-        Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
-                .eq(Tender::getId, task.getBidId())
-                .eq(Tender::getTenantId, TenantScope.requiredTenantId()));
-        if (tender == null || !StringUtils.hasText(tender.getRustDocumentId())) {
-            log.warn("getResult: no rustDocumentId for taskId={}, bidId={}", taskId, task.getBidId());
-            ResultVO vo = new ResultVO();
-            vo.setTaskId(task.getTaskId());
-            vo.setAuditResult("pending");
-            vo.setSummary(new SummaryVO());
-            vo.setIssues(List.of());
-            return vo;
-        }
-
-        // 尝试从 Rust 获取结果（内存缓存），失败则回退到 DB
+        // Rust 内存结果仅对「已完成」任务有意义；进行中任务直接走 DB 增量结果（P2）
         RustReviewResponse review = null;
-        try {
-            RustReviewResultResponse rustResult =
-                rustApiClient.getReviewResult(tender.getRustDocumentId());
-            if (rustResult != null && rustResult.isCompleted()) {
-                review = rustResult.getResult();
+        if (completed) {
+            Tender tender = tenderMapper.selectOne(new LambdaQueryWrapper<Tender>()
+                    .eq(Tender::getId, task.getBidId())
+                    .eq(Tender::getTenantId, TenantScope.requiredTenantId()));
+            if (tender != null && StringUtils.hasText(tender.getRustDocumentId())) {
+                try {
+                    RustReviewResultResponse rustResult =
+                        rustApiClient.getReviewResult(tender.getRustDocumentId());
+                    if (rustResult != null && (rustResult.isCompleted() || rustResult.isPartialFailed())) {
+                        review = rustResult.getResult();
+                    }
+                } catch (Exception e) {
+                    log.info("getResult: Rust unavailable (may have restarted), falling back to DB: {}",
+                            e.getMessage());
+                }
             }
-        } catch (Exception e) {
-            log.info("getResult: Rust unavailable (may have restarted), falling back to DB: {}",
-                    e.getMessage());
         }
 
         // 构建 ResultVO
@@ -210,13 +264,14 @@ public class AuditTaskServiceImpl implements AuditTaskService {
             allFindings = review.getFindings().stream()
                     .filter(f -> !f.shouldSkip()).collect(Collectors.toList());
         } else {
-            // Rust 重启了 → 从 audit_issue 表重建
+            // P2: 统一从 audit_issue 读（含进行中的增量结果 + 完成后的最终结果）
             List<AuditIssue> dbIssues = auditIssueMapper.selectList(
                     new LambdaQueryWrapper<AuditIssue>()
-                            .eq(AuditIssue::getAuditId, task.getId()));
+                            .eq(AuditIssue::getAuditId, task.getId())
+                            .eq(AuditIssue::getTenantId, task.getTenantId()));
             allFindings = dbIssues.stream().map(i -> {
                 RustRiskFinding f = new RustRiskFinding();
-                f.setRiskId(i.getIssueNo());
+                f.setRiskId(i.getRiskId() != null ? i.getRiskId() : i.getIssueNo());
                 f.setRiskType(i.getCategory());
                 f.setSeverity(i.getSeverity());
                 f.setCritical(Boolean.TRUE.equals(i.getIsCritical()));
@@ -230,12 +285,15 @@ public class AuditTaskServiceImpl implements AuditTaskService {
                 }
                 f.setSectionPath(i.getSectionName() != null
                         ? java.util.List.of(i.getSectionName().split(" > ")) : null);
+                f.setConfidence(i.getConfidence() != null ? i.getConfidence().floatValue() : 0f);
+                f.setBlockIds(parseStringList(i.getBlockIds()));
+                f.setHighlightRects(parseHighlightRects(i.getHighlightRects()));
                 return f;
             }).collect(Collectors.toList());
-            log.info("getResult: restored {} findings from DB for taskId={}", allFindings.size(), taskId);
+            log.info("getResult: {} findings from DB for taskId={} (completed={})", allFindings.size(), taskId, completed);
         }
 
-        vo.setAuditResult(allFindings.isEmpty() ? "pass" : "revise");
+        vo.setAuditResult(!completed ? "pending" : (allFindings.isEmpty() ? "pass" : "revise"));
 
         // 4 级统计
         SummaryVO summary = buildSummary(allFindings);
@@ -435,6 +493,26 @@ public class AuditTaskServiceImpl implements AuditTaskService {
 
     // ── 映射 ────────────────────────────────────────────────────────
 
+    private static List<String> parseStringList(String json) {
+        if (!StringUtils.hasText(json)) return new ArrayList<>();
+        try {
+            return JSON.readValue(json, new TypeReference<List<String>>() {});
+        } catch (Exception e) {
+            log.warn("parse blockIds JSON failed: {}", e.getMessage());
+            return new ArrayList<>();
+        }
+    }
+
+    private static List<RustRiskFinding.RustHighlightRect> parseHighlightRects(String json) {
+        if (!StringUtils.hasText(json)) return new ArrayList<>();
+        try {
+            return JSON.readValue(json, new TypeReference<List<RustRiskFinding.RustHighlightRect>>() {});
+        } catch (Exception e) {
+            log.warn("parse highlightRects JSON failed: {}", e.getMessage());
+            return new ArrayList<>();
+        }
+    }
+
     /**
      * 从 RustRiskFinding 直接映射为前端 IssueVO（不再经过 DB Entity）。
      */
@@ -480,8 +558,24 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         vo.setFinalTier(f.getFinalTier());
         vo.setTierEscalated(f.isTierEscalated());
         vo.setTruncated(f.isTruncated());
+        vo.setVerifierReason(f.getVerifierReason());
+        vo.setEvidenceVerdict(f.getEvidenceVerdict());
         vo.setClauseIds(f.getClauseIds());
         vo.setBlockIds(f.getBlockIds());
+        // 词级精确高亮矩形（非空时前端跳过段落级 block 与文本层收敛，直接渲染）
+        if (f.getHighlightRects() != null && !f.getHighlightRects().isEmpty()) {
+            List<IssueVO.HighlightRectVO> rects = f.getHighlightRects().stream().map(r -> {
+                IssueVO.HighlightRectVO rv = new IssueVO.HighlightRectVO();
+                rv.setPage(r.getPage());
+                rv.setX0(r.getX0());
+                rv.setTop(r.getTop());
+                rv.setX1(r.getX1());
+                rv.setBottom(r.getBottom());
+                rv.setPageWidth(r.getPageWidth());
+                return rv;
+            }).collect(Collectors.toList());
+            vo.setHighlightRects(rects);
+        }
         vo.setAgent(f.getAgent());
 
         // Citations

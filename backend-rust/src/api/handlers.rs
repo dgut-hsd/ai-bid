@@ -6,10 +6,11 @@
 //! 3. 格式化 HTTP 响应（JSON + 状态码）
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{Extension, Multipart, Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
@@ -26,42 +27,42 @@ use crate::agents::session_graph::SessionGraph;
 use crate::agents::tools::{
     ToolRegistry,
     answer_user::AnswerUserTool,
-    output_finding::OutputFindingTool,
-    read_section::ReadSectionTool,
-    search_document::SearchDocumentTool,
-    search_knowledge::{DashScopeSearchBackend, SearchKnowledgeTool},
-    search_knowledge_base::SearchKnowledgeBaseTool,
-    // V2+ 工具
-    compare_versions::CompareVersionsTool,
-    detect_boilerplate::DetectBoilerplateTool,
-    // V3 采购程序合规审查
-    verify_procurement_method::VerifyProcurementMethodTool,
-    verify_bid_deposit::VerifyBidDepositTool,
-    verify_announcement_period::VerifyAnnouncementPeriodTool,
-    verify_bid_preparation_period::VerifyBidPreparationPeriodTool,
-    // V4 评审标准审查
-    validate_scoring_formula::ValidateScoringFormulaTool,
-    validate_weight_distribution::ValidateWeightDistributionTool,
-    detect_subjective_scoring::DetectSubjectiveScoringTool,
-    check_scoring_completeness::CheckScoringCompletenessTool,
-    check_imported_products::CheckImportedProductsTool,
-    verify_consortium_rules::VerifyConsortiumRulesTool,
     // 零依赖计算/检查工具
     calculate_timeline::CalculateTimelineTool,
     // 依赖 chunk 数据的工具
     check_cross_reference::CheckCrossReferenceTool,
+    check_imported_products::CheckImportedProductsTool,
+    check_scoring_completeness::CheckScoringCompletenessTool,
+    // V2+ 工具
+    compare_versions::CompareVersionsTool,
+    compare_with_template::{ChunkTextProvider, CompareWithTemplateTool, TemplateStore},
+    detect_boilerplate::DetectBoilerplateTool,
+    detect_subjective_scoring::DetectSubjectiveScoringTool,
     extract_obligations::ExtractObligationsTool,
-    compare_with_template::{CompareWithTemplateTool, ChunkTextProvider, TemplateStore},
-    validate_calculation::ValidateCalculationTool,
+    output_finding::OutputFindingTool,
+    read_section::ReadSectionTool,
     search_contradiction::SearchContradictionTool,
+    search_document::SearchDocumentTool,
+    search_knowledge::{DashScopeSearchBackend, SearchKnowledgeTool},
+    search_knowledge_base::SearchKnowledgeBaseTool,
+    validate_calculation::ValidateCalculationTool,
+    // V4 评审标准审查
+    validate_scoring_formula::ValidateScoringFormulaTool,
+    validate_weight_distribution::ValidateWeightDistributionTool,
+    verify_announcement_period::VerifyAnnouncementPeriodTool,
+    verify_bid_deposit::VerifyBidDepositTool,
+    verify_bid_preparation_period::VerifyBidPreparationPeriodTool,
+    verify_consortium_rules::VerifyConsortiumRulesTool,
+    // V3 采购程序合规审查
+    verify_procurement_method::VerifyProcurementMethodTool,
 };
 use crate::agents::trace::TraceLog;
 use crate::agents::types::{
     AgentId, ChatAgentConfig, ChatResponse, ChatStreamEvent, CoordinatorConfig, CoordinatorOutput,
-    GraphSnapshot, ReviewClause, RiskFinding, TextSelection,
+    GraphSnapshot, HighlightRect, ReviewClause, RiskFinding, TextSelection,
 };
 use crate::domain::chunk::{Chunk, ChunkingConfig};
-use crate::domain::raw_document::RawDocument;
+use crate::domain::raw_document::{BBox, RawDocument};
 use crate::domain::vector_index::DocumentVectorIndex;
 use crate::paths::data_path_str;
 use crate::services::chunking_service::chunk_sections;
@@ -82,6 +83,18 @@ fn review_event_capacity() -> usize {
         .unwrap_or(4096)
         .clamp(256, 32768)
 }
+
+/// P2 实验开关：`AIBID_COMPRESS_TRANSCRIPT=1` 时压缩 assistant 冗长推理独白。
+/// 非法值视为关闭——保守默认，A/B 基线组（control）不受影响。
+fn transcript_compression_enabled() -> bool {
+    parse_transcript_compression(std::env::var("AIBID_COMPRESS_TRANSCRIPT").ok().as_deref())
+}
+
+/// 纯解析函数（便于单测）：仅 `1`/`true`/`on` 视为开启。
+fn parse_transcript_compression(value: Option<&str>) -> bool {
+    matches!(value, Some("1") | Some("true") | Some("on"))
+}
+
 use crate::services::sectionize_service::{self, Section};
 
 /// Authenticated Java → Rust request identity made available to handlers via
@@ -95,6 +108,85 @@ pub struct InternalRequestContext {
     pub body_sha256: String,
 }
 
+/// Explicit tenant/document composite key used for every in-memory document
+/// and review resource. A document ID is only meaningful inside its tenant.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DocumentKey {
+    pub tenant_id: String,
+    pub document_id: String,
+}
+
+impl DocumentKey {
+    pub fn new(tenant_id: impl Into<String>, document_id: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            document_id: document_id.into(),
+        }
+    }
+}
+
+/// Tenant IDs are decimal strings in the Java/Rust internal contract. Keeping
+/// this check next to path construction prevents an untrusted header from
+/// becoming a filesystem component.
+pub(crate) fn is_valid_tenant_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_safe_document_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn document_key(
+    context: &InternalRequestContext,
+    document_id: &str,
+) -> Result<DocumentKey, (StatusCode, Json<ErrorResponse>)> {
+    if !is_valid_tenant_id(&context.tenant_id) || !is_safe_document_id(document_id) {
+        return Err(document_not_found());
+    }
+    Ok(DocumentKey::new(
+        context.tenant_id.clone(),
+        document_id.to_string(),
+    ))
+}
+
+fn tenant_output_path(tenant_id: &str, relative: &str) -> Option<PathBuf> {
+    if !is_valid_tenant_id(tenant_id) || relative.is_empty() {
+        return None;
+    }
+    let root = PathBuf::from(data_path_str("output/tenants"));
+    let namespace = root.join(tenant_id);
+    let candidate = namespace.join(relative);
+    candidate.starts_with(&namespace).then_some(candidate)
+}
+
+fn tenant_document_path(
+    tenant_id: &str,
+    relative_dir: &str,
+    document_id: &str,
+    suffix: &str,
+) -> Option<PathBuf> {
+    if !is_safe_document_id(document_id) {
+        return None;
+    }
+    let dir = tenant_output_path(tenant_id, relative_dir)?;
+    let candidate = dir.join(format!("{document_id}{suffix}"));
+    candidate.starts_with(&dir).then_some(candidate)
+}
+
+async fn load_document(
+    state: &AppState,
+    key: &DocumentKey,
+) -> Result<Arc<DocumentState>, (StatusCode, Json<ErrorResponse>)> {
+    let docs = state.documents.read().await;
+    docs.get(key)
+        .filter(|document| document.tenant_id == key.tenant_id)
+        .cloned()
+        .ok_or_else(document_not_found)
+}
+
 // ─── 应用状态 ───────────────────────────────────────────────────────
 
 /// 服务全局共享状态。
@@ -102,8 +194,8 @@ pub struct InternalRequestContext {
 pub struct AppState {
     /// 全进程共享的审核并发额度，所有文档和阶段共同竞争。
     pub review_execution_limiter: Arc<crate::agents::execution_control::GlobalExecutionLimiter>,
-    /// 文档缓存：document_id → 已处理文档
-    pub documents: Arc<TokioRwLock<HashMap<String, Arc<DocumentState>>>>,
+    /// 文档缓存：(tenant_id, document_id) → 已处理文档
+    pub documents: Arc<TokioRwLock<HashMap<DocumentKey, Arc<DocumentState>>>>,
     /// 嵌入客户端（BGE-M3，启动时加载一次）
     pub embed_client: Arc<StdMutex<Option<Arc<EmbeddingClient>>>>,
     /// DashScope 联网搜索
@@ -112,22 +204,23 @@ pub struct AppState {
     pub search_backend: String,
     /// 嵌入引擎类型（local / remote）
     pub embed_engine: String,
-    /// SSE 实时推送通道：doc_id → ReviewEventBus
-    pub review_event_buses: Arc<TokioMutex<HashMap<String, Arc<ReviewEventBus>>>>,
-    /// 异步审查结果缓存：doc_id → CoordinatorOutput
-    pub review_results: Arc<TokioMutex<HashMap<String, CoordinatorOutput>>>,
-    /// 异步审查的 token/成本统计：doc_id → ReviewUsage
-    pub review_usages: Arc<TokioMutex<HashMap<String, ReviewUsage>>>,
-    /// 异步审查失败信息：doc_id → 错误消息
-    pub review_errors: Arc<TokioMutex<HashMap<String, String>>>,
-    /// 正在执行的审核任务：doc_id（用于并发控制，防止重复提交）
-    pub active_reviews: Arc<TokioMutex<HashSet<String>>>,
+    /// SSE 实时推送通道：(tenant_id, document_id) → ReviewEventBus
+    pub review_event_buses: Arc<TokioMutex<HashMap<DocumentKey, Arc<ReviewEventBus>>>>,
+    /// 异步审查结果缓存：(tenant_id, document_id) → CoordinatorOutput
+    pub review_results: Arc<TokioMutex<HashMap<DocumentKey, CoordinatorOutput>>>,
+    /// 异步审查的 token/成本统计：(tenant_id, document_id) → ReviewUsage
+    pub review_usages: Arc<TokioMutex<HashMap<DocumentKey, ReviewUsage>>>,
+    /// 异步审查失败信息：(tenant_id, document_id) → 错误消息
+    pub review_errors: Arc<TokioMutex<HashMap<DocumentKey, String>>>,
+    /// 正在执行的审核任务：(tenant_id, document_id)（用于并发控制）
+    pub active_reviews: Arc<TokioMutex<HashSet<DocumentKey>>>,
 }
 
 use std::sync::Mutex as StdMutex;
 
 /// 单个文档的处理状态。
 pub struct DocumentState {
+    pub tenant_id: String,
     pub id: String,
     pub filename: String,
     pub stem: String,
@@ -178,6 +271,139 @@ impl AppState {
             review_errors: Arc::new(TokioMutex::new(HashMap::new())),
             active_reviews: Arc::new(TokioMutex::new(HashSet::new())),
         })
+    }
+}
+
+/// 单文档「重启后可重建内存态」的持久化清单。
+///
+/// 补上进程内才有、此前未落盘的字段：原文件名、脱敏副本、脱敏映射。
+/// raw_json / sections / chunks / embeddings 已各自落盘，由清单按 stem 串联恢复。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentManifest {
+    pub document_id: String,
+    pub filename: String,
+    pub stem: String,
+    pub desensitization_summary: DesensitizationSummary,
+    pub review_chunks: Vec<Chunk>,
+    pub redaction_vault: RedactionVault,
+}
+
+/// 从磁盘整体重建单个文档的内存态。任一份必要文件缺失/损坏即返回 None
+/// （跳过该文档，不阻塞其余文档恢复）。
+///
+/// `data_root` 为 `output/tenants`，目录约定与 process_document 写盘一致：
+/// ```text
+/// {data_root}/{tenant}/{raw_json|sections|chunks}/{stem}_*.json
+/// {data_root}/{tenant}/embeddings/{stem}_embedding_index/
+/// {data_root}/{tenant}/documents/{stem}_manifest.json
+/// ```
+pub(crate) fn rebuild_document_state(
+    data_root: &std::path::Path,
+    tenant_id: &str,
+    stem: &str,
+) -> Option<DocumentState> {
+    let tenant_dir = data_root.join(tenant_id);
+
+    let manifest_json = std::fs::read_to_string(
+        tenant_dir
+            .join("documents")
+            .join(format!("{stem}_manifest.json")),
+    )
+    .ok()?;
+    let DocumentManifest {
+        document_id,
+        filename,
+        stem: manifest_stem,
+        desensitization_summary,
+        review_chunks,
+        redaction_vault,
+    } = serde_json::from_str(&manifest_json).ok()?;
+
+    let raw_path = tenant_dir.join("raw_json").join(format!("{stem}_raw.json"));
+    let sections_path = tenant_dir
+        .join("sections")
+        .join(format!("{stem}_sections.json"));
+    let chunks_path = tenant_dir
+        .join("chunks")
+        .join(format!("{stem}_chunks.json"));
+
+    let raw_doc: RawDocument =
+        serde_json::from_str(&std::fs::read_to_string(&raw_path).ok()?).ok()?;
+    let sections: Vec<Section> =
+        serde_json::from_str(&std::fs::read_to_string(&sections_path).ok()?).ok()?;
+    let chunks: Vec<Chunk> =
+        serde_json::from_str(&std::fs::read_to_string(&chunks_path).ok()?).ok()?;
+
+    let embeddings_dir = tenant_dir.join("embeddings");
+    let doc_index = crate::services::embedding_service::load_index(
+        embeddings_dir.to_string_lossy().as_ref(),
+        stem,
+    )
+    .ok()?;
+
+    let chunk_map: HashMap<String, Chunk> = chunks
+        .iter()
+        .map(|c| (c.chunk_id.clone(), c.clone()))
+        .collect();
+    let review_chunk_map: HashMap<String, Chunk> = review_chunks
+        .iter()
+        .map(|c| (c.chunk_id.clone(), c.clone()))
+        .collect();
+    let chunk_order: Vec<String> = chunks.iter().map(|c| c.chunk_id.clone()).collect();
+
+    Some(DocumentState {
+        tenant_id: tenant_id.to_string(),
+        id: document_id,
+        filename,
+        stem: manifest_stem,
+        raw_doc,
+        sections,
+        chunks,
+        review_chunks,
+        chunk_map: Arc::new(chunk_map),
+        review_chunk_map: Arc::new(review_chunk_map),
+        chunk_order: Arc::new(chunk_order),
+        doc_index: Arc::new(doc_index),
+        redaction_vault: Arc::new(redaction_vault),
+        desensitization_summary,
+    })
+}
+
+impl AppState {
+    /// 启动时扫描 `output/tenants/*/documents/*_manifest.json`，把已处理文档
+    /// 从磁盘恢复到内存注册表，避免容器重启后文档「丢失」触发 Java 重传、
+    /// 进而生成新 doc UUID 破坏 A/B 可比性。返回成功恢复的文档数。
+    pub async fn reload_persisted_documents(&self) -> usize {
+        let base = PathBuf::from(data_path_str("output/tenants"));
+        let mut restored = 0usize;
+        let Ok(tenants) = std::fs::read_dir(&base) else {
+            return 0;
+        };
+        for tenant in tenants.flatten() {
+            let tenant_id = tenant.file_name().to_string_lossy().to_string();
+            if !is_valid_tenant_id(&tenant_id) {
+                continue;
+            }
+            let docs_dir = tenant.path().join("documents");
+            let Ok(manifests) = std::fs::read_dir(&docs_dir) else {
+                continue;
+            };
+            for entry in manifests.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let Some(stem) = name.strip_suffix("_manifest.json") else {
+                    continue;
+                };
+                if !is_safe_document_id(stem) {
+                    continue;
+                }
+                if let Some(state) = rebuild_document_state(&base, &tenant_id, stem) {
+                    let key = DocumentKey::new(tenant_id.clone(), state.id.clone());
+                    self.documents.write().await.insert(key, Arc::new(state));
+                    restored += 1;
+                }
+            }
+        }
+        restored
     }
 }
 
@@ -341,53 +567,42 @@ fn sync_confirmed_findings(
     SessionGraph::sync_snapshot_confirmed_findings(snapshot, findings)
 }
 
-fn review_result_path(doc_id: &str) -> String {
-    format!(
-        "{}/{}_result.json",
-        data_path_str("output/findings"),
-        doc_id
-    )
-}
-
 #[derive(Debug, Clone)]
 struct ReviewArtifactPaths {
-    findings: String,
-    routing_summary: String,
-    graph_snapshot: String,
-    result: String,
+    findings: PathBuf,
+    routing_summary: PathBuf,
+    graph_snapshot: PathBuf,
+    result: PathBuf,
 }
 
 impl ReviewArtifactPaths {
-    fn all(&self) -> [&str; 4] {
+    fn all(&self) -> [&std::path::Path; 4] {
         [
-            &self.findings,
-            &self.routing_summary,
-            &self.graph_snapshot,
-            &self.result,
+            self.findings.as_path(),
+            self.routing_summary.as_path(),
+            self.graph_snapshot.as_path(),
+            self.result.as_path(),
         ]
     }
 }
 
-fn review_artifact_paths(doc_id: &str, filename: &str) -> ReviewArtifactPaths {
-    let file_stem = std::path::Path::new(filename)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("document");
-    let disk_stem = format!("{}_{}", file_stem, &doc_id[..8.min(doc_id.len())]);
-    let dir = data_path_str("output/findings");
-    ReviewArtifactPaths {
-        findings: format!("{}/{}_findings.json", dir, disk_stem),
-        routing_summary: format!("{}/{}_routing_summary.json", dir, disk_stem),
-        graph_snapshot: format!("{}/{}_graph_snapshot.json", dir, disk_stem),
-        result: review_result_path(doc_id),
-    }
+fn review_artifact_paths(key: &DocumentKey) -> Result<ReviewArtifactPaths, String> {
+    let dir = tenant_output_path(&key.tenant_id, "findings")
+        .ok_or_else(|| "租户审核结果目录无效".to_string())?;
+    let doc_id = &key.document_id;
+    Ok(ReviewArtifactPaths {
+        findings: dir.join(format!("{}_findings.json", doc_id)),
+        routing_summary: dir.join(format!("{}_routing_summary.json", doc_id)),
+        graph_snapshot: dir.join(format!("{}_graph_snapshot.json", doc_id)),
+        result: dir.join(format!("{}_result.json", doc_id)),
+    })
 }
 
 fn quarantine_review_artifacts_with<F>(
     paths: &ReviewArtifactPaths,
     quarantine_id: &str,
     mut rename: F,
-) -> Result<Vec<String>, String>
+) -> Result<Vec<PathBuf>, String>
 where
     F: FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
 {
@@ -425,44 +640,36 @@ where
     }
     Ok(quarantined
         .into_iter()
-        .map(|(_, isolated)| isolated.to_string_lossy().into_owned())
+        .map(|(_, isolated)| isolated)
         .collect())
 }
 
 /// 原子接受新的文档审核轮次；冲突时不清理上一轮结果。
-async fn try_accept_review_run(
-    state: &AppState,
-    doc_id: &str,
-    filename: &str,
-) -> Result<bool, String> {
-    try_accept_review_run_with(state, doc_id, filename, |source, target| {
-        std::fs::rename(source, target)
-    })
-    .await
+async fn try_accept_review_run(state: &AppState, key: &DocumentKey) -> Result<bool, String> {
+    try_accept_review_run_with(state, key, |source, target| std::fs::rename(source, target)).await
 }
 
 async fn try_accept_review_run_with<F>(
     state: &AppState,
-    doc_id: &str,
-    filename: &str,
+    key: &DocumentKey,
     rename: F,
 ) -> Result<bool, String>
 where
     F: FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
 {
     let mut active = state.active_reviews.lock().await;
-    if active.contains(doc_id) {
+    if active.contains(key) {
         return Ok(false);
     }
 
     // 同目录 rename 先隔离全部旧产物；任一失败会回滚，避免只清掉部分事实来源。
-    let artifact_paths = review_artifact_paths(doc_id, filename);
+    let artifact_paths = review_artifact_paths(key)?;
     let quarantine_id = Uuid::new_v4().to_string();
     let quarantined = quarantine_review_artifacts_with(&artifact_paths, &quarantine_id, rename)?;
-    state.review_results.lock().await.remove(doc_id);
-    state.review_usages.lock().await.remove(doc_id);
-    state.review_errors.lock().await.remove(doc_id);
-    active.insert(doc_id.to_string());
+    state.review_results.lock().await.remove(key);
+    state.review_usages.lock().await.remove(key);
+    state.review_errors.lock().await.remove(key);
+    active.insert(key.clone());
     drop(active);
 
     // canonical 路径已原子隔离；隔离文件只是非权威垃圾，删除失败不影响新轮次语义。
@@ -470,55 +677,63 @@ where
         if let Err(error) = std::fs::remove_file(&path) {
             eprintln!(
                 "[WARN] 清理隔离审核结果失败: path={}, error={}",
-                path, error
+                path.display(),
+                error
             );
         }
     }
     Ok(true)
 }
 
-async fn get_or_create_review_event_bus(state: &AppState, doc_id: &str) -> Arc<ReviewEventBus> {
+async fn get_or_create_review_event_bus(
+    state: &AppState,
+    key: &DocumentKey,
+) -> Arc<ReviewEventBus> {
     let mut buses = state.review_event_buses.lock().await;
     buses
-        .entry(doc_id.to_string())
+        .entry(key.clone())
         .or_insert_with(|| Arc::new(ReviewEventBus::new(review_event_capacity())))
         .clone()
 }
 
-async fn claim_review_event_bus(state: &AppState, doc_id: &str) -> Arc<ReviewEventBus> {
+async fn claim_review_event_bus(state: &AppState, key: &DocumentKey) -> Arc<ReviewEventBus> {
     // 新轮 active 已建立，而上一轮终态会在解除 active 前摘除自身总线；
     // 因此 map 中若已有总线，只可能是本轮 GET 预连接创建的 pending 总线。
-    get_or_create_review_event_bus(state, doc_id).await
+    get_or_create_review_event_bus(state, key).await
 }
 
 async fn remove_review_event_bus_if_current(
     state: &AppState,
-    doc_id: &str,
+    key: &DocumentKey,
     expected: &Arc<ReviewEventBus>,
 ) -> bool {
     let mut buses = state.review_event_buses.lock().await;
     if buses
-        .get(doc_id)
+        .get(key)
         .is_some_and(|current| Arc::ptr_eq(current, expected))
     {
-        buses.remove(doc_id);
+        buses.remove(key);
         true
     } else {
         false
     }
 }
 
-async fn finish_review_run(state: &AppState, doc_id: &str, review_events: &Arc<ReviewEventBus>) {
+async fn finish_review_run(
+    state: &AppState,
+    key: &DocumentKey,
+    review_events: &Arc<ReviewEventBus>,
+) {
     // receiver 自身持有 Arc，摘除 map 不会阻止其接收刚发出的终态事件。
     // 只有本轮 bus 仍是 map 当前值时才释放 active，旧 supervisor 不得误清新轮。
-    if remove_review_event_bus_if_current(state, doc_id, review_events).await {
-        state.active_reviews.lock().await.remove(doc_id);
+    if remove_review_event_bus_if_current(state, key, review_events).await {
+        state.active_reviews.lock().await.remove(key);
     }
 }
 
 fn spawn_review_pipeline_supervisor<F>(
     state: AppState,
-    doc_id: String,
+    key: DocumentKey,
     review_events: Arc<ReviewEventBus>,
     pipeline: F,
 ) -> tokio::task::JoinHandle<()>
@@ -529,20 +744,23 @@ where
         let pipeline_result = tokio::spawn(pipeline).await;
         if pipeline_result.is_err() {
             let message = "后台审核任务异常终止，请重试".to_string();
-            eprintln!("[ERROR] 后台审核任务异常终止: doc_id={}", doc_id);
+            eprintln!(
+                "[ERROR] 后台审核任务异常终止: tenant_id={}, doc_id={}",
+                key.tenant_id, key.document_id
+            );
             state
                 .review_errors
                 .lock()
                 .await
-                .insert(doc_id.clone(), message.clone());
+                .insert(key.clone(), message.clone());
             review_events.emit(&crate::agents::review_event::ReviewEvent::Error {
                 message,
-                session_id: doc_id.clone(),
+                session_id: key.document_id.clone(),
             });
         }
 
         // supervisor 是唯一的轮次清理所有者，避免正常路径与 panic 路径双重清理。
-        finish_review_run(&state, &doc_id, &review_events).await;
+        finish_review_run(&state, &key, &review_events).await;
     })
 }
 
@@ -573,8 +791,13 @@ pub async fn health() -> Json<serde_json::Value> {
 )]
 pub async fn process_document(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     mut multipart: Multipart,
 ) -> Result<Json<ProcessResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = context.tenant_id;
+    if !is_valid_tenant_id(&tenant_id) {
+        return Err(bad_request("tenant context is invalid"));
+    }
     println!("[REQ] 收到文件上传请求，开始解析 multipart...");
 
     let mut file_data: Vec<u8> = Vec::new();
@@ -607,27 +830,33 @@ pub async fn process_document(
         file_data.len()
     );
 
-    let tmp_dir = data_path_str("tmp");
+    let tmp_dir = tenant_output_path(&tenant_id, "tmp")
+        .ok_or_else(|| bad_request("tenant context is invalid"))?;
     std::fs::create_dir_all(&tmp_dir).map_err(|e| server_error("创建临时目录失败", e))?;
     let stem = Uuid::new_v4().to_string();
+    let doc_id = stem.clone();
     let ext = std::path::Path::new(&filename)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("pdf");
-    let tmp_path = format!("{}/{}.{}", tmp_dir, stem, ext);
+    let tmp_path = tmp_dir.join(format!("{}.{}", stem, ext));
     std::fs::write(&tmp_path, &file_data).map_err(|e| server_error("写入临时文件失败", e))?;
 
     // DOCX → PDF 转换（对齐 CLI 行为）
     let pdf_path = if ext == "docx" || ext == "doc" {
         println!("[STAGE] DOCX → PDF 转换...");
-        convert_docx_to_pdf(&tmp_path, &tmp_dir).map_err(|e| server_error("DOCX 转 PDF 失败", e))?
+        convert_docx_to_pdf(
+            tmp_path.to_string_lossy().as_ref(),
+            tmp_dir.to_string_lossy().as_ref(),
+        )
+        .map_err(|e| server_error("DOCX 转 PDF 失败", e))?
     } else {
-        std::path::PathBuf::from(&tmp_path)
+        tmp_path.clone()
     };
 
     // 阶段 1: PDF → RawDocument（Rust 主路径 + Python 兜底）
     println!("[STAGE] PDF 文本提取...");
-    let pdf_path_str = pdf_path.to_str().unwrap_or(&tmp_path).to_string();
+    let pdf_path_str = pdf_path.to_string_lossy().to_string();
     let raw_doc: RawDocument = match extract_pdf_to_raw_json(&pdf_path_str) {
         Ok(doc) => {
             println!("Rust pdfplumber 解析成功");
@@ -636,8 +865,8 @@ pub async fn process_document(
         Err(e) => {
             println!("Rust pdfplumber 失败: {}", e);
             println!("切换到 Python pdfplumber 兜底提取...");
-            let fallback_json = format!("{}/{}_python_fallback_raw.json", tmp_dir, stem);
-            extract_with_python(&pdf_path_str, &fallback_json)
+            let fallback_json = tmp_dir.join(format!("{}_python_fallback_raw.json", stem));
+            extract_with_python(&pdf_path_str, &fallback_json.to_string_lossy())
                 .map_err(|e2| server_error("PDF 解析失败（Rust 和 Python 均失败）", e2))?;
             let json_str = std::fs::read_to_string(&fallback_json)
                 .map_err(|e2| server_error("读取 Python 兜底 JSON 失败", e2))?;
@@ -651,21 +880,18 @@ pub async fn process_document(
         raw_doc.pages.iter().map(|p| p.blocks.len()).sum::<usize>()
     );
 
-    // 构建磁盘输出用的 stem：{原始文件名}_{uuid前8位}
-    let file_stem = std::path::Path::new(&filename)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("document");
-    let disk_stem = format!("{}_{}", file_stem, &stem[..8.min(stem.len())]);
+    // 构建磁盘输出用的安全 stem：只使用服务端生成的 document_id。
+    let disk_stem = doc_id.clone();
 
     // ── 写盘：raw_json ──
     {
-        let dir = data_path_str("output/raw_json");
+        let dir = tenant_output_path(&tenant_id, "raw_json")
+            .ok_or_else(|| bad_request("tenant context is invalid"))?;
         let _ = std::fs::create_dir_all(&dir);
-        let path = format!("{}/{}_raw.json", dir, disk_stem);
+        let path = dir.join(format!("{}_raw.json", disk_stem));
         if let Ok(json) = serde_json::to_string_pretty(&raw_doc) {
             let _ = std::fs::write(&path, json);
-            println!("[DISK] raw_json → {}", path);
+            println!("[DISK] raw_json → {}", path.display());
         }
     }
 
@@ -753,12 +979,13 @@ pub async fn process_document(
 
     // ── 写盘：sections ──
     {
-        let dir = data_path_str("output/sections");
+        let dir = tenant_output_path(&tenant_id, "sections")
+            .ok_or_else(|| bad_request("tenant context is invalid"))?;
         let _ = std::fs::create_dir_all(&dir);
-        let path = format!("{}/{}_sections.json", dir, disk_stem);
+        let path = dir.join(format!("{}_sections.json", disk_stem));
         if let Ok(json) = serde_json::to_string_pretty(&all_sections) {
             let _ = std::fs::write(&path, json);
-            println!("[DISK] sections → {}", path);
+            println!("[DISK] sections → {}", path.display());
         }
     }
 
@@ -789,12 +1016,13 @@ pub async fn process_document(
 
     // ── 写盘：chunks ──
     {
-        let dir = data_path_str("output/chunks");
+        let dir = tenant_output_path(&tenant_id, "chunks")
+            .ok_or_else(|| bad_request("tenant context is invalid"))?;
         let _ = std::fs::create_dir_all(&dir);
-        let path = format!("{}/{}_chunks.json", dir, disk_stem);
+        let path = dir.join(format!("{}_chunks.json", disk_stem));
         if let Ok(json) = serde_json::to_string_pretty(&chunks) {
             let _ = std::fs::write(&path, json);
-            println!("[DISK] chunks → {}", path);
+            println!("[DISK] chunks → {}", path.display());
         }
     }
 
@@ -824,12 +1052,40 @@ pub async fn process_document(
 
     // ── 写盘：embeddings ──
     {
-        let dir = data_path_str("output/embeddings");
-        if let Err(e) = crate::services::embedding_service::save_index(&doc_index, &dir, &disk_stem)
-        {
+        let dir = tenant_output_path(&tenant_id, "embeddings")
+            .ok_or_else(|| bad_request("tenant context is invalid"))?;
+        if let Err(e) = crate::services::embedding_service::save_index(
+            &doc_index,
+            dir.to_string_lossy().as_ref(),
+            &disk_stem,
+        ) {
             eprintln!("[DISK] embeddings 写入失败: {}", e);
         } else {
-            println!("[DISK] embeddings → {}/{}_embedding_index/", dir, disk_stem);
+            println!(
+                "[DISK] embeddings → {}/{}_embedding_index/",
+                dir.display(),
+                disk_stem
+            );
+        }
+    }
+
+    // ── 写盘：documents manifest（供重启后恢复内存文档注册表）──
+    {
+        let dir = tenant_output_path(&tenant_id, "documents")
+            .ok_or_else(|| bad_request("tenant context is invalid"))?;
+        let _ = std::fs::create_dir_all(&dir);
+        let manifest = DocumentManifest {
+            document_id: doc_id.clone(),
+            filename: filename.clone(),
+            stem: disk_stem.clone(),
+            desensitization_summary: desensitization_summary.clone(),
+            review_chunks: review_chunks.clone(),
+            redaction_vault: redaction_vault.clone(),
+        };
+        let path = dir.join(format!("{}_manifest.json", disk_stem));
+        if let Ok(json) = serde_json::to_string_pretty(&manifest) {
+            let _ = std::fs::write(&path, json);
+            println!("[DISK] manifest → {}", path.display());
         }
     }
 
@@ -847,8 +1103,8 @@ pub async fn process_document(
     let total_blocks: usize = raw_doc.pages.iter().map(|p| p.blocks.len()).sum();
     let total_chars: usize = chunks.iter().map(|c| c.text.len()).sum();
 
-    let doc_id = stem.clone();
     let doc_state = Arc::new(DocumentState {
+        tenant_id: tenant_id.clone(),
         id: doc_id.clone(),
         filename: filename.clone(),
         stem,
@@ -867,7 +1123,7 @@ pub async fn process_document(
         .documents
         .write()
         .await
-        .insert(doc_id.clone(), doc_state);
+        .insert(DocumentKey::new(tenant_id, doc_id.clone()), doc_state);
 
     let _ = std::fs::remove_file(&tmp_path);
 
@@ -913,12 +1169,15 @@ pub async fn process_document(
 )]
 pub async fn get_document(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
 ) -> Result<Json<DocumentInfo>, (StatusCode, Json<ErrorResponse>)> {
+    let key = document_key(&context, &doc_id)?;
     let docs = state.documents.read().await;
     let doc = docs
-        .get(&doc_id)
-        .ok_or_else(|| not_found(&format!("文档不存在: {}", doc_id)))?;
+        .get(&key)
+        .filter(|document| document.tenant_id == key.tenant_id)
+        .ok_or_else(document_not_found)?;
     Ok(Json(DocumentInfo {
         document_id: doc.id.clone(),
         filename: doc.filename.clone(),
@@ -953,13 +1212,16 @@ pub async fn get_document(
 #[axum::debug_handler]
 pub async fn review_document(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
     Json(req): Json<ReviewRequest>,
 ) -> Result<(StatusCode, Json<ReviewAccepted>), (StatusCode, Json<ErrorResponse>)> {
+    let key = document_key(&context, &doc_id)?;
     let docs = state.documents.read().await;
     let doc = docs
-        .get(&doc_id)
-        .ok_or_else(|| not_found(&format!("文档不存在: {}", doc_id)))?
+        .get(&key)
+        .filter(|document| document.tenant_id == key.tenant_id)
+        .ok_or_else(document_not_found)?
         .clone();
     drop(docs);
 
@@ -1031,8 +1293,28 @@ pub async fn review_document(
         .map_err(|_| server_error_fmt("审核准备失败：嵌入客户端状态不可用"))?
         .clone();
 
+    // 提取每页 word 级坐标（审核完成后做 source_quote → 词级精确高亮）。
+    let page_words: Arc<HashMap<usize, (f64, Vec<(String, BBox)>)>> = Arc::new(
+        doc.raw_doc
+            .pages
+            .iter()
+            .map(|page| {
+                (
+                    page.page_index,
+                    (
+                        page.width,
+                        page.words
+                            .iter()
+                            .map(|word| (word.text.clone(), word.bbox.clone()))
+                            .collect(),
+                    ),
+                )
+            })
+            .collect(),
+    );
+
     // 参数校验完成后再原子接受新轮次；并发冲突不得清理上一轮结果。
-    match try_accept_review_run(&state, &doc_id, &doc.filename).await {
+    match try_accept_review_run(&state, &key).await {
         Ok(true) => {}
         Ok(false) => {
             return Ok((
@@ -1047,8 +1329,18 @@ pub async fn review_document(
         Err(error) => return Err(server_error_fmt(&error)),
     }
 
+    // 新轮次接受后立即写入 running；旧 canonical 结果已由 try_accept_review_run 原子隔离。
+    if let Some(findings_dir) = tenant_output_path(&key.tenant_id, "findings") {
+        let _ = std::fs::create_dir_all(&findings_dir);
+        if let Err(error) = crate::api::review_state::write_running(&findings_dir, &doc_id, || {
+            chrono::Utc::now().to_rfc3339()
+        }) {
+            eprintln!("[WARN] 审核状态落盘失败: doc_id={}, {}", doc_id, error);
+        }
+    }
+
     // 认领 GET 预连接创建的 pending 总线；若没有预连接则创建本轮总线。
-    let review_events = claim_review_event_bus(&state, &doc_id).await;
+    let review_events = claim_review_event_bus(&state, &key).await;
 
     println!(
         "[REQ] 审核条款数: {}, 启用 Agent: {:?}",
@@ -1059,7 +1351,7 @@ pub async fn review_document(
     // 后台执行管线
     let pipeline = run_review_pipeline(
         state.clone(),
-        doc_id.clone(),
+        key.clone(),
         review_clauses,
         enabled_agents,
         chunk_map,
@@ -1070,9 +1362,10 @@ pub async fn review_document(
         dashscope_search,
         search_backend,
         embed_client_for_tools,
+        page_words,
         review_events.clone(),
     );
-    spawn_review_pipeline_supervisor(state, doc_id.clone(), review_events, pipeline);
+    spawn_review_pipeline_supervisor(state, key, review_events, pipeline);
 
     Ok((
         StatusCode::ACCEPTED,
@@ -1091,7 +1384,7 @@ pub async fn review_document(
 #[allow(clippy::too_many_arguments)]
 async fn run_review_pipeline(
     state: AppState,
-    doc_id: String,
+    document_key: DocumentKey,
     review_clauses: Vec<ReviewClause>,
     enabled_agents: Option<Vec<AgentId>>,
     chunk_map: Arc<HashMap<String, Chunk>>,
@@ -1102,8 +1395,11 @@ async fn run_review_pipeline(
     dashscope_search: Option<Arc<DashScopeSearchBackend>>,
     search_backend: String,
     embed_client_for_tools: Option<Arc<EmbeddingClient>>,
+    page_words: Arc<HashMap<usize, (f64, Vec<(String, BBox)>)>>,
     review_events: Arc<ReviewEventBus>,
 ) {
+    let tenant_id = document_key.tenant_id.clone();
+    let doc_id = document_key.document_id.clone();
     let start_time = std::time::Instant::now();
 
     // ── 指标采集器 ──
@@ -1122,6 +1418,9 @@ async fn run_review_pipeline(
     if let Some(agent_ids) = enabled_agents {
         coord_config.enabled_agents = agent_ids;
     }
+    // P2 A/B 开关：同一套流程，on/off 只差独白压缩。分组写入 run meta 便于对比。
+    let transcript_compression = transcript_compression_enabled();
+    coord_config.transcript_compression = transcript_compression;
 
     let llm_factory = Arc::new(move || create_llm_client().expect("创建 LLM 客户端失败"));
 
@@ -1155,15 +1454,15 @@ async fn run_review_pipeline(
             registry.register(Box::new(SearchKnowledgeBaseTool::new(ec.clone())));
         }
         registry.register(Box::new(OutputFindingTool));
-        // V2+ 工具
-        registry.register(Box::new(CompareVersionsTool::new(
-            chunk_map_for_tools.clone(),
-            chunk_order_for_tools.clone(),
-        )));
-        registry.register(Box::new(DetectBoilerplateTool::new(
-            chunk_map_for_tools.clone(),
-            chunk_order_for_tools.clone(),
-        )));
+        // V2+ 工具（需要 chunk 数据）
+        registry.register(Box::new(CompareVersionsTool {
+            current_chunks: chunk_map_for_tools.clone(),
+            current_order: chunk_order_for_tools.clone(),
+        }));
+        registry.register(Box::new(DetectBoilerplateTool {
+            chunks: chunk_map_for_tools.clone(),
+            chunk_order: chunk_order_for_tools.clone(),
+        }));
         // V3 采购程序合规审查
         registry.register(Box::new(VerifyProcurementMethodTool));
         registry.register(Box::new(VerifyBidDepositTool));
@@ -1270,14 +1569,13 @@ async fn run_review_pipeline(
                     let mut valid_blocks: Vec<(String, usize)> = Vec::new();
                     let mut offset_acc = 0usize;
                     for r in &chunk.bbox_refs {
-                        let is_placeholder =
-                            r.bbox.x0 == 0.0 && r.bbox.x1 == 400.0
-                                && (r.bbox.bottom - r.bbox.top) <= 20.1;
+                        let is_placeholder = r.bbox.x0 == 0.0
+                            && r.bbox.x1 == 400.0
+                            && (r.bbox.bottom - r.bbox.top) <= 20.1;
                         if !is_placeholder {
                             // 用 block 中心偏移代表其位置，避免长 block 的首字符偏移
                             // 无法覆盖落在 block 中后段的证据。
-                            valid_blocks
-                                .push((r.block_id.clone(), offset_acc + r.char_count / 2));
+                            valid_blocks.push((r.block_id.clone(), offset_acc + r.char_count / 2));
                         }
                         offset_acc += r.char_count;
                     }
@@ -1290,6 +1588,26 @@ async fn run_review_pipeline(
                         &chunk.text,
                         max_blocks,
                     );
+
+                    // ★ 词级精确高亮：用同一份 source_quote 反查该页的词坐标，
+                    //   返回紧贴命中原句的逐行矩形（比段落级 block 更精确）。
+                    //   chunk.page_start 为 0-based，与 page_words 键一致。
+                    finding.highlight_rects = page_words
+                        .get(&chunk.page_start)
+                        .map(|(width, words)| {
+                            match_words_to_quote(words, &source_quote)
+                                .into_iter()
+                                .map(|bbox| HighlightRect {
+                                    page: chunk.page_start,
+                                    x0: bbox.x0,
+                                    top: bbox.top,
+                                    x1: bbox.x1,
+                                    bottom: bbox.bottom,
+                                    page_width: *width,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                 }
             }
             let sync_result = output
@@ -1307,7 +1625,7 @@ async fn run_review_pipeline(
                     .review_errors
                     .lock()
                     .await
-                    .insert(doc_id.clone(), message.clone());
+                    .insert(document_key.clone(), message.clone());
                 review_events.emit(&crate::agents::review_event::ReviewEvent::Error {
                     message,
                     session_id: doc_id.clone(),
@@ -1342,20 +1660,20 @@ async fn run_review_pipeline(
 
             // ── 写盘：findings ──
             {
-                let filename = {
-                    let docs = state.documents.read().await;
-                    if let Some(doc) = docs.get(&doc_id) {
-                        doc.filename.clone()
-                    } else {
-                        "doc.pdf".to_string()
+                let artifact_paths = match review_artifact_paths(&document_key) {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        eprintln!("[ERROR] 审核结果路径无效: doc_id={}, {}", doc_id, error);
+                        return;
                     }
                 };
-                let artifact_paths = review_artifact_paths(&doc_id, &filename);
-                let dir = data_path_str("output/findings");
+                let Some(dir) = artifact_paths.findings.parent() else {
+                    return;
+                };
                 let _ = std::fs::create_dir_all(&dir);
                 if let Ok(json) = serde_json::to_string_pretty(&output.findings) {
                     let _ = std::fs::write(&artifact_paths.findings, json);
-                    println!("[DISK] findings → {}", artifact_paths.findings);
+                    println!("[DISK] findings → {}", artifact_paths.findings.display());
                 }
                 if let Ok(json) = serde_json::to_string_pretty(&output.routing_summary) {
                     let _ = std::fs::write(&artifact_paths.routing_summary, json);
@@ -1380,12 +1698,23 @@ async fn run_review_pipeline(
                     },
                 );
 
-                let run_id = chrono::Local::now().format("%Y%m%dT%H%M%S").to_string();
+                let run_id = format!(
+                    "{}-{}",
+                    chrono::Local::now().format("%Y%m%dT%H%M%S"),
+                    &Uuid::new_v4().to_string()[..8]
+                );
                 let meta = crate::metrics::RunMeta {
                     run_id: run_id.clone(),
                     title: None,
                     notes: None,
-                    experiment_group: None,
+                    experiment_group: Some(
+                        if transcript_compression {
+                            "transcript_compress"
+                        } else {
+                            "control"
+                        }
+                        .to_string(),
+                    ),
                     timestamp: chrono::Local::now().to_rfc3339(),
                     git_commit: "unknown".to_string(),
                     git_branch: "unknown".to_string(),
@@ -1403,16 +1732,19 @@ async fn run_review_pipeline(
                         llm_model,
                         search_backend: search_backend.clone(),
                         max_parallel_clauses: coord_max_parallel,
+                        transcript_compression,
                     },
                 };
                 let run_metrics = collector.finalize(meta);
 
-                let runs_dir = data_path_str("output/runs");
+                let Some(runs_dir) = metric_runs_path(&tenant_id, "") else {
+                    return;
+                };
                 let _ = std::fs::create_dir_all(&runs_dir);
-                let run_path = format!("{}/{}.json", runs_dir, run_id);
+                let run_path = runs_dir.join(format!("{}.json", run_id));
                 if let Ok(json) = serde_json::to_string_pretty(&run_metrics) {
                     let _ = std::fs::write(&run_path, json);
-                    println!("[METRICS] → {}", run_path);
+                    println!("[METRICS] → {}", run_path.display());
                 }
 
                 let totals = &run_metrics.llm_efficiency.totals;
@@ -1427,16 +1759,18 @@ async fn run_review_pipeline(
             // 存入 review_results + review_usages 供 GET /result 查询
             {
                 let mut results = state.review_results.lock().await;
-                results.insert(doc_id.clone(), output.clone());
+                results.insert(document_key.clone(), output.clone());
                 let mut usages = state.review_usages.lock().await;
-                usages.insert(doc_id.clone(), usage.clone());
+                usages.insert(document_key.clone(), usage.clone());
             }
 
-            // 写盘: {doc_id}_result.json — 重启后磁盘 fallback（含 usage）
+            // 写盘: {doc_id}_result.json — 重启后磁盘 fallback（含 usage，租户命名空间）
             {
-                let dir = data_path_str("output/findings");
+                let Some(dir) = tenant_output_path(&tenant_id, "findings") else {
+                    return;
+                };
                 let _ = std::fs::create_dir_all(&dir);
-                let result_path = review_result_path(&doc_id);
+                let result_path = dir.join(format!("{}_result.json", doc_id));
                 let persisted = ReviewResultResponse {
                     status: result_status.clone(),
                     result: Some(ReviewResponse {
@@ -1451,8 +1785,10 @@ async fn run_review_pipeline(
                 };
                 if let Ok(json) = serde_json::to_string_pretty(&persisted) {
                     let _ = std::fs::write(&result_path, json);
-                    println!("[DISK] result → {}", result_path);
+                    println!("[DISK] result → {}", result_path.display());
                 }
+                // 结果已落盘，清除"进行中"状态文件
+                crate::api::review_state::remove(&dir, &doc_id);
             }
 
             if output.execution_summary.status
@@ -1484,7 +1820,15 @@ async fn run_review_pipeline(
             // 存入 review_errors
             {
                 let mut errors = state.review_errors.lock().await;
-                errors.insert(doc_id.clone(), msg.clone());
+                errors.insert(document_key.clone(), msg.clone());
+            }
+
+            // 落盘失败状态：重启后 get_review_result 可透传原始失败原因
+            if let Some(dir) = tenant_output_path(&tenant_id, "findings") {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = crate::api::review_state::write_failed(&dir, &doc_id, &msg, || {
+                    chrono::Utc::now().to_rfc3339()
+                });
             }
 
             // 发送 Error 事件
@@ -1513,14 +1857,21 @@ async fn run_review_pipeline(
 )]
 pub async fn stream_review_events(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
-) -> axum::response::Sse<
-    impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+) -> Result<
+    axum::response::Sse<
+        impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    (StatusCode, Json<ErrorResponse>),
 > {
     use axum::response::sse::Event;
 
+    let key = document_key(&context, &doc_id)?;
+    let _ = load_document(&state, &key).await?;
+
     // POST 前的多个预连接共享同一 pending 总线，随后由审核轮次认领。
-    let review_events = get_or_create_review_event_bus(&state, &doc_id).await;
+    let review_events = get_or_create_review_event_bus(&state, &key).await;
 
     let mut rx = review_events.subscribe();
 
@@ -1583,7 +1934,7 @@ pub async fn stream_review_events(
         }
     };
 
-    axum::response::Sse::new(stream)
+    Ok(axum::response::Sse::new(stream))
 }
 
 /// GET /api/v1/review/:doc_id/result
@@ -1602,10 +1953,13 @@ pub async fn stream_review_events(
 )]
 pub async fn get_review_result(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
 ) -> Result<Json<ReviewResultResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let key = document_key(&context, &doc_id)?;
+
     // 1. 新轮次占用期间不得返回上一轮成功结果。
-    if state.active_reviews.lock().await.contains(&doc_id) {
+    if state.active_reviews.lock().await.contains(&key) {
         return Ok(Json(ReviewResultResponse {
             status: "pending".to_string(),
             result: None,
@@ -1617,8 +1971,8 @@ pub async fn get_review_result(
     // 2. 检查内存中已完成的结果（不移除，允许多次查询）
     {
         let results = state.review_results.lock().await;
-        if let Some(output) = results.get(&doc_id) {
-            let usage = state.review_usages.lock().await.get(&doc_id).cloned();
+        if let Some(output) = results.get(&key) {
+            let usage = state.review_usages.lock().await.get(&key).cloned();
             return Ok(Json(ReviewResultResponse {
                 status: output.execution_summary.status.as_str().to_string(),
                 result: Some(ReviewResponse {
@@ -1637,7 +1991,7 @@ pub async fn get_review_result(
     // 3. 检查失败信息
     {
         let errors = state.review_errors.lock().await;
-        if let Some(msg) = errors.get(&doc_id) {
+        if let Some(msg) = errors.get(&key) {
             return Ok(Json(ReviewResultResponse {
                 status: "failed".to_string(),
                 result: None,
@@ -1650,7 +2004,7 @@ pub async fn get_review_result(
     // 4. 检查 SSE 通道是否仍在延迟清理期
     {
         let buses = state.review_event_buses.lock().await;
-        if buses.contains_key(&doc_id) {
+        if buses.contains_key(&key) {
             return Ok(Json(ReviewResultResponse {
                 status: "pending".to_string(),
                 result: None,
@@ -1660,18 +2014,63 @@ pub async fn get_review_result(
         }
     }
 
-    // 5. 磁盘 fallback — 重启后内存为空，从 JSON 文件恢复
+    // 5. 磁盘 fallback — 重启后内存为空：
+    //    已完成结果(_result.json) → 恢复；中断状态(_review_state.json) → 明确失败。
     {
-        let result_path = review_result_path(&doc_id);
-        if let Ok(json) = std::fs::read_to_string(&result_path)
-            && let Ok(result) = serde_json::from_str::<ReviewResultResponse>(&json)
-        {
-            println!("[DISK] result loaded from disk: {}", result_path);
-            return Ok(Json(result));
+        let Some(findings_dir) = tenant_output_path(&context.tenant_id, "findings") else {
+            return Err(document_not_found());
+        };
+        if let Some(recovered) = disk_recovery(&context.tenant_id, &doc_id, &findings_dir) {
+            println!("[DISK] review recovered from disk: doc_id={}", doc_id);
+            return Ok(Json(recovered));
         }
     }
 
-    Err(not_found(&format!("审查结果不存在: {}", doc_id)))
+    Err(document_not_found())
+}
+
+/// 磁盘兜底恢复（纯函数，便于单测）：
+/// 1. `{doc_id}_result.json` 存在且归属正确 → 返回已完成结果；
+/// 2. `{doc_id}_review_state.json` 存在：
+///    - running → 引擎重启导致中断 → failed + 中断文案
+///    - failed → 透传原始失败原因
+/// 3. 均无 → None（调用方返回 404）。
+fn disk_recovery(
+    tenant_id: &str,
+    doc_id: &str,
+    findings_dir: &std::path::Path,
+) -> Option<ReviewResultResponse> {
+    // 1. 已完成结果优先（完成写盘后、删状态文件前崩溃的窗口）
+    let result_path = findings_dir.join(format!("{}_result.json", doc_id));
+    if let Ok(json) = std::fs::read_to_string(&result_path)
+        && let Ok(result) = serde_json::from_str::<ReviewResultResponse>(&json)
+    {
+        let belongs_to_document = result
+            .result
+            .as_ref()
+            .map(|review| review.document_id == doc_id)
+            .unwrap_or(true);
+        if belongs_to_document {
+            return Some(result);
+        }
+    }
+
+    // 2. 中断/失败状态文件
+    let state = crate::api::review_state::read(findings_dir, doc_id)?;
+    let (status, error) = if state.is_running() {
+        (
+            "failed".to_string(),
+            Some(crate::api::review_state::INTERRUPTED_ERROR_MSG.to_string()),
+        )
+    } else {
+        ("failed".to_string(), state.error)
+    };
+    Some(ReviewResultResponse {
+        status,
+        result: None,
+        usage: None,
+        error,
+    })
 }
 
 /// POST /api/v1/documents/:id/chat
@@ -1690,16 +2089,12 @@ pub async fn get_review_result(
 )]
 pub async fn chat_with_document(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let docs = state.documents.read().await;
-    let doc = docs
-        .get(&doc_id)
-        .ok_or_else(|| not_found(&format!("文档不存在: {}", doc_id)))?
-        .clone();
-    drop(docs);
-
+    let key = document_key(&context, &doc_id)?;
+    let doc = load_document(&state, &key).await?;
     let llm: Arc<dyn LlmClient> =
         Arc::from(create_llm_client().map_err(|e| server_error("创建 Chat LLM 客户端失败", e))?);
 
@@ -1715,6 +2110,8 @@ pub async fn chat_with_document(
             doc.doc_index.clone(),
             ec.clone(),
         )));
+        // 本地知识库检索（对话也能引用已入库的法规/案例原文）
+        chat_tools.register(Box::new(SearchKnowledgeBaseTool::new(ec.clone())));
     }
     chat_tools.register(Box::new(ReadSectionTool::new(
         doc.review_chunk_map.clone(),
@@ -1789,28 +2186,25 @@ pub async fn chat_with_document(
 )]
 pub async fn chat_with_document_stream(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
     Json(req): Json<ChatRequest>,
-) -> axum::response::Sse<
-    impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+) -> Result<
+    axum::response::Sse<
+        impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    (StatusCode, Json<ErrorResponse>),
 > {
     use axum::response::sse::Event;
+
+    let key = document_key(&context, &doc_id)?;
+    let doc = load_document(&state, &key).await?;
 
     // All setup + streaming in a single async_stream block
     // (each async_stream::stream! creates a unique type — can't have early returns)
     let stream = async_stream::stream! {
         // ── Setup (inside stream to avoid type mismatch) ──
-        let docs = state.documents.read().await;
-        let doc = match docs.get(&doc_id) {
-            Some(d) => d.clone(),
-            None => {
-                yield Ok(Event::default()
-                    .event("error")
-                    .data(r#"{"message":"文档不存在"}"#));
-                return;
-            }
-        };
-        drop(docs);
+        let doc = doc.clone();
 
         let llm: Arc<dyn LlmClient> = match create_llm_client() {
             Ok(client) => Arc::from(client),
@@ -1834,6 +2228,8 @@ pub async fn chat_with_document_stream(
                 doc.doc_index.clone(),
                 ec.clone(),
             )));
+            // 本地知识库检索（对话也能引用已入库的法规/案例原文）
+            chat_tools.register(Box::new(SearchKnowledgeBaseTool::new(ec.clone())));
         }
         chat_tools.register(Box::new(ReadSectionTool::new(
             doc.review_chunk_map.clone(),
@@ -1922,7 +2318,7 @@ pub async fn chat_with_document_stream(
         }
     };
 
-    axum::response::Sse::new(stream)
+    Ok(axum::response::Sse::new(stream))
 }
 
 /// POST /api/v1/documents/:id/search
@@ -1941,15 +2337,18 @@ pub async fn chat_with_document_stream(
 )]
 pub async fn search_document(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let docs = state.documents.read().await;
-    let doc = docs
-        .get(&doc_id)
-        .ok_or_else(|| not_found(&format!("文档不存在: {}", doc_id)))?
-        .clone();
-    drop(docs);
+    let key = document_key(&context, &doc_id)?;
+    let doc = load_document(&state, &key).await?;
+
+    if req.queries.is_empty() {
+        return Ok(Json(SearchResponse {
+            results: Vec::new(),
+        }));
+    }
 
     let embed_client = {
         let ec = state.embed_client.lock().unwrap();
@@ -2039,14 +2438,12 @@ pub struct BlockBBoxResponse {
 )]
 pub async fn get_block_bboxes(
     State(state): State<AppState>,
+    Extension(context): Extension<InternalRequestContext>,
     Path(doc_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<BlockQuery>,
 ) -> Result<Json<Vec<BlockBBoxResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let docs = state.documents.read().await;
-    let doc = docs
-        .get(&doc_id)
-        .ok_or_else(|| not_found(&format!("文档不存在: {}", doc_id)))?;
-
+    let key = document_key(&context, &doc_id)?;
+    let doc = load_document(&state, &key).await?;
     let requested_ids: Vec<&str> = params.ids.split(',').map(|s| s.trim()).collect();
     println!(
         "[BLOCKS] 查询 block BBox: doc={}, ids={:?}",
@@ -2126,19 +2523,43 @@ fn not_found(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
-            error: "NOT_FOUND".to_string(),
+            error: "RESOURCE_NOT_FOUND".to_string(),
             detail: msg.to_string(),
         }),
     )
 }
 
+fn document_not_found() -> (StatusCode, Json<ErrorResponse>) {
+    not_found("resource not found")
+}
+
 // ─── Metrics Helpers ────────────────────────────────────────────────────
 
-/// 递归扫描 output/runs/ 下所有 .json 文件，返回 (相对文件夹路径, 文件路径)。
-fn list_run_files() -> Vec<(Option<String>, std::path::PathBuf)> {
-    let base = crate::paths::data_path_str("output/runs");
+/// 解析租户命名空间下的 metrics runs 根目录（`output/runs/{tenant_id}`）。
+///
+/// tenant_id 必须通过 `is_valid_tenant_id` 校验，且最终路径不得逃逸该命名空间，
+/// 防止目录穿越。`relative` 为空时返回命名空间根目录本身。
+fn metric_runs_path(tenant_id: &str, relative: &str) -> Option<std::path::PathBuf> {
+    if !is_valid_tenant_id(tenant_id) {
+        return None;
+    }
+    let root = std::path::PathBuf::from(crate::paths::data_path_str("output/runs"));
+    let namespace = root.join(tenant_id);
+    let candidate = if relative.is_empty() {
+        namespace.clone()
+    } else {
+        namespace.join(relative)
+    };
+    candidate.starts_with(&namespace).then_some(candidate)
+}
+
+/// 递归扫描 output/runs/{tenant_id}/ 下所有 .json 文件，返回 (相对文件夹路径, 文件路径)。
+fn list_run_files(tenant_id: &str) -> Vec<(Option<String>, std::path::PathBuf)> {
+    let Some(base) = metric_runs_path(tenant_id, "") else {
+        return Vec::new();
+    };
     let mut files = Vec::new();
-    let _ = scan_dir(&base, None, &mut files);
+    let _ = scan_dir(&base.to_string_lossy(), None, &mut files);
     files
 }
 
@@ -2165,16 +2586,18 @@ fn scan_dir(
 }
 
 /// 根据 run_id 查找文件路径（递归搜索子目录）。
-fn find_run_path(run_id: &str) -> Option<std::path::PathBuf> {
-    list_run_files()
+fn find_run_path(tenant_id: &str, run_id: &str) -> Option<std::path::PathBuf> {
+    list_run_files(tenant_id)
         .into_iter()
         .map(|(_, path)| path)
         .find(|path| path.file_stem().and_then(|s| s.to_str()) == Some(run_id))
 }
 
 /// 列出所有实验组名称。
-fn list_experiment_groups() -> Vec<String> {
-    let base = crate::paths::data_path_str("output/runs");
+fn list_experiment_groups(tenant_id: &str) -> Vec<String> {
+    let Some(base) = metric_runs_path(tenant_id, "") else {
+        return Vec::new();
+    };
     let mut groups = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&base) {
         for entry in entries.flatten() {
@@ -2225,10 +2648,18 @@ pub struct UpdateTagsRequest {
 }
 
 /// GET /api/v1/metrics/runs — 列出所有实验的摘要。
-pub async fn list_metric_runs() -> (StatusCode, Json<serde_json::Value>) {
+pub async fn list_metric_runs(
+    Extension(context): Extension<InternalRequestContext>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !is_valid_tenant_id(&context.tenant_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"租户不存在"})),
+        );
+    }
     let mut summaries: Vec<MetricRunSummary> = Vec::new();
 
-    for (experiment_group, path) in list_run_files() {
+    for (experiment_group, path) in list_run_files(&context.tenant_id) {
         if let Ok(content) = std::fs::read_to_string(&path)
             && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
         {
@@ -2288,8 +2719,17 @@ pub async fn list_metric_runs() -> (StatusCode, Json<serde_json::Value>) {
 }
 
 /// GET /api/v1/metrics/runs/:run_id — 获取单次实验的完整指标。
-pub async fn get_metric_run(Path(run_id): Path<String>) -> (StatusCode, Json<serde_json::Value>) {
-    let path = match find_run_path(&run_id) {
+pub async fn get_metric_run(
+    Extension(context): Extension<InternalRequestContext>,
+    Path(run_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !is_valid_tenant_id(&context.tenant_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"租户不存在"})),
+        );
+    }
+    let path = match find_run_path(&context.tenant_id, &run_id) {
         Some(p) => p,
         None => {
             return (
@@ -2315,10 +2755,17 @@ pub async fn get_metric_run(Path(run_id): Path<String>) -> (StatusCode, Json<ser
 
 /// PATCH /api/v1/metrics/runs/:run_id/tags — 更新实验标签。
 pub async fn update_metric_tags(
+    Extension(context): Extension<InternalRequestContext>,
     Path(run_id): Path<String>,
     Json(body): Json<UpdateTagsRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let path = match find_run_path(&run_id) {
+    if !is_valid_tenant_id(&context.tenant_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"租户不存在"})),
+        );
+    }
+    let path = match find_run_path(&context.tenant_id, &run_id) {
         Some(p) => p,
         None => {
             return (
@@ -2363,14 +2810,22 @@ pub async fn update_metric_tags(
 
 /// PATCH /api/v1/metrics/runs/:run_id/title — 更新实验标题。
 pub async fn update_metric_title(
+    Extension(context): Extension<InternalRequestContext>,
     Path(run_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let path = format!(
-        "{}/{}.json",
-        crate::paths::data_path_str("output/runs"),
-        run_id
-    );
+    if !is_valid_tenant_id(&context.tenant_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"租户不存在"})),
+        );
+    }
+    let Some(path) = metric_runs_path(&context.tenant_id, &format!("{}.json", run_id)) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"不存在"})),
+        );
+    };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => {
@@ -2407,14 +2862,22 @@ pub async fn update_metric_title(
 
 /// PATCH /api/v1/metrics/runs/:run_id/notes — 更新实验备注。
 pub async fn update_metric_notes(
+    Extension(context): Extension<InternalRequestContext>,
     Path(run_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let path = format!(
-        "{}/{}.json",
-        crate::paths::data_path_str("output/runs"),
-        run_id
-    );
+    if !is_valid_tenant_id(&context.tenant_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"租户不存在"})),
+        );
+    }
+    let Some(path) = metric_runs_path(&context.tenant_id, &format!("{}.json", run_id)) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"不存在"})),
+        );
+    };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => {
@@ -2451,10 +2914,17 @@ pub async fn update_metric_notes(
 
 /// PATCH /api/v1/metrics/runs/:run_id/experiment-group — 移动实验到指定实验组。
 pub async fn move_metric_experiment_group(
+    Extension(context): Extension<InternalRequestContext>,
     Path(run_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let old_path = match find_run_path(&run_id) {
+    if !is_valid_tenant_id(&context.tenant_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"租户不存在"})),
+        );
+    }
+    let old_path = match find_run_path(&context.tenant_id, &run_id) {
         Some(p) => p,
         None => {
             return (
@@ -2467,19 +2937,27 @@ pub async fn move_metric_experiment_group(
         .get("experiment_group")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let base = crate::paths::data_path_str("output/runs");
-    let new_dir = if let Some(ref g) = group {
-        if g.is_empty() {
-            base.clone()
-        } else {
-            format!("{}/{}", base, g)
-        }
-    } else {
-        base.clone()
+    let Some(base) = metric_runs_path(&context.tenant_id, "") else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"租户不存在"})),
+        );
+    };
+    let new_dir = match group.as_deref() {
+        Some(g) if !g.is_empty() => match metric_runs_path(&context.tenant_id, g) {
+            Some(d) => d,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"非法实验组名"})),
+                );
+            }
+        },
+        _ => base.clone(),
     };
     let _ = std::fs::create_dir_all(&new_dir);
     let fname = old_path.file_name().unwrap();
-    let new_path = std::path::Path::new(&new_dir).join(fname);
+    let new_path = new_dir.join(fname);
     if let Err(e) = std::fs::rename(&old_path, &new_path) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2539,9 +3017,12 @@ mod tests {
             verification_required: Vec::new(),
             hypothesized_by: Vec::new(),
             verified_by: vec!["FactCheckAgent".to_string()],
+            evidence_verdict: None,
+            verifier_reason: None,
             page_number: None,
             section_path: None,
             context: None,
+            highlight_rects: Vec::new(),
         }
     }
 
@@ -2696,6 +3177,22 @@ mod tests {
         }
     }
 
+    const TEST_TENANT_ID: &str = "1";
+
+    fn test_context() -> InternalRequestContext {
+        InternalRequestContext {
+            tenant_id: TEST_TENANT_ID.to_string(),
+            user_id: "tester".to_string(),
+            request_id: "req-1".to_string(),
+            timestamp: 0,
+            body_sha256: String::new(),
+        }
+    }
+
+    fn test_key(doc_id: &str) -> DocumentKey {
+        DocumentKey::new(TEST_TENANT_ID, doc_id)
+    }
+
     fn make_test_chunk() -> Chunk {
         Chunk {
             chunk_id: "ch_001".to_string(),
@@ -2713,6 +3210,7 @@ mod tests {
         let chunk = make_test_chunk();
         let chunk_map = Arc::new(HashMap::from([(chunk.chunk_id.clone(), chunk.clone())]));
         Arc::new(DocumentState {
+            tenant_id: TEST_TENANT_ID.to_string(),
             id: doc_id.to_string(),
             filename: "test.pdf".to_string(),
             stem: "test".to_string(),
@@ -2751,11 +3249,10 @@ mod tests {
             review_errors: Arc::new(TokioMutex::new(HashMap::new())),
             active_reviews: Arc::new(TokioMutex::new(HashSet::new())),
         };
-        state
-            .documents
-            .write()
-            .await
-            .insert(doc_id.to_string(), make_test_document(doc_id));
+        state.documents.write().await.insert(
+            DocumentKey::new(TEST_TENANT_ID, doc_id),
+            make_test_document(doc_id),
+        );
         state
     }
 
@@ -2785,7 +3282,7 @@ mod tests {
 
     fn write_test_review_artifacts(paths: &ReviewArtifactPaths) {
         for path in paths.all() {
-            if let Some(parent) = std::path::Path::new(path).parent() {
+            if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).expect("应创建测试输出目录");
             }
             std::fs::write(path, r#"{"status":"completed"}"#).expect("应写入旧磁盘结果");
@@ -2802,15 +3299,16 @@ mod tests {
     async fn preconnected_bus_is_claimed_and_delivers_review_events() {
         let doc_id = "doc_bus_preconnect";
         let state = make_test_state(doc_id).await;
-        let preconnected_bus = get_or_create_review_event_bus(&state, doc_id).await;
+        let key = test_key(doc_id);
+        let preconnected_bus = get_or_create_review_event_bus(&state, &key).await;
         let mut events = preconnected_bus.subscribe();
 
         assert!(
-            try_accept_review_run(&state, doc_id, "test.pdf")
+            try_accept_review_run(&state, &key)
                 .await
                 .expect("审核应被接受")
         );
-        let claimed_bus = claim_review_event_bus(&state, doc_id).await;
+        let claimed_bus = claim_review_event_bus(&state, &key).await;
         assert!(Arc::ptr_eq(&preconnected_bus, &claimed_bus));
 
         claimed_bus.emit(&crate::agents::review_event::ReviewEvent::Error {
@@ -2828,23 +3326,24 @@ mod tests {
     async fn terminal_cleanup_separates_next_run_bus_and_stale_cleanup_is_safe() {
         let doc_id = "doc_bus_generation";
         let state = make_test_state(doc_id).await;
-        let run1_bus = get_or_create_review_event_bus(&state, doc_id).await;
-        state.active_reviews.lock().await.insert(doc_id.to_string());
+        let key = test_key(doc_id);
+        let run1_bus = get_or_create_review_event_bus(&state, &key).await;
+        state.active_reviews.lock().await.insert(key.clone());
         run1_bus.emit(&crate::agents::review_event::ReviewEvent::Error {
             message: "run1-terminal".to_string(),
             session_id: doc_id.to_string(),
         });
-        finish_review_run(&state, doc_id, &run1_bus).await;
-        assert!(!state.active_reviews.lock().await.contains(doc_id));
-        assert!(!state.review_event_buses.lock().await.contains_key(doc_id));
+        finish_review_run(&state, &key, &run1_bus).await;
+        assert!(!state.active_reviews.lock().await.contains(&key));
+        assert!(!state.review_event_buses.lock().await.contains_key(&key));
 
-        let run2_bus = get_or_create_review_event_bus(&state, doc_id).await;
+        let run2_bus = get_or_create_review_event_bus(&state, &key).await;
         let mut run2_events = run2_bus.subscribe();
-        state.active_reviews.lock().await.insert(doc_id.to_string());
+        state.active_reviews.lock().await.insert(key.clone());
 
-        finish_review_run(&state, doc_id, &run1_bus).await;
+        finish_review_run(&state, &key, &run1_bus).await;
         assert!(
-            state.active_reviews.lock().await.contains(doc_id),
+            state.active_reviews.lock().await.contains(&key),
             "旧轮重复收口不得解除新轮 active"
         );
         assert!(Arc::ptr_eq(
@@ -2852,7 +3351,7 @@ mod tests {
                 .review_event_buses
                 .lock()
                 .await
-                .get(doc_id)
+                .get(&key)
                 .expect("新轮总线应保留"),
             &run2_bus
         ));
@@ -2866,15 +3365,16 @@ mod tests {
             .expect("新轮事件应及时到达")
             .expect("新轮总线应保持连接");
         assert!(event.contains("run2-event"));
-        finish_review_run(&state, doc_id, &run2_bus).await;
+        finish_review_run(&state, &key, &run2_bus).await;
     }
 
     #[tokio::test]
     async fn multiple_preconnections_share_one_pending_bus() {
         let doc_id = "doc_bus_multiple_preconnect";
         let state = make_test_state(doc_id).await;
-        let first = get_or_create_review_event_bus(&state, doc_id).await;
-        let second = get_or_create_review_event_bus(&state, doc_id).await;
+        let key = test_key(doc_id);
+        let first = get_or_create_review_event_bus(&state, &key).await;
+        let second = get_or_create_review_event_bus(&state, &key).await;
 
         assert!(Arc::ptr_eq(&first, &second));
     }
@@ -2883,11 +3383,12 @@ mod tests {
     async fn conflicting_review_does_not_replace_active_bus() {
         let doc_id = "doc_bus_conflict";
         let state = make_test_state(doc_id).await;
-        let active_bus = get_or_create_review_event_bus(&state, doc_id).await;
-        state.active_reviews.lock().await.insert(doc_id.to_string());
+        let key = test_key(doc_id);
+        let active_bus = get_or_create_review_event_bus(&state, &key).await;
+        state.active_reviews.lock().await.insert(key.clone());
 
         assert!(
-            !try_accept_review_run(&state, doc_id, "test.pdf")
+            !try_accept_review_run(&state, &key)
                 .await
                 .expect("并发审核应返回冲突")
         );
@@ -2895,7 +3396,7 @@ mod tests {
             .review_event_buses
             .lock()
             .await
-            .get(doc_id)
+            .get(&key)
             .cloned()
             .expect("active 总线应保留");
         assert!(Arc::ptr_eq(&active_bus, &current));
@@ -2905,18 +3406,19 @@ mod tests {
     async fn panicking_review_is_supervised_and_always_releases_current_run() {
         let doc_id = "doc_supervised_panic";
         let state = make_test_state(doc_id).await;
-        let preconnected_bus = get_or_create_review_event_bus(&state, doc_id).await;
+        let key = test_key(doc_id);
+        let preconnected_bus = get_or_create_review_event_bus(&state, &key).await;
         let mut events = preconnected_bus.subscribe();
         assert!(
-            try_accept_review_run(&state, doc_id, "test.pdf")
+            try_accept_review_run(&state, &key)
                 .await
                 .expect("首轮审核应被接受")
         );
-        let claimed_bus = claim_review_event_bus(&state, doc_id).await;
+        let claimed_bus = claim_review_event_bus(&state, &key).await;
 
         let supervisor = spawn_review_pipeline_supervisor(
             state.clone(),
-            doc_id.to_string(),
+            key.clone(),
             claimed_bus.clone(),
             async { panic!("测试注入的后台 panic") },
         );
@@ -2928,34 +3430,35 @@ mod tests {
             .expect("原预连接 receiver 应收到 Error");
         assert!(event.contains("后台审核任务异常终止"));
         assert_eq!(
-            state.review_errors.lock().await.get(doc_id),
+            state.review_errors.lock().await.get(&key),
             Some(&"后台审核任务异常终止，请重试".to_string())
         );
-        assert!(!state.active_reviews.lock().await.contains(doc_id));
-        assert!(!state.review_event_buses.lock().await.contains_key(doc_id));
+        assert!(!state.active_reviews.lock().await.contains(&key));
+        assert!(!state.review_event_buses.lock().await.contains_key(&key));
         assert!(
-            try_accept_review_run(&state, doc_id, "test.pdf")
+            try_accept_review_run(&state, &key)
                 .await
                 .expect("panic 收口后后续审核应可接受")
         );
-        state.active_reviews.lock().await.remove(doc_id);
+        state.active_reviews.lock().await.remove(&key);
     }
 
     #[tokio::test]
     async fn poisoned_prepare_lock_preserves_previous_run_and_does_not_reserve_active() {
         let doc_id = format!("doc_prepare_failure_{}", uuid::Uuid::new_v4());
+        let key = test_key(&doc_id);
         let state = make_test_state(&doc_id).await;
         state
             .review_results
             .lock()
             .await
-            .insert(doc_id.clone(), make_test_review_output());
+            .insert(key.clone(), make_test_review_output());
         state
             .review_usages
             .lock()
             .await
-            .insert(doc_id.clone(), make_test_review_usage());
-        let artifact_paths = review_artifact_paths(&doc_id, "test.pdf");
+            .insert(key.clone(), make_test_review_usage());
+        let artifact_paths = review_artifact_paths(&key).expect("测试路径应有效");
         write_test_review_artifacts(&artifact_paths);
         let embed_client = state.embed_client.clone();
         let _ = std::thread::spawn(move || {
@@ -2966,6 +3469,7 @@ mod tests {
 
         let response = review_document(
             State(state.clone()),
+            Extension(test_context()),
             Path(doc_id.clone()),
             Json(ReviewRequest {
                 chunk_ids: Vec::new(),
@@ -2977,14 +3481,11 @@ mod tests {
 
         let (_, Json(error)) = response.expect_err("准备失败应返回明确错误");
         assert_eq!(error.detail, "审核准备失败：嵌入客户端状态不可用");
-        assert!(!state.active_reviews.lock().await.contains(&doc_id));
-        assert!(state.review_results.lock().await.contains_key(&doc_id));
-        assert!(state.review_usages.lock().await.contains_key(&doc_id));
+        assert!(!state.active_reviews.lock().await.contains(&key));
+        assert!(state.review_results.lock().await.contains_key(&key));
+        assert!(state.review_usages.lock().await.contains_key(&key));
         assert!(
-            artifact_paths
-                .all()
-                .iter()
-                .all(|path| std::path::Path::new(path).exists()),
+            artifact_paths.all().iter().all(|path| path.exists()),
             "准备失败不得隔离上一轮磁盘结果"
         );
         remove_test_review_artifacts(&artifact_paths);
@@ -2993,38 +3494,36 @@ mod tests {
     #[tokio::test]
     async fn accepted_rerun_clears_old_success_before_sync_failure() {
         let doc_id = format!("doc_rerun_{}", uuid::Uuid::new_v4());
+        let key = test_key(&doc_id);
         let state = make_test_state(&doc_id).await;
         state
             .review_results
             .lock()
             .await
-            .insert(doc_id.clone(), make_test_review_output());
+            .insert(key.clone(), make_test_review_output());
         state
             .review_usages
             .lock()
             .await
-            .insert(doc_id.clone(), make_test_review_usage());
+            .insert(key.clone(), make_test_review_usage());
         state
             .review_errors
             .lock()
             .await
-            .insert(doc_id.clone(), "旧错误".to_string());
-        let artifact_paths = review_artifact_paths(&doc_id, "test.pdf");
+            .insert(key.clone(), "旧错误".to_string());
+        let artifact_paths = review_artifact_paths(&key).expect("测试路径应有效");
         write_test_review_artifacts(&artifact_paths);
 
         assert!(
-            try_accept_review_run(&state, &doc_id, "test.pdf")
+            try_accept_review_run(&state, &key)
                 .await
                 .expect("重跑应成功接受")
         );
-        assert!(!state.review_results.lock().await.contains_key(&doc_id));
-        assert!(!state.review_usages.lock().await.contains_key(&doc_id));
-        assert!(!state.review_errors.lock().await.contains_key(&doc_id));
+        assert!(!state.review_results.lock().await.contains_key(&key));
+        assert!(!state.review_usages.lock().await.contains_key(&key));
+        assert!(!state.review_errors.lock().await.contains_key(&key));
         assert!(
-            artifact_paths
-                .all()
-                .iter()
-                .all(|path| !std::path::Path::new(path).exists()),
+            artifact_paths.all().iter().all(|path| !path.exists()),
             "接受重跑后四类 canonical 结果文件必须全部消失"
         );
 
@@ -3039,53 +3538,50 @@ mod tests {
             .review_errors
             .lock()
             .await
-            .insert(doc_id.clone(), sync_error);
-        state.active_reviews.lock().await.remove(&doc_id);
+            .insert(key.clone(), sync_error);
+        state.active_reviews.lock().await.remove(&key);
 
-        let Json(response) = get_review_result(State(state), Path(doc_id.clone()))
-            .await
-            .expect("同步失败应返回失败状态");
+        let Json(response) = get_review_result(
+            State(state),
+            Extension(test_context()),
+            Path(doc_id.clone()),
+        )
+        .await
+        .expect("同步失败应返回失败状态");
         assert_eq!(response.status, "failed");
         assert!(response.result.is_none());
-        assert!(
-            artifact_paths
-                .all()
-                .iter()
-                .all(|path| !std::path::Path::new(path).exists())
-        );
+        assert!(artifact_paths.all().iter().all(|path| !path.exists()));
     }
 
     #[tokio::test]
     async fn rejected_concurrent_rerun_preserves_old_success() {
         let doc_id = format!("doc_conflict_{}", uuid::Uuid::new_v4());
+        let key = test_key(&doc_id);
         let state = make_test_state(&doc_id).await;
-        state.active_reviews.lock().await.insert(doc_id.clone());
+        state.active_reviews.lock().await.insert(key.clone());
         state
             .review_results
             .lock()
             .await
-            .insert(doc_id.clone(), make_test_review_output());
+            .insert(key.clone(), make_test_review_output());
         state
             .review_usages
             .lock()
             .await
-            .insert(doc_id.clone(), make_test_review_usage());
-        let artifact_paths = review_artifact_paths(&doc_id, "test.pdf");
+            .insert(key.clone(), make_test_review_usage());
+        let artifact_paths = review_artifact_paths(&key).expect("测试路径应有效");
         write_test_review_artifacts(&artifact_paths);
 
         assert!(
-            !try_accept_review_run(&state, &doc_id, "test.pdf")
+            !try_accept_review_run(&state, &key)
                 .await
                 .expect("并发重跑应返回冲突")
         );
 
-        assert!(state.review_results.lock().await.contains_key(&doc_id));
-        assert!(state.review_usages.lock().await.contains_key(&doc_id));
+        assert!(state.review_results.lock().await.contains_key(&key));
+        assert!(state.review_usages.lock().await.contains_key(&key));
         assert!(
-            artifact_paths
-                .all()
-                .iter()
-                .all(|path| std::path::Path::new(path).exists()),
+            artifact_paths.all().iter().all(|path| path.exists()),
             "并发冲突不得清理任一旧结果文件"
         );
         remove_test_review_artifacts(&artifact_paths);
@@ -3094,40 +3590,180 @@ mod tests {
     #[tokio::test]
     async fn artifact_cleanup_failure_rolls_back_and_does_not_accept_run() {
         let doc_id = format!("doc_cleanup_failure_{}", uuid::Uuid::new_v4());
+        let key = test_key(&doc_id);
         let state = make_test_state(&doc_id).await;
         state
             .review_results
             .lock()
             .await
-            .insert(doc_id.clone(), make_test_review_output());
-        let artifact_paths = review_artifact_paths(&doc_id, "test.pdf");
+            .insert(key.clone(), make_test_review_output());
+        let artifact_paths = review_artifact_paths(&key).expect("测试路径应有效");
         write_test_review_artifacts(&artifact_paths);
         let fail_path = artifact_paths.routing_summary.clone();
 
-        let error =
-            try_accept_review_run_with(&state, &doc_id, "test.pdf", move |source, target| {
-                if source == std::path::Path::new(&fail_path) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "模拟 Windows 文件占用",
-                    ));
-                }
-                std::fs::rename(source, target)
-            })
-            .await
-            .expect_err("任一文件隔离失败时不得接受任务");
+        let error = try_accept_review_run_with(&state, &key, move |source, target| {
+            if source == fail_path {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "模拟 Windows 文件占用",
+                ));
+            }
+            std::fs::rename(source, target)
+        })
+        .await
+        .expect_err("任一文件隔离失败时不得接受任务");
 
         assert!(error.contains("模拟 Windows 文件占用"));
-        assert!(!state.active_reviews.lock().await.contains(&doc_id));
-        assert!(state.review_results.lock().await.contains_key(&doc_id));
+        assert!(!state.active_reviews.lock().await.contains(&key));
+        assert!(state.review_results.lock().await.contains_key(&key));
         assert!(
-            artifact_paths
-                .all()
-                .iter()
-                .all(|path| std::path::Path::new(path).exists()),
+            artifact_paths.all().iter().all(|path| path.exists()),
             "失败回滚后四类 canonical 结果文件必须全部恢复"
         );
         remove_test_review_artifacts(&artifact_paths);
+    }
+
+    /// 按 process_document 的目录约定把一份 DocumentState 落地到临时目录。
+    fn write_document_artifacts(root: &std::path::Path, ds: &DocumentState) {
+        let tenant = root.join(ds.tenant_id.clone());
+        for sub in ["raw_json", "sections", "chunks", "documents", "embeddings"] {
+            std::fs::create_dir_all(tenant.join(sub)).unwrap();
+        }
+        std::fs::write(
+            tenant
+                .join("raw_json")
+                .join(format!("{}_raw.json", ds.stem)),
+            serde_json::to_string(&ds.raw_doc).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            tenant
+                .join("sections")
+                .join(format!("{}_sections.json", ds.stem)),
+            serde_json::to_string(&ds.sections).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            tenant
+                .join("chunks")
+                .join(format!("{}_chunks.json", ds.stem)),
+            serde_json::to_string(&ds.chunks).unwrap(),
+        )
+        .unwrap();
+        let manifest = DocumentManifest {
+            document_id: ds.id.clone(),
+            filename: ds.filename.clone(),
+            stem: ds.stem.clone(),
+            desensitization_summary: ds.desensitization_summary.clone(),
+            review_chunks: ds.review_chunks.clone(),
+            redaction_vault: (*ds.redaction_vault).clone(),
+        };
+        std::fs::write(
+            tenant
+                .join("documents")
+                .join(format!("{}_manifest.json", ds.stem)),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        crate::services::embedding_service::save_index(
+            &ds.doc_index,
+            tenant.join("embeddings").to_string_lossy().as_ref(),
+            &ds.stem,
+        )
+        .unwrap();
+    }
+
+    /// 重启恢复闭环：一份文档写盘后必须能原样重建内存态（filename/脱敏副本/向量/章节不丢）。
+    #[test]
+    fn rebuild_document_state_round_trips() {
+        let mut chunk = make_test_chunk();
+        chunk.text = "投标人须在东莞设有常驻服务机构".to_string();
+        let index = DocumentVectorIndex::new(
+            vec![crate::domain::vector_index::ChunkMeta {
+                chunk_id: chunk.chunk_id.clone(),
+                section_path: chunk.section_path.clone(),
+                embed_text: chunk.text.clone(),
+                text_len: chunk.text.chars().count(),
+                page_start: chunk.page_start,
+                page_end: chunk.page_end,
+            }],
+            vec![vec![1.0, 0.0]],
+        );
+        let ds = DocumentState {
+            tenant_id: "3".to_string(),
+            id: "doc-reload-1".to_string(),
+            filename: "MAOMING_mutated.pdf".to_string(),
+            stem: "docreload1".to_string(),
+            raw_doc: RawDocument {
+                document_id: "doc-reload-1".to_string(),
+                source_path: "src.pdf".to_string(),
+                pages: Vec::new(),
+            },
+            sections: vec![Section {
+                level: 1,
+                title: "第一章".to_string(),
+                pattern: "heading".to_string(),
+                page_start: 0,
+                page_end: 0,
+                block_ids: vec!["b_1".to_string()],
+                body_text: chunk.text.clone(),
+                children: Vec::new(),
+                body_page_start: 0,
+                body_page_end: 0,
+            }],
+            chunks: vec![chunk.clone()],
+            review_chunks: vec![chunk.clone()],
+            chunk_map: Arc::new(HashMap::new()),
+            review_chunk_map: Arc::new(HashMap::new()),
+            chunk_order: Arc::new(Vec::new()),
+            doc_index: Arc::new(index),
+            redaction_vault: Arc::new(RedactionVault::new(DesensitizationMode::Low)),
+            desensitization_summary: DesensitizationSummary::default(),
+        };
+
+        let root = std::env::temp_dir().join(format!("ai-bid-reload-{}", Uuid::new_v4()));
+        write_document_artifacts(&root, &ds);
+
+        let rebuilt = rebuild_document_state(&root, "3", "docreload1").expect("应能从磁盘重建文档");
+        assert_eq!(rebuilt.id, "doc-reload-1");
+        assert_eq!(rebuilt.filename, "MAOMING_mutated.pdf");
+        assert_eq!(rebuilt.chunks.len(), 1);
+        assert_eq!(rebuilt.review_chunks.len(), 1);
+        assert_eq!(rebuilt.chunks[0].text, "投标人须在东莞设有常驻服务机构");
+        assert_eq!(rebuilt.doc_index.len(), 1);
+        assert_eq!(rebuilt.chunk_order.len(), 1);
+        assert_eq!(rebuilt.sections.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 缺 manifest（或任何一份必要文件）时优雅跳过，返回 None 而不是 panic。
+    #[test]
+    fn rebuild_document_state_missing_manifest_is_none() {
+        let root = std::env::temp_dir().join(format!("ai-bid-reload-missing-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("3").join("documents")).unwrap();
+        assert!(rebuild_document_state(&root, "3", "nosuchdoc").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P2 开关解析：只有 1/true/on 开启，其余（含未设置、空串、乱写）一律关闭，
+    /// 保证 A/B 基线组（control）不受脏环境变量影响。
+    #[test]
+    fn parse_transcript_compression_accepts_only_truthy() {
+        for v in [Some("1"), Some("true"), Some("on")] {
+            assert!(parse_transcript_compression(v), "{v:?} 应视为开启");
+        }
+        for v in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("yes"),
+            Some("TRUE"),
+        ] {
+            assert!(!parse_transcript_compression(v), "{v:?} 应视为关闭");
+        }
     }
 
     #[tokio::test]
@@ -3137,6 +3773,7 @@ mod tests {
 
         let response = review_document(
             State(state.clone()),
+            Extension(test_context()),
             Path(doc_id.to_string()),
             Json(ReviewRequest {
                 chunk_ids: Vec::new(),
@@ -3151,7 +3788,11 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert!(
-            !state.active_reviews.lock().await.contains(doc_id),
+            !state
+                .active_reviews
+                .lock()
+                .await
+                .contains(&DocumentKey::new(TEST_TENANT_ID, doc_id)),
             "非法请求不得占用审核锁"
         );
     }
@@ -3163,6 +3804,7 @@ mod tests {
 
         let response = review_document(
             State(state.clone()),
+            Extension(test_context()),
             Path(doc_id.to_string()),
             Json(ReviewRequest {
                 chunk_ids: Vec::new(),
@@ -3176,7 +3818,11 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(error.detail, "非法 Agent 名称: UnknownAgent");
         assert!(
-            !state.active_reviews.lock().await.contains(doc_id),
+            !state
+                .active_reviews
+                .lock()
+                .await
+                .contains(&DocumentKey::new(TEST_TENANT_ID, doc_id)),
             "非法 Agent 名称不得占用审核锁"
         );
     }
@@ -3185,10 +3831,15 @@ mod tests {
     async fn invalid_request_takes_precedence_over_active_review_conflict() {
         let doc_id = "doc_invalid_while_active";
         let state = make_test_state(doc_id).await;
-        state.active_reviews.lock().await.insert(doc_id.to_string());
+        state
+            .active_reviews
+            .lock()
+            .await
+            .insert(DocumentKey::new(TEST_TENANT_ID, doc_id));
 
         let response = review_document(
             State(state),
+            Extension(test_context()),
             Path(doc_id.to_string()),
             Json(ReviewRequest {
                 chunk_ids: Vec::new(),
@@ -3209,7 +3860,7 @@ mod tests {
         let doc_id = "doc_partial_result";
         let state = make_test_state(doc_id).await;
         state.review_results.lock().await.insert(
-            doc_id.to_string(),
+            DocumentKey::new(TEST_TENANT_ID, doc_id),
             CoordinatorOutput {
                 findings: Vec::new(),
                 routing_summary: crate::agents::types::RoutingSummary {
@@ -3234,9 +3885,13 @@ mod tests {
             },
         );
 
-        let Json(response) = get_review_result(State(state), Path(doc_id.to_string()))
-            .await
-            .expect("部分失败结果应可查询");
+        let Json(response) = get_review_result(
+            State(state),
+            Extension(test_context()),
+            Path(doc_id.to_string()),
+        )
+        .await
+        .expect("部分失败结果应可查询");
 
         assert_eq!(response.status, "partial_failed");
         assert_eq!(
@@ -3249,21 +3904,126 @@ mod tests {
             1
         );
     }
+
+    // ── 重启中断检测（disk_recovery 纯函数）──────────────────────────
+
+    #[test]
+    fn disk_recovery_returns_interrupted_failed_for_running_state_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::api::review_state::write_running(dir.path(), "doc-interrupted", || {
+            "2026-08-27T00:00:00Z".to_string()
+        })
+        .expect("write running state");
+
+        let recovered = disk_recovery("1", "doc-interrupted", dir.path())
+            .expect("running 状态文件应被识别为中断");
+
+        assert_eq!(recovered.status, "failed");
+        assert!(recovered.result.is_none(), "中断审核不得返回结果");
+        assert_eq!(
+            recovered.error.as_deref(),
+            Some(crate::api::review_state::INTERRUPTED_ERROR_MSG),
+            "应返回明确的中断文案"
+        );
+    }
+
+    #[test]
+    fn disk_recovery_returns_original_error_for_failed_state_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::api::review_state::write_failed(
+            dir.path(),
+            "doc-failed-before-restart",
+            "审核引擎执行失败: LLM 超时",
+            || "2026-08-27T00:00:00Z".to_string(),
+        )
+        .expect("write failed state");
+
+        let recovered = disk_recovery("1", "doc-failed-before-restart", dir.path())
+            .expect("failed 状态文件应被识别");
+
+        assert_eq!(recovered.status, "failed");
+        assert_eq!(
+            recovered.error.as_deref(),
+            Some("审核引擎执行失败: LLM 超时"),
+            "应透传原始失败原因"
+        );
+    }
+
+    #[test]
+    fn disk_recovery_returns_none_without_any_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            disk_recovery("1", "doc-nothing", dir.path()).is_none(),
+            "无结果文件也无状态文件时应返回 None（404）"
+        );
+    }
+
+    #[test]
+    fn disk_recovery_prefers_completed_result_over_state_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let completed: ReviewResultResponse = ReviewResultResponse {
+            status: "completed".to_string(),
+            result: Some(ReviewResponse {
+                document_id: "doc-done".to_string(),
+                findings: Vec::new(),
+                routing_summary: crate::agents::types::RoutingSummary {
+                    total_clauses: 1,
+                    agent_clause_counts: HashMap::new(),
+                    high_risk_count: 0,
+                    legal_verify_count: 0,
+                    blind_spot_findings: 0,
+                },
+                execution_summary: crate::agents::types::ExecutionSummary::default(),
+                graph_snapshot: None,
+            }),
+            error: None,
+            usage: None,
+        };
+        std::fs::write(
+            dir.path().join("doc-done_result.json"),
+            serde_json::to_string(&completed).expect("serialize result"),
+        )
+        .expect("write result.json");
+        // 陈旧 running 状态文件（模拟完成写盘后、删状态文件前崩溃）
+        crate::api::review_state::write_running(dir.path(), "doc-done", || {
+            "2026-08-27T00:00:00Z".to_string()
+        })
+        .expect("write stale running state");
+
+        let recovered =
+            disk_recovery("1", "doc-done", dir.path()).expect("completed 结果优先于状态文件");
+        assert_eq!(recovered.status, "completed", "已完成结果必须优先");
+    }
 }
 
 /// GET /api/v1/metrics/experiment-groups — 列出所有实验组。
-pub async fn list_metric_experiment_groups() -> (StatusCode, Json<serde_json::Value>) {
+pub async fn list_metric_experiment_groups(
+    Extension(context): Extension<InternalRequestContext>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !is_valid_tenant_id(&context.tenant_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"租户不存在"})),
+        );
+    }
     (
         StatusCode::OK,
-        Json(serde_json::json!({"experiment_groups": list_experiment_groups()})),
+        Json(serde_json::json!({"experiment_groups": list_experiment_groups(&context.tenant_id)})),
     )
 }
 
 /// DELETE /api/v1/metrics/runs/:run_id — 删除实验记录。
 pub async fn delete_metric_run(
+    Extension(context): Extension<InternalRequestContext>,
     Path(run_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let path = match find_run_path(&run_id) {
+    if !is_valid_tenant_id(&context.tenant_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"租户不存在"})),
+        );
+    }
+    let path = match find_run_path(&context.tenant_id, &run_id) {
         Some(p) => p,
         None => {
             return (
@@ -3434,6 +4194,97 @@ fn select_blocks_by_source_quote(
         .collect()
 }
 
+/// 在页面的词序列（阅读顺序）中定位 `source_quote`，返回命中词的逐行紧致包围盒。
+///
+/// 与 `select_blocks_by_source_quote` 共用同一套 bigram 定位（`find_quote_position`），
+/// 区别是匹配粒度在「词」而非「段落块」，因此返回的矩形紧贴原句、不会盖住整段。
+/// 每个返回值对应一个视觉行（同行命中词合并为一个矩形）。
+///
+/// 匹配不可靠时返回空 `Vec`，前端回落到 block 级高亮 + 文本层收敛。
+fn match_words_to_quote(words: &[(String, BBox)], source_quote: &str) -> Vec<BBox> {
+    if words.is_empty() || source_quote.trim().is_empty() {
+        return Vec::new();
+    }
+
+    // 1. 按阅读顺序「无分隔」拼接词文本（中文词间本无空格），并记录每个词的字符区间。
+    //    字符偏移与 `find_quote_position` 的 char 语义保持一致（UTF-8 按 char 而非字节）。
+    let mut word_text = String::new();
+    let mut ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(words.len());
+    for (i, (text, bbox)) in words.iter().enumerate() {
+        let start = word_text.chars().count();
+        word_text.push_str(text);
+        let end = word_text.chars().count();
+        if end > start && (bbox.bottom - bbox.top) > 0.0 {
+            ranges.push((i, start, end));
+        }
+    }
+
+    // 2. 去掉 source_quote 空白，与无分隔拼接的 word_text 对齐
+    //   （英文短语 / LLM 输出可能带空格）。
+    let compact_quote: String = source_quote
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if compact_quote.is_empty() {
+        return Vec::new();
+    }
+
+    // 3. 定位匹配范围：逐字引用是最常见情形，先做精确子串匹配（字节偏移 → 字符偏移）；
+    //    引用带标点 / OCR 误差导致不逐字相等时，回落到 bigram 滑动窗口。
+    let (match_start, match_end): (usize, usize) = match word_text.find(&compact_quote) {
+        Some(byte_start) => {
+            let char_start = word_text[..byte_start].chars().count();
+            (char_start, char_start + compact_quote.chars().count())
+        }
+        None => match find_quote_position(&compact_quote, &word_text) {
+            Some(pos) => pos,
+            None => return Vec::new(),
+        },
+    };
+
+    // 3. 找出与匹配窗口相交的词
+    let mut hit_idx: Vec<usize> = Vec::new();
+    for &(i, start, end) in &ranges {
+        if start < match_end && match_start < end {
+            hit_idx.push(i);
+        }
+    }
+    if hit_idx.is_empty() {
+        return Vec::new();
+    }
+
+    // 4. 按视觉行分组（top 接近视为同行），每行合并为一个紧致矩形。
+    //    行分组阈值参照 compute_blocks：line_height * 1.2。
+    let hit_boxes: Vec<&BBox> = hit_idx.iter().map(|&i| &words[i].1).collect();
+    let mut heights: Vec<f64> = hit_boxes.iter().map(|b| b.bottom - b.top).collect();
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let line_height = heights[heights.len() / 2];
+
+    let mut sorted: Vec<&BBox> = hit_boxes.clone();
+    sorted.sort_by(|a, b| {
+        a.top
+            .partial_cmp(&b.top)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let tol = (line_height * 1.2).max(6.0);
+    let mut lines: Vec<BBox> = Vec::new();
+    for b in sorted {
+        if let Some(last) = lines.last_mut() {
+            if b.top - last.top < tol {
+                last.x0 = last.x0.min(b.x0);
+                last.top = last.top.min(b.top);
+                last.x1 = last.x1.max(b.x1);
+                last.bottom = last.bottom.max(b.bottom);
+                continue;
+            }
+        }
+        lines.push(b.clone());
+    }
+    lines
+}
+
 #[cfg(test)]
 mod block_matching_tests {
     use super::*;
@@ -3505,19 +4356,13 @@ mod block_matching_tests {
     #[test]
     fn select_blocks_returns_empty_when_match_unreliable() {
         // chunk.text 与 source_quote 无交集
-        let valid_blocks: Vec<(String, usize)> = (0..10)
-            .map(|i| (format!("b_1_{}", i), i))
-            .collect();
-        let chunk_text =
-            "第一章 总则。本办法适用于所有政府采购项目的招标投标活动。".repeat(5);
+        let valid_blocks: Vec<(String, usize)> =
+            (0..10).map(|i| (format!("b_1_{}", i), i)).collect();
+        let chunk_text = "第一章 总则。本办法适用于所有政府采购项目的招标投标活动。".repeat(5);
         let source_quote = "投标人须为本省注册企业且具有独立法人资格";
 
-        let result =
-            select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 5);
-        assert!(
-            result.is_empty(),
-            "不可靠匹配应返回空，让前端走文本定位"
-        );
+        let result = select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 5);
+        assert!(result.is_empty(), "不可靠匹配应返回空，让前端走文本定位");
     }
 
     #[test]
@@ -3541,8 +4386,7 @@ mod block_matching_tests {
         // 证据在第九条（block_texts[8]，index 8）：投标保证金不得超过项目估算价的2%
         let source_quote = "投标保证金不得超过项目估算价的2%";
 
-        let result =
-            select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 3);
+        let result = select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 3);
 
         assert!(!result.is_empty(), "应找到匹配的 block");
         // 第九条的 block 是 b_1_8（index 8），应在结果中排在前面
@@ -3555,14 +4399,12 @@ mod block_matching_tests {
 
     #[test]
     fn select_blocks_falls_back_to_empty_for_very_different_texts() {
-        let valid_blocks: Vec<(String, usize)> = (0..6)
-            .map(|i| (format!("b_2_{}", i), i))
-            .collect();
+        let valid_blocks: Vec<(String, usize)> =
+            (0..6).map(|i| (format!("b_2_{}", i), i)).collect();
         let chunk_text = "项目名称：XX市污水处理厂建设工程。建设地点：XX市南郊。工期：365天。";
         let source_quote = "投标人须具备有效的安全生产许可证且在有效期内";
 
-        let result =
-            select_blocks_by_source_quote(&valid_blocks, source_quote, chunk_text, 5);
+        let result = select_blocks_by_source_quote(&valid_blocks, source_quote, chunk_text, 5);
         assert!(
             result.is_empty(),
             "完全不相关的 source_quote 应返回空 block_ids"
@@ -3580,8 +4422,7 @@ mod block_matching_tests {
 
         let source_quote = "第15条 条款内容文本占位";
 
-        let result =
-            select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 5);
+        let result = select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 5);
         assert!(
             result.len() <= 5,
             "返回的 block 数不应超过 max_blocks=5，实际: {}",
@@ -3600,9 +4441,8 @@ mod block_matching_tests {
         // 证据落在长 block 的中段。若按 index 比例估算偏移，长 block 会被
         // 误估到 chunk 末尾，导致选中错误的短 block；按真实文本长度累加的
         // 中心偏移则能正确选中长 block（index 9）。
-        let mut block_texts: Vec<String> = (0..9)
-            .map(|i| format!("第{}条 短条款。", i + 1))
-            .collect();
+        let mut block_texts: Vec<String> =
+            (0..9).map(|i| format!("第{}条 短条款。", i + 1)).collect();
         let long_block = format!(
             "第十条 详细说明。{}投标保证金不得超过项目估算价的2%。{}",
             "内容".repeat(200),
@@ -3615,13 +4455,128 @@ mod block_matching_tests {
         let valid_blocks = make_valid_blocks("b_nu", &block_refs);
 
         let source_quote = "投标保证金不得超过项目估算价的2%";
-        let result =
-            select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 3);
+        let result = select_blocks_by_source_quote(&valid_blocks, source_quote, &chunk_text, 3);
 
         assert!(
             result.contains(&"b_nu_9".to_string()),
             "应按真实偏移选中长 block b_nu_9（第十条，index 9），实际: {:?}",
             result
+        );
+    }
+
+    // ─── match_words_to_quote 测试 ────────────────────────────────────────
+
+    /// 构造一行词：每个词按「字数 ×10pt」给宽、高 12pt，行首 x=10。
+    /// 用于验证词级高亮返回的矩形紧贴命中的词、不吞掉相邻词。
+    fn words_on_line(top: f64, texts: &[&str]) -> Vec<(String, BBox)> {
+        let mut x = 10.0f64;
+        texts
+            .iter()
+            .map(|t| {
+                let w = t.chars().count() as f64 * 10.0;
+                let b = BBox {
+                    x0: x,
+                    top,
+                    x1: x + w,
+                    bottom: top + 12.0,
+                };
+                x += w;
+                (t.to_string(), b)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn match_words_to_quote_single_line_tight_box() {
+        let words = words_on_line(
+            100.0,
+            &[
+                "本",
+                "项目",
+                "要求",
+                "投标人",
+                "须",
+                "在本市",
+                "注册",
+                "三年",
+            ],
+        );
+        let quote = "投标人须在本市注册";
+        let rects = match_words_to_quote(&words, quote);
+        assert_eq!(
+            rects.len(),
+            1,
+            "单行命中应合并为 1 个矩形，实际: {:?}",
+            rects
+        );
+        let r = &rects[0];
+        assert!(
+            (r.x0 - words[3].1.x0).abs() < 1e-6,
+            "x0 应紧贴首个命中词（投标人），实际: {:.3} vs 期望 {:.3}",
+            r.x0,
+            words[3].1.x0
+        );
+        assert!(
+            (r.x1 - words[6].1.x1).abs() < 1e-6,
+            "x1 应紧贴末个命中词（注册），不得吞掉「三年」"
+        );
+        assert!((r.top - 100.0).abs() < 1e-9 && (r.bottom - 112.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn match_words_to_quote_two_lines_two_boxes() {
+        let mut words = words_on_line(100.0, &["投标人", "须", "为中华"]);
+        words.extend(words_on_line(
+            130.0,
+            &["人民", "共和国", "境内", "注册", "的企业"],
+        ));
+        let quote = "投标人须为中华人民共和国境内注册";
+        let rects = match_words_to_quote(&words, quote);
+        assert_eq!(rects.len(), 2, "跨两行应得到 2 个矩形，实际: {:?}", rects);
+        assert!((rects[0].top - 100.0).abs() < 1e-9, "第一行 top 应为 100");
+        assert!((rects[1].top - 130.0).abs() < 1e-9, "第二行 top 应为 130");
+        // 第二行 x1 应停在「注册」，不吞掉「的企业」
+        assert!(
+            (rects[1].x1 - words[6].1.x1).abs() < 1e-6,
+            "第二行 x1 应紧贴注册，实际: {:.3} vs 期望 {:.3}",
+            rects[1].x1,
+            words[6].1.x1
+        );
+    }
+
+    #[test]
+    fn match_words_to_quote_unreliable_returns_empty() {
+        let words = words_on_line(100.0, &["本", "项目", "位于", "北京", "市", "朝阳"]);
+        let quote = "投标人须具有独立法人资格";
+        assert!(
+            match_words_to_quote(&words, quote).is_empty(),
+            "无重叠 quote 应返回空，前端回落 block 级高亮"
+        );
+    }
+
+    #[test]
+    fn match_words_to_quote_empty_inputs_return_empty() {
+        let words = words_on_line(100.0, &["本", "项目"]);
+        assert!(match_words_to_quote(&words, "").is_empty());
+        assert!(match_words_to_quote(&[], "投标人").is_empty());
+    }
+
+    #[test]
+    fn match_words_to_quote_english_with_spaces() {
+        let words = words_on_line(50.0, &["the", "quick", "brown", "fox", "jumps"]);
+        let quote = "the quick brown";
+        let rects = match_words_to_quote(&words, quote);
+        assert_eq!(
+            rects.len(),
+            1,
+            "英文带空格 quote 应命中单行，实际: {:?}",
+            rects
+        );
+        let r = &rects[0];
+        assert!((r.x0 - words[0].1.x0).abs() < 1e-6, "x0 应贴 the");
+        assert!(
+            (r.x1 - words[2].1.x1).abs() < 1e-6,
+            "x1 应贴 brown，不吞掉 fox/jumps"
         );
     }
 }

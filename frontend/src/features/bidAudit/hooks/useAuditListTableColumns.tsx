@@ -1,32 +1,36 @@
-import type { Dispatch, SetStateAction } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { App, Button, Space } from 'antd';
+import type { ColumnsType } from 'antd/es/table';
+import {
+   DeleteOutlined,
+   EyeOutlined,
+   UploadOutlined,
+} from '@ant-design/icons';
 
 import { EllipsisTooltip } from '@/components/EllipsisTooltip/EllipsisTooltip';
-
-import type { ProjectItem } from '../types';
-
-import { Button, Popconfirm, Space, Tag } from 'antd';
-import type { ColumnsType } from 'antd/es/table';
 import { useIsMobile } from '@/hooks/useMediaQuery';
+import { StatusTag } from '../components/StatusTag';
+import type { ProjectItem } from '../types';
 import dayjs from 'dayjs';
 
 interface ColumnsProps {
    styles: Record<string, string>;
-   setIsDrawerOpen: Dispatch<SetStateAction<boolean>>;
-   setSelectedProject: Dispatch<SetStateAction<number | null>>;
    handleDeleteProject: (projectId: number) => void;
    deletingProjectId: number | null;
    isDeletingProject: boolean;
+   onView: (projectId: number) => void;
 }
 
 export const useAuditListTableColumns = ({
    styles,
-   setIsDrawerOpen,
-   setSelectedProject,
    handleDeleteProject,
    deletingProjectId,
    isDeletingProject,
+   onView,
 }: ColumnsProps) => {
    const isMobile = useIsMobile();
+   const navigate = useNavigate();
+   const { modal } = App.useApp();
 
    const columns: ColumnsType<ProjectItem> = [
       {
@@ -40,94 +44,103 @@ export const useAuditListTableColumns = ({
          render: (text: string) => <EllipsisTooltip text={text ?? '-'} />,
       },
       {
-         title: '文件类型',
-         dataIndex: 'fileCategory',
-         key: 'fileCategory',
-         align: 'center',
-         width: 100,
-         render: (fileCategory: string) => (
-            <Tag color={'green'}>{fileCategory ?? '-'}</Tag>
-         ),
-      },
-      {
-         title: '供应商名称',
-         dataIndex: 'supplierName',
-         key: 'supplierName',
-         align: 'center',
-         width: 150,
-         ellipsis: true,
-         render: (text: string) => <EllipsisTooltip text={text ?? '-'} />,
-      },
-      {
          title: '上传时间',
          dataIndex: 'uploadTime',
          key: 'uploadTime',
          align: 'center',
-         width: 150,
+         width: 120,
          render: (text) => (text ? dayjs(text).format('YYYY-MM-DD') : '-'),
+      },
+      {
+         title: '版本',
+         dataIndex: 'version',
+         key: 'version',
+         align: 'center',
+         width: 80,
+         render: (version: number | null) => `V${version ?? '-'}`,
+      },
+      {
+         title: '审核状态',
+         key: 'auditStatus',
+         align: 'center',
+         width: 110,
+         render: (_, record) => (
+            <StatusTag parseStatus={record.parseStatus} />
+         ),
       },
       {
          title: '审核人',
          dataIndex: 'auditorName',
          key: 'auditorName',
          align: 'center',
-         width: 100,
+         width: 110,
          ellipsis: true,
          render: (text: string) => <EllipsisTooltip text={text ?? '-'} />,
-      },
-      {
-         title: '版本号',
-         dataIndex: 'version',
-         key: 'version',
-         align: 'center',
-         width: 100,
       },
       {
          title: '操作',
          key: 'actions',
          align: 'center',
-         width: 140,
+         width: 360,
+         fixed: 'right',
          render: (_, record) => {
             const deletingCurrent =
                isDeletingProject && deletingProjectId === record.projectId;
+
+            const confirmDelete = () => {
+               modal.confirm({
+                  title: '确定要删除该项目吗？',
+                  content:
+                     '删除后将同步移除该项目下全部版本与审核记录，且不可恢复。',
+                  okText: '确认删除',
+                  cancelText: '取消',
+                  okButtonProps: { danger: true },
+                  onOk: () => handleDeleteProject(record.projectId),
+               });
+            };
+
             return (
-               <Space size='small'>
+               <Space size='small' style={{ whiteSpace: 'nowrap' }}>
                   <Button
                      type='link'
+                     size='small'
+                     icon={<EyeOutlined />}
+                     className={styles.actionLinkBtn}
                      onClick={(e) => {
                         e.stopPropagation();
-                        setSelectedProject(record.projectId);
-                        setIsDrawerOpen(true);
+                        onView(record.projectId);
                      }}
-                     className={styles.actionLinkBtn}
                   >
-                     查看
+                     查看详情
                   </Button>
 
-                  <span className={styles.actionSeparator}>|</span>
-
-                  <Popconfirm
-                     title='确定要删除该项目吗？'
-                     description='删除后将同步移除该项目下全部版本与审核记录，且不可恢复。'
-                     okText='确认删除'
-                     cancelText='取消'
-                     okButtonProps={{ danger: true, loading: deletingCurrent }}
-                     onConfirm={(e) => {
-                        e?.stopPropagation();
-                        handleDeleteProject(record.projectId);
+                  <Button
+                     type='link'
+                     size='small'
+                     icon={<UploadOutlined />}
+                     className={styles.actionLinkBtn}
+                     onClick={(e) => {
+                        e.stopPropagation();
+                        navigate(`/upload/${record.projectId}`);
                      }}
-                     onCancel={(e) => e?.stopPropagation()}
                   >
-                     <Button
-                        type='link'
-                        danger
-                        className={styles.actionLinkBtn}
-                        loading={deletingCurrent}
-                        onClick={(e) => e.stopPropagation()}
-                     >
-                        删除
-                     </Button>
-                  </Popconfirm>
+                     上传新版本
+                  </Button>
+
+                  <Button
+                     type='link'
+                     size='small'
+                     danger
+                     icon={<DeleteOutlined />}
+                     loading={deletingCurrent}
+                     className={styles.actionLinkBtn}
+                     onClick={(e) => {
+                        e.stopPropagation();
+                        confirmDelete();
+                     }}
+                  >
+                     {deletingCurrent ? '删除中…' : '删除项目'}
+                  </Button>
                </Space>
             );
          },

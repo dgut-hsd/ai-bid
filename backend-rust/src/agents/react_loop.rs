@@ -19,7 +19,7 @@
 //! 审查过程中支持动态升降级（turn 2 检测）。
 
 use crate::agents::bus::{AgentBus, BusMessage};
-use crate::agents::review_event::{ReviewEvent, ReviewEventBus};
+use crate::agents::review_event::{FindingLifecycle, ReviewEvent, ReviewEventBus};
 use crate::agents::risk_taxonomy;
 use crate::agents::session_graph::SessionGraph;
 use crate::agents::trace::{TraceEventType, TraceLog};
@@ -485,6 +485,37 @@ fn canonical_category(value: &str) -> String {
     upper
 }
 
+/// 根据条款 tier 裁剪下发的工具清单。
+///
+/// L1（格式/信息类）提示词已禁止 read_section/web_search，这里同步停止为其
+/// 下发对应 schema——少发即少付费，且不改变审查行为；L2/L3 保持全量。
+/// 过滤保持原始顺序。
+fn tool_names_for_tier(all_tools: &[String], tier: RiskTier) -> Vec<String> {
+    match tier {
+        RiskTier::Low => all_tools
+            .iter()
+            .filter(|n| n.as_str() == "output_finding")
+            .cloned()
+            .collect(),
+        RiskTier::Medium | RiskTier::High => all_tools.to_vec(),
+    }
+}
+
+/// P2：「每轮全量重放冗长独白」是 token 膨胀的第二大来源（约 35%）。
+/// 压缩策略：独白里的推理链（事实→规则→结论）结论通常在尾部，因此截头保尾
+/// 比截尾保头更安全。阈值内原样返回；超过阈值只保留结论尾段，前缀加省略标记。
+fn compress_reasoning(content: &str, max_chars: usize) -> String {
+    let len = content.chars().count();
+    if len <= max_chars {
+        return content.to_string();
+    }
+    let tail: String = content.chars().skip(len - max_chars).collect();
+    format!("[前段推理已省略，仅保留结论尾段]\n{tail}")
+}
+
+/// P2 实验：独白压缩后保留的尾段字符数（约 500 中文字 ≈ 800 token）。
+const TRANSCRIPT_COMPRESS_TAIL: usize = 800;
+
 // ─── ReActLoop ─────────────────────────────────────────────────
 
 /// ReAct 循环引擎 — Agent 审查的运行时。
@@ -517,6 +548,8 @@ pub struct ReActLoop {
     pub review_events: Option<Arc<ReviewEventBus>>,
     /// 指标采集器（可选，启用时记录所有 LLM 调用明细）
     pub metrics: Option<Arc<Mutex<crate::metrics::MetricsCollector>>>,
+    /// P2 实验开关：压缩 assistant 冗长推理独白，只保留结论尾段重放（A/B 对比）。
+    pub compress_transcript: bool,
 }
 
 impl ReActLoop {
@@ -538,6 +571,7 @@ impl ReActLoop {
             print_lock: None,
             review_events: None,
             metrics: None,
+            compress_transcript: false,
         }
     }
 
@@ -585,6 +619,12 @@ impl ReActLoop {
         cache: Arc<Mutex<HashMap<(String, String), serde_json::Value>>>,
     ) -> Self {
         self.search_cache = cache;
+        self
+    }
+
+    /// 开/关 P2 transcript 压缩（A/B 实验用）。默认关闭。
+    pub fn with_transcript_compression(mut self, enabled: bool) -> Self {
+        self.compress_transcript = enabled;
         self
     }
 
@@ -806,7 +846,11 @@ impl ReActLoop {
                     在调用 output_finding 前必须逐段复核，不得只挑最严重的一条。\
                     使用 findings 数组逐条输出；不同事实、不同风险类别或不同修改建议应拆成不同 finding。\
                     无风险返回 findings=[]；最多5条，仍有遗漏可能时 has_more=true。\
-                    每条必须填写稳定 category_code 和只支撑该问题的 source_quote。"
+                    每条必须填写稳定 category_code 和只支撑该问题的 source_quote。risk_type 用中文短语，category_code 用英文稳定码。\
+                    【工具使用规范】web_search 按条款等级设硬性上限(L1≤1/L2≤2/L3≤4)，连续2次空结果立即停止；\
+                    source_quote 必须逐字截取条款原文，禁止改写、禁止凭记忆拼凑；\
+                    search_document 用提炼关键词，勿粘贴整段原文；\
+                    read_section 当前条款原文已在任务消息中时无需调用，同一 chunk 读取≥2次即停止。"
                     .to_string(),
             },
             ChatMessage::User {
@@ -946,7 +990,9 @@ impl ReActLoop {
                 });
             }
 
-            let tool_defs = self.tools.definitions_filtered(&self.config.tool_names);
+            let tool_defs = self
+                .tools
+                .definitions_filtered(&tool_names_for_tier(&self.config.tool_names, tier));
             let api_start = std::time::Instant::now();
             let response = match self.llm.chat(&conversation, &tool_defs, &tool_choice).await {
                 Ok(r) => {
@@ -1106,6 +1152,7 @@ impl ReActLoop {
                         risk_id: risk_id.to_string(),
                         clause_ids: vec![clause.chunk_id.clone()],
                         block_ids: Vec::new(),
+                        highlight_rects: Vec::new(),
                         agent: agent_name.clone(),
                         no_risk: true,
                         severity: RiskSeverity::Info,
@@ -1131,6 +1178,8 @@ impl ReActLoop {
                         verification_required: Vec::new(),
                         hypothesized_by: Vec::new(),
                         verified_by: Vec::new(),
+                        evidence_verdict: None,
+                        verifier_reason: None,
                         page_number: None,
                         section_path: None,
                         context: None,
@@ -1193,6 +1242,7 @@ impl ReActLoop {
                     risk_id: risk_id.to_string(),
                     clause_ids: vec![clause.chunk_id.clone()],
                     block_ids: Vec::new(),
+                    highlight_rects: Vec::new(),
                     agent: agent_name.clone(),
                     no_risk: false,
                     severity: RiskSeverity::Info,
@@ -1217,6 +1267,8 @@ impl ReActLoop {
                     verification_required: Vec::new(),
                     hypothesized_by: Vec::new(),
                     verified_by: Vec::new(),
+                    evidence_verdict: None,
+                    verifier_reason: None,
                     page_number: None,
                     section_path: None,
                     context: None,
@@ -1412,8 +1464,16 @@ impl ReActLoop {
             // ── Step 4: 执行工具调用 ──
             // 先追加 assistant 消息
             let assistant_tool_calls: Vec<ToolCall> = response.tool_calls.clone();
+            let assistant_content = if self.compress_transcript {
+                response
+                    .content
+                    .as_deref()
+                    .map(|c| compress_reasoning(c, TRANSCRIPT_COMPRESS_TAIL))
+            } else {
+                response.content
+            };
             conversation.push(ChatMessage::Assistant {
-                content: response.content,
+                content: assistant_content,
                 tool_calls: if assistant_tool_calls.is_empty() {
                     None
                 } else {
@@ -1484,7 +1544,7 @@ impl ReActLoop {
                 } else {
                     let available: Vec<String> = self
                         .tools
-                        .definitions_filtered(&self.config.tool_names)
+                        .definitions_filtered(&tool_names_for_tier(&self.config.tool_names, tier))
                         .iter()
                         .filter_map(|d| {
                             d.get("function")
@@ -2466,6 +2526,7 @@ pub async fn review_clauses_parallel_report<F>(
     review_events: Option<Arc<ReviewEventBus>>,
     agent_id: AgentId,
     execution_control: Option<Arc<crate::agents::execution_control::ReviewExecutionControl>>,
+    streamed_findings: Option<Arc<std::sync::Mutex<Vec<RiskFinding>>>>,
 ) -> ClauseReviewReport
 where
     F: Fn(Box<dyn LlmClient>, crate::agents::tools::ToolRegistry) -> ReActLoop
@@ -2484,6 +2545,7 @@ where
         agent_id,
         execution_control,
         None,
+        streamed_findings,
     )
     .await
 }
@@ -2500,6 +2562,7 @@ pub(crate) async fn review_clauses_parallel_report_with_progress<F>(
     agent_id: AgentId,
     execution_control: Option<Arc<crate::agents::execution_control::ReviewExecutionControl>>,
     progress: Option<ClauseReviewProgress>,
+    streamed_findings: Option<Arc<std::sync::Mutex<Vec<RiskFinding>>>>,
 ) -> ClauseReviewReport
 where
     F: Fn(Box<dyn LlmClient>, crate::agents::tools::ToolRegistry) -> ReActLoop
@@ -2666,11 +2729,48 @@ where
     }
 
     // 收集结果，按原始顺序排列
+    let clause_blocks: HashMap<String, Vec<String>> = clauses
+        .iter()
+        .map(|c| (c.chunk_id.clone(), c.source_block_ids.clone()))
+        .collect();
     let mut findings: Vec<Option<Vec<RiskFinding>>> = (0..total).map(|_| None).collect();
     while let Some(result) = join_set.join_next_with_id().await {
         match result {
             Ok((task_id, Ok((idx, clause_findings)))) => {
                 task_meta.remove(&task_id);
+                // 条款级流式落库 + 超时存活累积：一条条款一经完成立即：
+                // 1) 写入共享累积器，供 coordinator 在 Execute 超时 abort 后
+                //    仍能从 /result 带回已完成条款的发现；
+                // 2) 发射 FindingAdded（SSE 推向前端增量落库）。
+                for f in clause_findings.iter().filter(|f| !f.no_risk) {
+                    if let Some(ref acc) = streamed_findings {
+                        if let Ok(mut guard) = acc.lock() {
+                            guard.push(f.clone());
+                        }
+                    }
+                    if let Some(ref events) = review_events {
+                        let block_ids =
+                            collect_block_ids_for_clause_ids(&f.clause_ids, &clause_blocks, 10);
+                        events.emit(&ReviewEvent::FindingAdded {
+                            risk_id: f.risk_id.clone(),
+                            severity: f.severity.as_str().to_string(),
+                            is_critical: f.is_critical,
+                            critical_reason: f.critical_reason.clone(),
+                            risk_type: f.risk_type.clone(),
+                            agent: f.agent.clone(),
+                            confidence: f.confidence as f64,
+                            clause_ids: f.clause_ids.clone(),
+                            source_quote: f.source_quote.chars().take(500).collect(),
+                            legal_basis: f.legal_basis.clone(),
+                            reason: f.reason.chars().take(500).collect(),
+                            suggestion: f.suggestion.clone(),
+                            lifecycle: FindingLifecycle::Verified,
+                            page_number: f.page_number,
+                            section_path: f.section_path.clone(),
+                            block_ids,
+                        });
+                    }
+                }
                 findings[idx] = Some(clause_findings);
             }
             Ok((task_id, Err(e))) => {
@@ -2783,6 +2883,7 @@ where
         review_events,
         agent_id,
         execution_control,
+        None,
     )
     .await
     .findings
@@ -2918,6 +3019,7 @@ mod multi_finding_tests {
             page_end: 0,
             tier: RiskTier::Low,
             tier_max_turns: 1,
+            source_block_ids: vec![],
         }];
 
         let report = review_clauses_parallel_report(
@@ -2940,6 +3042,7 @@ mod multi_finding_tests {
             None,
             None,
             AgentId::Dynamic("TestAgent".to_string()),
+            None,
             None,
         )
         .await;
@@ -3043,6 +3146,7 @@ mod multi_finding_tests {
                 page_end: 0,
                 tier: RiskTier::Low,
                 tier_max_turns: 1,
+                source_block_ids: Vec::new(),
             },
             ReviewClause {
                 chunk_id: "ch_slow".to_string(),
@@ -3052,6 +3156,7 @@ mod multi_finding_tests {
                 page_end: 0,
                 tier: RiskTier::Low,
                 tier_max_turns: 1,
+                source_block_ids: Vec::new(),
             },
         ];
         let factory = {
@@ -3088,6 +3193,7 @@ mod multi_finding_tests {
                 Some(graph_for_review),
                 None,
                 AgentId::FactCheck,
+                None,
                 None,
             )
             .await
@@ -3136,6 +3242,7 @@ mod multi_finding_tests {
                 page_end: 0,
                 tier: RiskTier::Low,
                 tier_max_turns: 1,
+                source_block_ids: vec![],
             },
             ReviewClause {
                 chunk_id: "ch_002".to_string(),
@@ -3145,6 +3252,7 @@ mod multi_finding_tests {
                 page_end: 0,
                 tier: RiskTier::Low,
                 tier_max_turns: 1,
+                source_block_ids: vec![],
             },
         ];
         let factory = {
@@ -3184,6 +3292,7 @@ mod multi_finding_tests {
                 None,
                 AgentId::Dynamic("TestAgent".to_string()),
                 None,
+                None,
             )
             .await
         });
@@ -3211,6 +3320,7 @@ mod multi_finding_tests {
                 page_end: 0,
                 tier: RiskTier::Low,
                 tier_max_turns: 1,
+                source_block_ids: vec![],
             },
             ReviewClause {
                 chunk_id: "ch_timeout".to_string(),
@@ -3220,6 +3330,7 @@ mod multi_finding_tests {
                 page_end: 0,
                 tier: RiskTier::Low,
                 tier_max_turns: 1,
+                source_block_ids: vec![],
             },
         ];
         let limiter = Arc::new(
@@ -3256,6 +3367,7 @@ mod multi_finding_tests {
             None,
             AgentId::Dynamic("TestAgent".to_string()),
             Some(control),
+            None,
         )
         .await;
 
@@ -3306,6 +3418,7 @@ mod multi_finding_tests {
             page_end: 0,
             tier: RiskTier::Low,
             tier_max_turns: 1,
+            source_block_ids: Vec::new(),
         };
 
         let findings = agent.review(&[clause]).await;
@@ -3376,6 +3489,7 @@ mod multi_finding_tests {
             page_end: 0,
             tier: RiskTier::Medium,
             tier_max_turns: 1,
+            source_block_ids: Vec::new(),
         };
 
         let findings = agent.review(&[clause]).await;
@@ -3433,6 +3547,7 @@ mod multi_finding_tests {
             page_end: 0,
             tier: RiskTier::Medium,
             tier_max_turns: 1,
+            source_block_ids: Vec::new(),
         };
 
         let findings = agent.review(&[clause]).await;
@@ -3518,5 +3633,95 @@ mod multi_finding_tests {
     fn detects_numbered_multi_issue_chunk() {
         let text = "1.地域注册限制\n须本地注册\n2、保证金超限\n保证金5%\n3）单方变更";
         assert_eq!(numbered_item_count(text), 3);
+    }
+}
+
+#[cfg(test)]
+mod tool_gating_tests {
+    use super::*;
+
+    fn full_tools() -> Vec<String> {
+        vec![
+            "web_search".to_string(),
+            "search_document".to_string(),
+            "read_section".to_string(),
+            "output_finding".to_string(),
+            "search_contradiction".to_string(),
+        ]
+    }
+
+    /// L1（格式/信息类）只发终端工具：提示词已禁止 read_section/web_search，
+    /// schema 不应再被全量下发。
+    #[test]
+    fn low_tier_only_keeps_output_finding() {
+        let got = tool_names_for_tier(&full_tools(), RiskTier::Low);
+        assert_eq!(got, vec!["output_finding".to_string()]);
+    }
+
+    /// L2/L3 保持全量下发。
+    #[test]
+    fn medium_and_high_keep_all_tools() {
+        for tier in [RiskTier::Medium, RiskTier::High] {
+            let got = tool_names_for_tier(&full_tools(), tier);
+            assert_eq!(got, full_tools());
+        }
+    }
+
+    /// 边缘：如果工具集里没有 output_finding，L1 应得到空列表（不会 panic）。
+    #[test]
+    fn low_tier_without_output_finding_is_empty() {
+        let no_of = vec!["web_search".to_string(), "read_section".to_string()];
+        assert!(tool_names_for_tier(&no_of, RiskTier::Low).is_empty());
+    }
+
+    /// 保序：过滤不得改变原始顺序。
+    #[test]
+    fn filtering_preserves_order() {
+        let tools = vec![
+            "read_section".to_string(),
+            "output_finding".to_string(),
+            "web_search".to_string(),
+        ];
+        let got = tool_names_for_tier(&tools, RiskTier::Low);
+        assert_eq!(got, vec!["output_finding".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod transcript_compression_tests {
+    use super::*;
+
+    /// 阈值内原样返回，绝不改写短文本。
+    #[test]
+    fn short_content_is_untouched() {
+        let s = "结论：合规。";
+        assert_eq!(compress_reasoning(s, 800), s);
+    }
+
+    /// 超过阈值只保留结论尾段，前段换成省略标记；标记不含被截内容。
+    #[test]
+    fn long_content_keeps_tail_with_marker() {
+        let head = "事实".repeat(1000);
+        let tail = "结论：严重违约。";
+        let content = format!("{head}{tail}");
+        let compressed = compress_reasoning(&content, 20);
+        assert!(compressed.starts_with("[前段推理已省略"));
+        assert!(compressed.ends_with(tail));
+        assert!(!compressed.contains(head.as_str()), "冗长前段不应保留");
+        assert!(compressed.chars().count() < 200);
+    }
+
+    /// 尾段长度不超过 max_chars + 标记长度，且 UTF-8 边界安全（中文按字符计数）。
+    #[test]
+    fn tail_len_bounded_on_utf8() {
+        let content = "甲".repeat(3000);
+        let max = 500;
+        let compressed = compress_reasoning(&content, max);
+        let tail: String = compressed
+            .strip_prefix("[前段推理已省略，仅保留结论尾段]\n")
+            .unwrap()
+            .to_string();
+        assert_eq!(tail.chars().count(), max);
+        assert_eq!(tail, "甲".repeat(max));
     }
 }

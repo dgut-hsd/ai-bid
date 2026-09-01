@@ -15,6 +15,8 @@ public class RustReviewResponse {
     private String documentId;
     private List<RustRiskFinding> findings = new ArrayList<>();
     private RustRoutingSummary routingSummary;
+    /** Rust CoordinatorOutput.executionSummary（含 status + failed_stages，用于区分 completed / partial_failed） */
+    private RustExecutionSummary executionSummary;
     /** Rust CoordinatorOutput.graphSnapshot（可选，知识图谱用） */
     private java.util.Map<String, Object> graphSnapshot;
 }

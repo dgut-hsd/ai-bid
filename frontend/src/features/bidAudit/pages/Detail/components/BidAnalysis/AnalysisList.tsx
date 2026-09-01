@@ -1,8 +1,9 @@
 import React, { useMemo, useRef, useEffect } from 'react';
-import { Segmented, Typography, Tag, Space, Progress, Alert } from 'antd';
+import { Segmented, Typography, Tag, Space, Alert } from 'antd';
 import { useStyles } from '../../style';
 import type { AuditIssue } from '../../types';
 import type { BBoxData } from '../../components/PDFPreview/PdfPreview';
+import { mapBBoxEntries } from './bboxMapping';
 import { agentLabel, SEVERITY_MAP } from '@/types/audit';
 import { useUrlState } from '@/hooks/useUrlState';
 
@@ -263,9 +264,9 @@ const parseSourceReference = (reference?: string): ParsedSourceRef | null => {
    const baseName = nameParts.length ? nameParts[nameParts.length - 1] : String(fileName || '');
    const previewUrl =
       sourceType === 'knowledge' && fileId
-         ? `/api/knowledge-files/${fileId}/preview`
+         ? `${import.meta.env.VITE_API_BASE_URL}/api/knowledge-files/${fileId}/preview`
          : fileId
-            ? `/api/bid-documents/${fileId}/download`
+            ? `${import.meta.env.VITE_API_BASE_URL}/api/bid-documents/${fileId}/download`
             : undefined;
    return {
       fileName: baseName || '未返回来源文件',
@@ -533,6 +534,11 @@ const buildIssueExplanation = (issue: AuditIssue, raw?: string): string => {
    return text;
 };
 
+const EVIDENCE_VERDICT_META: Record<string, { label: string; color: string }> = {
+   refute: { label: '被反驳', color: 'error' },
+   insufficient: { label: '证据不足', color: 'default' },
+};
+
 interface AnalysisListProps {
    issues: AuditIssue[];
    isComplete: boolean;
@@ -544,7 +550,7 @@ interface AnalysisListProps {
    /** 审核任务 ID（用于 bbox API 调用） */
    taskId?: string | null;
    /** BBox-based 精确高亮回调（优先于文本匹配） */
-   onLocateBboxes?: (page: number, bboxes: BBoxData[]) => void;
+   onLocateBboxes?: (page: number, bboxes: BBoxData[], highlightText?: string, fallbackTokens?: string[]) => void;
 }
 
 /** 高亮模式配置：auto=优先BBox失败回落 | bbox=仅BBox | text=仅文本匹配 */
@@ -564,21 +570,26 @@ async function fetchBlockBboxes(taskId: string, blockIds: string[]): Promise<BBo
   const json = await resp.json();
   const list = json?.data || [];
   console.info('[bbox-fetch] got %d bbox entries for %d blockIds', list.length, blockIds.length);
-  return list.map((item: Record<string, any>) => ({
-    x0: item.bbox?.x0 ?? 0,
-    top: item.bbox?.top ?? 0,
-    x1: item.bbox?.x1 ?? 0,
-    bottom: item.bbox?.bottom ?? 0,
-    pageWidth: item.page_width ?? 595,
-    page: (item.page ?? 0) + 1,            // ← 新增：把后端返回的 page 带出来
-  }));
+  return mapBBoxEntries(list);
 }
 
 export const AnalysisList: React.FC<AnalysisListProps> = React.memo(
    ({ issues, isComplete, onLocateIssuePage, currentFileName, currentFileId, onIssueClick, taskId, onLocateBboxes }) => {
       const { theme, styles } = useStyles();
-      const [queryParams, setQueryParams] = useUrlState({ tab: 'all' });
+      // 初始 tab：若进入时审核已完成，默认直接落在「高风险」；审核进行中进入则默认「全部」。
+      const [queryParams, setQueryParams] = useUrlState({ tab: isComplete ? 'high' : 'all' });
       const currentTab = queryParams.tab;
+
+      // 「未完成 → 完成」瞬间自动切「高风险」（适用于审核中已停留在结果页的场景），
+      // 只在转换时刻切一次，之后尊重用户手动切换。
+      const prevCompleteRef = useRef(isComplete);
+      useEffect(() => {
+         if (isComplete && !prevCompleteRef.current) {
+            setQueryParams({ tab: 'high' });
+         }
+         prevCompleteRef.current = isComplete;
+      }, [isComplete]);
+
       const visibleIssues = useMemo(
          () => (issues || []).filter((i) => i && shouldRenderIssue(i)),
          [issues]
@@ -663,28 +674,44 @@ export const AnalysisList: React.FC<AnalysisListProps> = React.memo(
             if (page == null) return;
             const src = extractSourceInfo(target, currentFileName, currentFileId);
             const normalizedPage = normalizeLocatePage(page, src.fileName);
+            // ★ 首选：后端已算好词级紧致框（highlight_rects），直接按坐标渲染，
+            //   无需再 fetch /blocks，也无需走 pdf.js 文本层收敛（避免其固有误差）。
+            const preciseRects = Array.isArray(target.highlightRects) ? target.highlightRects : [];
+            if (HIGHLIGHT_MODE !== 'text' && preciseRects.length > 0 && onLocateBboxes) {
+               const boxes: BBoxData[] = preciseRects.map((r) => ({
+                  x0: r.x0,
+                  top: r.top,
+                  x1: r.x1,
+                  bottom: r.bottom,
+                  pageWidth: r.pageWidth,
+                  page: (r.page ?? 0) + 1, // 后端 page 为 0-based → 前端 1-based data-page-num
+               }));
+               onLocateBboxes(normalizedPage, boxes);
+               return;
+            }
             const useBbox =
                HIGHLIGHT_MODE !== 'text' &&
                target.blockIds &&
                target.blockIds.length > 0 &&
                taskId &&
                onLocateBboxes;
+            // 文本定位素材提前计算：bbox 路径也要用作「文本层精确收敛」的 source_quote
+            const parsedDesc = parseIssueText(target.description);
+            const hl = buildHighlightText(
+               target,
+               buildIssueExplanation(target, parsedDesc?.rationale || sanitizeDisplayText(target.description)),
+               target.category || '审查问题'
+            );
+            const tokens = Array.isArray(target.anchorTokens)
+               ? target.anchorTokens.map((t) => String(t || '').trim()).filter(Boolean).slice(0, 5)
+               : [];
             const fallback = () => {
-               const p = parseIssueText(target.description);
-               const hl = buildHighlightText(
-                  target,
-                  buildIssueExplanation(target, p?.rationale || sanitizeDisplayText(target.description)),
-                  target.category || '审查问题'
-               );
-               const tokens = Array.isArray(target.anchorTokens)
-                  ? target.anchorTokens.map((t) => String(t || '').trim()).filter(Boolean).slice(0, 5)
-                  : [];
                onLocateIssuePage(normalizedPage, hl, tokens);
             };
             if (useBbox) {
                fetchBlockBboxes(taskId!, target.blockIds!)
                   .then((bboxes) => {
-                     if (bboxes.length > 0) onLocateBboxes!(normalizedPage, bboxes);
+                     if (bboxes.length > 0) onLocateBboxes!(normalizedPage, bboxes, hl, tokens);
                      else if (HIGHLIGHT_MODE === 'auto') fallback();
                   })
                   .catch(() => {
@@ -706,7 +733,9 @@ export const AnalysisList: React.FC<AnalysisListProps> = React.memo(
                   issue,
                   parsed?.rationale || rawDescription
                );
-               const rationale = `${buildAnchorPrefix(issue)}\n【问题说明】${rationaleBody}`;
+               const verdictMeta = issue.evidenceVerdict ? EVIDENCE_VERDICT_META[issue.evidenceVerdict] : undefined;
+               const isVerifierSupported = issue.evidenceVerdict === 'support' && Boolean((issue.verifierReason || '').trim());
+               const rationale = isVerifierSupported ? `${buildAnchorPrefix(issue)}\n【证据核验】${String(issue.verifierReason || '').trim()}` : `${buildAnchorPrefix(issue)}\n【问题说明】${rationaleBody}`;
                if (!hasMeaningfulContent(title, rationale)) {
                   return null;
                }
@@ -748,21 +777,25 @@ export const AnalysisList: React.FC<AnalysisListProps> = React.memo(
                         e.currentTarget.style.boxShadow = 'none';
                      }}
                   >
-                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                     <div
+                        onClick={(e) => {
+                           e.stopPropagation();
+                           handleLocate();
+                        }}
+                        style={{
+                           display: 'flex',
+                           alignItems: 'center',
+                           justifyContent: 'space-between',
+                           marginBottom: 8,
+                           cursor: pageNo ? 'pointer' : 'default',
+                        }}
+                     >
                         <Space size={8}>
                            <Tag
                               style={{ fontSize: '1rem' }}
                               color="green"
                            >
-                              <span
-                                 onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleLocate();
-                                 }}
-                                 style={{ cursor: pageNo ? 'pointer' : 'default' }}
-                              >
-                                 {pageNo ? `第 ${pageNo} 页` : '页码待定位'}
-                              </span>
+                              {pageNo ? `第 ${pageNo} 页` : '页码待定位'}
                            </Tag>
 
                            {title ? (
@@ -797,20 +830,13 @@ export const AnalysisList: React.FC<AnalysisListProps> = React.memo(
                         </Space>
                      </div>
 
-                     {/* Confidence + Truncated */}
+                     {/* 核验结论 + Truncated */}
                      <div style={{ marginTop: 4, marginBottom: 6 }}>
-                        {issue.confidence !== undefined && (
+                        {verdictMeta && (
                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                              <Progress
-                                 percent={Math.round(issue.confidence * 100)}
-                                 size="small"
-                                 style={{ width: 120, margin: 0 }}
-                                 format={(p) => `置信度 ${p}%`}
-                                 strokeColor={
-                                    issue.confidence < 0.5 ? '#f5222d' :
-                                    issue.confidence < 0.7 ? '#fa8c16' : '#52c41a'
-                                 }
-                              />
+                              <Tag color={verdictMeta.color} style={{ fontSize: 12, margin: 0 }}>
+                                 {verdictMeta.label}
+                              </Tag>
                            </div>
                         )}
                         {issue.truncated && (

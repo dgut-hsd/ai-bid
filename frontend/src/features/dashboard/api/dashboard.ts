@@ -1,25 +1,14 @@
 import request from '@/api/request';
 import type { BaseResponse } from '@/api/types';
 import type {
-   AuditCount,
    IssueChartItem,
    DistributionResponse,
    ProjectItem,
    ProjectParams,
-   AuditCountItem,
+   DailyIssueCountItem,
 } from '../types';
 import { mutationOptions, queryOptions } from '@tanstack/react-query';
 import { getStoredCurrentTenantId } from '@/store/slices/authSlice';
-
-const WEEKDAY_LABEL_MAP: Record<string, string> = {
-   Monday: '周一',
-   Tuesday: '周二',
-   Wednesday: '周三',
-   Thursday: '周四',
-   Friday: '周五',
-   Saturday: '周六',
-   Sunday: '周日',
-};
 
 export const getDashboardList = async (): Promise<ProjectItem[]> => {
    const res = await request.get<
@@ -70,25 +59,28 @@ export const getIssueDistribution = async (): Promise<IssueChartItem[]> => {
    );
 
    const data = res.data;
+   if (!data || typeof data !== 'object') return [];
 
-   return [
-      { name: '合规性', value: data?.budget || 0 },
-      { name: '法律法规', value: data?.legal || 0 },
-      { name: '采购需求', value: data?.demand || 0 },
-   ];
+   // category 列实际存的是 Rust 引擎 risk_type（"地域歧视"/"品牌指定"/… 等中文标签），
+   // 直接透传后端 map 的 key/value，不再硬编码 budget/legal/demand 三个旧分类。
+   return Object.entries(data)
+      .map(([name, value]) => ({ name, value: Number(value) || 0 }))
+      .filter((item) => item.value > 0)
+      .sort((a, b) => b.value - a.value);
 };
 
-export const getAuditCount = async (): Promise<AuditCountItem[]> => {
-   const res = await request.get<unknown, BaseResponse<AuditCount>>(
-      '/api/audit-tasks/count-audit'
+export const getDailyIssueCount = async (): Promise<DailyIssueCountItem[]> => {
+   const res = await request.get<unknown, BaseResponse<Record<string, number>>>(
+      '/api/audit-issues/count-by-day'
    );
 
    const data = res.data;
 
-   if (!data) return [];
+   if (!data || typeof data !== 'object') return [];
 
-   return Object.entries(data).map(([key, value]) => ({
-      name: WEEKDAY_LABEL_MAP[key] ?? key,
+   // 后端返回 Map<当月第几日, 问题数>，直接透传
+   return Object.entries(data).map(([day, value]) => ({
+      name: day,
       count: Number(value) || 0,
    }));
 };
@@ -116,12 +108,12 @@ export const dashboardOptions = {
          staleTime: 0,
       });
    },
-   auditCount: (tenantId?: string | null) => {
+   dailyIssues: (tenantId?: string | null) => {
       const resolvedTenantId =
          tenantId === undefined ? getStoredCurrentTenantId() : tenantId;
       return queryOptions({
-         queryKey: ['auditCount', resolvedTenantId],
-         queryFn: () => getAuditCount(),
+         queryKey: ['dailyIssues', resolvedTenantId],
+         queryFn: () => getDailyIssueCount(),
          enabled: Boolean(resolvedTenantId),
          placeholderData: (previousData) => previousData,
          staleTime: 0,

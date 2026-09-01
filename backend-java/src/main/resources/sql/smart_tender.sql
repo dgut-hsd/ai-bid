@@ -80,7 +80,7 @@ CREATE TABLE `audit_issue` (
   `severity` varchar(20) DEFAULT NULL COMMENT '四级严重程度（high/medium/low/info）',
   `is_critical` tinyint(1) NOT NULL DEFAULT 0 COMMENT '是否重大/红线问题',
   `critical_reason` text COMMENT '重大问题判定依据',
-  `category` varchar(50) DEFAULT NULL COMMENT '问题类型（budget预算合规性/demand需求合规性/legal政策合法性）',
+  `category` varchar(50) DEFAULT NULL COMMENT '风险类型（Rust引擎risk_type，如：地域歧视/品牌指定/程序违规）',
   `description` text COMMENT '问题描述',
   `suggestion` text COMMENT '修改建议',
   `page_number` int(11) DEFAULT NULL COMMENT '页码',
@@ -123,6 +123,7 @@ CREATE TABLE `knowledge_file` (
   `status` tinyint(4) DEFAULT 1 COMMENT '状态（0停用 1启用 2已删除）',
   `version` int(11) DEFAULT 1 COMMENT '版本号',
   `chunk_count` int(11) DEFAULT 0 COMMENT '分块数量',
+  `rust_document_id` varchar(64) DEFAULT NULL COMMENT 'Rust/Qdrant 文档ID（向量化入库成功后回填，删除时用于清理向量）',
   `upload_user_id` bigint(20) DEFAULT NULL COMMENT '上传用户ID',
   `upload_time` datetime DEFAULT NULL COMMENT '上传时间',
   `update_time` datetime DEFAULT NULL COMMENT '更新时间',
@@ -130,7 +131,8 @@ CREATE TABLE `knowledge_file` (
   KEY `idx_category` (`category`),
   KEY `idx_status` (`status`),
   KEY `idx_upload_user_id` (`upload_user_id`),
-  KEY `idx_upload_time` (`upload_time`)
+  KEY `idx_upload_time` (`upload_time`),
+  KEY `idx_rust_document_id` (`rust_document_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='标准库文件表';
 
 DROP TABLE IF EXISTS `knowledge_chunk`;

@@ -12,6 +12,8 @@ import com.ithsd.smart_tender.service.TenderService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDate;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -31,6 +33,7 @@ public class AuditIssueServiceImpl extends ServiceImpl<AuditIssueMapper, AuditIs
 
     @Override
     public Map<String, Long> countByCategory() {
+        Long tenantId = TenantScope.requiredTenantId();
         List<Long> bidIds = tenderService.getBidIdsByUserId(BaseContext.getCurrentId());
         List<Long> auditIds = auditTaskService.getAuditIdsByBidIds(bidIds);
         if(auditIds.isEmpty())
@@ -39,6 +42,7 @@ public class AuditIssueServiceImpl extends ServiceImpl<AuditIssueMapper, AuditIs
         QueryWrapper<AuditIssue> queryWrapper = new QueryWrapper<>();
         queryWrapper.select("category", "count(1) as count")
                 .in("audit_id", auditIds)
+                .eq("tenant_id", tenantId)
                 .groupBy("category");
 
         List<Map<String, Object>> result = this.baseMapper.selectMaps(queryWrapper);
@@ -46,9 +50,36 @@ public class AuditIssueServiceImpl extends ServiceImpl<AuditIssueMapper, AuditIs
         return result.stream()
                 .collect(java.util.stream.Collectors.toMap(
                         row -> (String) row.get("category"),
-                        row -> (Long) row.get("count"),
+                        row -> ((Number) row.get("count")).longValue(),
                         Long::sum
                 ));
 
+    }
+
+    @Override
+    public Map<String, Long> countByDayCurrentMonth() {
+        List<Long> bidIds = tenderService.getBidIdsByUserId(BaseContext.getCurrentId());
+        List<Long> auditIds = auditTaskService.getAuditIdsByBidIds(bidIds);
+
+        LocalDate today = LocalDate.now();
+        Map<String, Long> result = new LinkedHashMap<>();
+        for (int d = 1; d <= today.lengthOfMonth(); d++) {
+            result.put(String.valueOf(d), 0L);
+        }
+        if (auditIds.isEmpty()) {
+            return result;
+        }
+
+        List<Map<String, Object>> rows = this.baseMapper.countIssuesByDayCurrentMonth(auditIds);
+        for (Map<String, Object> row : rows) {
+            Object dayNum = row.get("day_num");
+            if (dayNum == null) {
+                continue;
+            }
+            int day = ((Number) dayNum).intValue();
+            long count = row.get("count") == null ? 0L : ((Number) row.get("count")).longValue();
+            result.put(String.valueOf(day), count);
+        }
+        return result;
     }
 }

@@ -42,12 +42,16 @@ interface BidAnalysisProps {
   currentFileName?: string;
   currentFileId?: number;
   /** BBox-based 精确高亮回调（AnalysisList → DetailPage → PdfPreview） */
-  onLocateBboxes?: (page: number, bboxes: import('../../components/PDFPreview/PdfPreview').BBoxData[]) => void;
+  onLocateBboxes?: (page: number, bboxes: import('../../components/PDFPreview/PdfPreview').BBoxData[], highlightText?: string, fallbackTokens?: string[]) => void;
   agentProgresses?: Map<string, AgentProgress>;
   liveFeedEvents?: TraceEventType[];
   phaseEvent?: PhaseEvent | null;
   statsEvent?: StatsEvent | null;
   liveFindings?: FindingAddedEvent[];
+  /** 部分失败阶段名（如 evidence_verify），非空表示结果经过降级、未经完整核验 */
+  failedStages?: string[];
+  /** 透传给根节点，移动端用于控制显示/隐藏 */
+  style?: React.CSSProperties;
 }
 
 /**
@@ -77,17 +81,17 @@ const BidAnalysis: React.FC<BidAnalysisProps> = ({
   phaseEvent,
   statsEvent,
   liveFindings,
+  failedStages,
+  style,
 }) => {
   const { styles } = useStyles();
   const navigate = useNavigate();
   const { id: routeBidId } = useParams<{ id: string }>();
   const rightPanelRef = React.useRef<HTMLDivElement>(null);
-  const [activeTab, setActiveTab] = useState<DetailTab>(() => {
-    // 已审过的项目（本地有 taskId 记录）→ 默认进「审核结果」；
-    // 未审过的项目（无 taskId）→ 默认进「审核过程」（含「开始审核」按钮）。
-    // 进行中 / 已完成的状态由下方副作用在 hydrating 后校准，避免闪错。
-    return taskId ? 'results' : 'process';
-  });
+  // 默认始终先展示「审核过程」：未开始的项目在这里看到「开始审核」按钮，
+  // 已开始/进行中的项目在这里看到进度，已完成的也在这里先看到「审核完成」横幅，
+  // 再由横幅上的「查看审核结果」入口手动切到「审核结果」，避免一进来就只丢结果。
+  const [activeTab, setActiveTab] = useState<DetailTab>('process');
   const [drawerIssue, setDrawerIssue] = useState<AuditIssue | null>(null);
 
   // 审核开始时自动切到"审核过程"。
@@ -137,6 +141,7 @@ const BidAnalysis: React.FC<BidAnalysisProps> = ({
             <PipelineProgress
               currentStage={currentStage}
               isComplete={isComplete}
+              failedStages={failedStages || []}
               onViewResults={() => setActiveTab('results')}
             />
           )}
@@ -250,7 +255,7 @@ const BidAnalysis: React.FC<BidAnalysisProps> = ({
   ];
 
   return (
-    <div ref={rightPanelRef} className={styles.rightPanel}>
+    <div ref={rightPanelRef} className={styles.rightPanel} style={style}>
       <Tabs
         activeKey={activeTab}
         onChange={(key) => setActiveTab(key as DetailTab)}

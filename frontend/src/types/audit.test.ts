@@ -5,6 +5,7 @@
  * completeness. No DOM or API mocking is needed since everything tested
  * here is a pure function or a static Record.
  */
+import { describe, expect, it } from 'vitest';
 import {
   agentLabel,
   SEVERITY_MAP,

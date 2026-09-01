@@ -223,6 +223,28 @@ export const useStyles = createStyles(({ css, token }) => ({
         font-size: 13px;
         line-height: 1.7;
         color: ${token.colorTextBase};
+        word-break: break-word;
+
+        h1, h2, h3, h4, h5, h6 {
+          margin: 14px 0 6px;
+          line-height: 1.4;
+          font-weight: 600;
+          color: ${token.colorTextBase};
+
+          &:first-child {
+            margin-top: 0;
+          }
+        }
+
+        h1 { font-size: 18px; }
+        h2 { font-size: 16px; }
+        h3 { font-size: 15px; }
+        h4 { font-size: 14px; }
+        h5 { font-size: 13px; }
+        h6 {
+          font-size: 12px;
+          color: ${token.colorTextSecondary};
+        }
 
         p {
           margin: 0 0 8px;
@@ -257,6 +279,15 @@ export const useStyles = createStyles(({ css, token }) => ({
           font-weight: 600;
         }
 
+        a {
+          color: ${token.colorPrimary};
+          text-decoration: none;
+
+          &:hover {
+            text-decoration: underline;
+          }
+        }
+
         code {
           padding: 1px 5px;
           border-radius: 4px;
@@ -289,13 +320,17 @@ export const useStyles = createStyles(({ css, token }) => ({
         table {
           margin: 8px 0;
           border-collapse: collapse;
+          display: block;
           width: 100%;
+          max-width: 100%;
+          overflow-x: auto;
           font-size: 12px;
 
           th, td {
             border: 1px solid ${token.colorBorderSecondary};
             padding: 6px 10px;
             text-align: left;
+            white-space: nowrap;
           }
 
           th {

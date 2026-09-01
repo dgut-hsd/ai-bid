@@ -1,0 +1,206 @@
+# ── ai-bid 全栈编排 ──
+# 一个项目一套独立网络 + 独立命名卷，多项目（A/B/C）互不干扰。
+# 用法：cd deploy && cp .env.example .env（改好密钥）&& docker compose up -d --build
+
+name: ai-bid
+
+services:
+  # ───────────────────────── 前端 ─────────────────────────
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: aib-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend-java
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    networks: [default]
+
+  # ───────────────────────── Java 业务后端 ─────────────────────────
+  backend-java:
+    build:
+      context: ../backend-java
+      dockerfile: Dockerfile
+    container_name: aib-backend-java
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend-rust:
+        condition: service_started
+    environment:
+      # MySQL（覆盖 application.yml 的 localhost 连接）
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-smart_tender_system}?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8&useSSL=false&allowPublicKeyRetrieval=true&socketTimeout=60000&connectTimeout=5000"
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER:-root}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_ROOT_PASSWORD:-1234}
+      # Redis（覆盖 localhost）
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      SPRING_DATA_REDIS_DATABASE: "10"
+      # Rust 引擎（覆盖 127.0.0.1 → 容器服务名）
+      RUST_API_BASE_URL: http://backend-rust:3001
+      RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
+      # Rust 审核总超时（分钟），大标书（如 92 页）需 >30；不设则回退 60
+      RUST_REVIEW_TIMEOUT_MINUTES: "${RUST_REVIEW_TIMEOUT_MINUTES:-60}"
+      # JWT 密钥
+      ST_JWT_SECRET: ${ST_JWT_SECRET:-local-test-only-jwt-secret-change-me}
+      # 初始管理员密码（仅新装首次建号时使用；已存在的 admin 手动在 DB 改）
+      AIBID_BOOTSTRAP_ADMIN_PASSWORD: "${AIBID_BOOTSTRAP_ADMIN_PASSWORD}"
+      # JVM 堆上限（宿主机 7.7G 无 swap，避免 JVM+LibreOffice 撑爆触发 OOM）
+      JAVA_TOOL_OPTIONS: "-Xmx1024m"
+      # 孤儿任务守护（Spring relaxed binding：AUDIT_ORPHAN_* → audit.orphan.*）
+      AUDIT_ORPHAN_ENABLED: "${AUDIT_ORPHAN_ENABLED:-true}"
+      AUDIT_ORPHAN_SWEEP_INTERVAL_MS: "${AUDIT_ORPHAN_SWEEP_INTERVAL_MS:-60000}"
+      AUDIT_ORPHAN_STALE_AFTER_MS: "${AUDIT_ORPHAN_STALE_AFTER_MS:-600000}"
+      # 文件存储（覆盖 prod profile 里硬编码的 /opt 路径）
+      FILE_STORAGE_PATH: /data/uploads
+      PREVIEW_CACHE_PATH: /data/preview-cache
+    volumes:
+      - app_data:/data
+    mem_limit: 1536m
+    mem_reservation: 512m
+    networks: [default]
+
+  # ───────────────────────── Rust 审核引擎 ─────────────────────────
+  backend-rust:
+    build:
+      context: ../backend-rust
+      dockerfile: Dockerfile
+    container_name: aib-backend-rust
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_started
+      neo4j:
+        condition: service_started
+    environment:
+      # 必须监听 0.0.0.0，否则 Java 容器访问不到（默认是 127.0.0.1）
+      AIBID_RUST_BIND: 0.0.0.0:3001
+      AIBID_DATA_DIR: /data
+      # Python pdfplumber 兜底脚本的可执行文件（容器只有 python3，没有 python 软链）
+      AI_BID_PYTHON_EXECUTABLE: python3
+      # LLM
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      DASHSCOPE_MODEL: ${DASHSCOPE_MODEL:-qwen-turbo}
+      AIBID_LLM_PROTOCOL: ${AIBID_LLM_PROTOCOL:-dashscope}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      # 搜索 / 嵌入
+      AIBID_SEARCH_BACKEND: ${AIBID_SEARCH_BACKEND:-dashscope}
+      EMBED_ENGINE: ${EMBED_ENGINE:-remote}
+      # Multi-Agent
+      AIBID_AGENT: ${AIBID_AGENT:-1}
+      AIBID_COORDINATOR: ${AIBID_COORDINATOR:-1}
+      # 审核管线总超时（分钟），默认 60；大标书需更长时间完成证据核验
+      AIBID_PIPELINE_TIMEOUT_MINUTES: "${AIBID_PIPELINE_TIMEOUT_MINUTES:-60}"
+      # 证据核验多组并行度（默认 6），调大可加速、调小可避免 LLM 限流
+      AIBID_EVIDENCE_VERIFY_CONCURRENCY: "${AIBID_EVIDENCE_VERIFY_CONCURRENCY:-6}"
+      # 主分析 Token 预算上限（输入+输出，默认 2.5M）：撞上限时各 Agent 优雅交卷，
+      # 而不是被 Execute 超时 abort 后丢弃已完成的发现。证据核验不占此预算。
+      AIBID_BUDGET_TOTAL_TOKENS: "${AIBID_BUDGET_TOTAL_TOKENS:-2500000}"
+      # Execute 阶段超时（分钟，默认 30）。193 条款标书完整执行约 17 分钟，20 分钟曾
+      # 骑在边界上导致超时 abort 丢弃在途发现；条款级流式落库保证即使超时也只丢少量条款。
+      AIBID_EXECUTE_TIMEOUT_MINUTES: "${AIBID_EXECUTE_TIMEOUT_MINUTES:-30}"
+      # P2 实验开关：压缩 assistant 冗长推理独白（只重放结论尾段）。=1/true/on 开启，
+      # 走 transcript_compress 实验组；关闭走 control 组。默认关（保守）。
+      AIBID_COMPRESS_TRANSCRIPT: "${AIBID_COMPRESS_TRANSCRIPT:-}"
+      # 关闭 qwen3.x 思考(reasoning)模式：请求体追加 enable_thinking=false，显著提速降本。
+      # 法律条款审查看重工具链+法条引用而非逐步推理。=1/true/on 开启。
+      AIBID_DISABLE_THINKING: "${AIBID_DISABLE_THINKING:-}"
+      # Java ↔ Rust 内部签名密钥（必须与 Java 一致）
+      RUST_API_INTERNAL_SECRET: ${RUST_API_INTERNAL_SECRET:-dev-internal-secret-key-2024}
+      # 向量库 / 图库
+      QDRANT_URL: http://qdrant:6334
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-b1234567}
+    volumes:
+      - rust_data:/data
+    networks: [default]
+
+  # ───────────────────────── MySQL ─────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: aib-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-1234}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-smart_tender_system}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # 降低落盘频次：写突发时 InnoDB 每秒一次 fsync 而非每次提交都 fsync，
+      # 避免瞬时卡顿（极端断电最多丢最近 ~1s 已提交事务，数据文件不损坏）
+      - --innodb-flush-log-at-trx-commit=2
+      - --sync-binlog=0
+      # 打开慢查询日志，便于下次定位具体是哪条 SQL 卡住
+      - --slow-query-log=1
+      - --long-query-time=2
+    ports:
+      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    mem_limit: 2g
+    mem_reservation: 1g
+    networks: [default]
+
+  # ───────────────────────── Redis ─────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: aib-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [default]
+
+  # ───────────────────────── Qdrant 向量库（Rust 依赖） ─────────────────────────
+  qdrant:
+    image: qdrant/qdrant:v1.17.0
+    container_name: aib-qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks: [default]
+
+  # ───────────────────────── Neo4j 图库（Rust 依赖） ─────────────────────────
+  neo4j:
+    image: neo4j:5.21
+    container_name: aib-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-b1234567}
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks: [default]
+
+# ───────────────────────── 命名卷 ─────────────────────────
+volumes:
+  mysql_data:
+  redis_data:
+  qdrant_data:
+  neo4j_data:
+  neo4j_logs:
+  app_data:
+  rust_data:

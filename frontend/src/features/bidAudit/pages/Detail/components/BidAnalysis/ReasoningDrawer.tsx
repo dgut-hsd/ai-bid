@@ -6,11 +6,13 @@ import {
   SafetyCertificateOutlined,
   BookOutlined,
   BulbOutlined,
+  AuditOutlined,
 } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { AuditIssue } from '@/types/audit';
 import { SEVERITY_MAP, SEVERITY_COLORS, agentLabel } from '@/types/audit';
+import { useIsMobile } from '@/hooks/useMediaQuery';
 import TierBadge from './TierBadge';
 import CitationList from './CitationList';
 
@@ -28,6 +30,7 @@ const GREEN_BG = '#f6ffed';
 const SUGGESTION_BG = '#fffbe6';
 
 const ReasoningDrawer: React.FC<Props> = ({ issue, open, onClose, onLocatePage }) => {
+  const isMobile = useIsMobile();
   if (!issue) return null;
 
   const severityColor = SEVERITY_COLORS[issue.severity] || '#1890ff';
@@ -51,7 +54,7 @@ const ReasoningDrawer: React.FC<Props> = ({ issue, open, onClose, onLocatePage }
       open={open}
       onCancel={onClose}
       footer={null}
-      width={920}
+      width={isMobile ? '100%' : 920}
       centered
       styles={{
         content: {
@@ -60,7 +63,7 @@ const ReasoningDrawer: React.FC<Props> = ({ issue, open, onClose, onLocatePage }
           padding: 0,
         },
         header: {
-          padding: '18px 28px 18px 80px',
+          padding: isMobile ? '18px 20px 18px 64px' : '18px 28px 18px 80px',
         },
         body: {
           position: 'static',
@@ -106,7 +109,7 @@ const ReasoningDrawer: React.FC<Props> = ({ issue, open, onClose, onLocatePage }
       </div>
 
       {/* ── 可滚动内容 ── */}
-      <div style={{ maxHeight: 'calc(100vh - 200px)', overflowY: 'auto', padding: '12px 28px 24px' }}>
+      <div style={{ maxHeight: isMobile ? 'calc(100dvh - 160px)' : 'calc(100vh - 200px)', overflowY: 'auto', padding: isMobile ? '12px 16px 24px' : '12px 28px 24px' }}>
       {/* ── 截断警告 ── */}
       {issue.truncated && (
         <Alert
@@ -128,7 +131,7 @@ const ReasoningDrawer: React.FC<Props> = ({ issue, open, onClose, onLocatePage }
 
       {/* ── 摘要行 ── */}
       <div style={{ marginBottom: 24 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 24, marginBottom: 4 }}>
+        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 24, marginBottom: 4 }}>
           {issue.confidence !== undefined && (
             <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <Text type="secondary" style={{ fontSize: 13 }}>置信度</Text>
@@ -257,6 +260,20 @@ const ReasoningDrawer: React.FC<Props> = ({ issue, open, onClose, onLocatePage }
               <Tag key={idx} color="purple">{c}</Tag>
             ))}
           </Space>
+        </>
+      )}
+
+      {/* ── 证据核验 ── */}
+      {issue.verifierReason && (
+        <>
+          <Divider style={{ margin: '8px 0 16px' }} />
+          <Title level={5}>
+            <AuditOutlined style={{ marginRight: 6 }} />
+            证据核验
+          </Title>
+          <Text style={{ display: 'block', marginBottom: 24, paddingLeft: 4, fontSize: 15, lineHeight: 1.9, whiteSpace: 'pre-wrap' }}>
+            {issue.verifierReason}
+          </Text>
         </>
       )}
 

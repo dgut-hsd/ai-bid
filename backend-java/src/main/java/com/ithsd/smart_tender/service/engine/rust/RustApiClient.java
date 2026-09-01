@@ -156,7 +156,9 @@ public class RustApiClient {
 
             URI uri = URI.create(properties.apiUrl("/api/v1/documents/" + documentId + "/review"));
             HttpRequest request = signedRequestBuilder("POST", uri, body)
-                    .timeout(Duration.ofMillis(properties.getConnectTimeoutMs()))  // 仅连接超时，不设读超时
+                    // 整体请求超时用独立的 reviewStartTimeoutMs（默认 30s），
+                    // 不能复用 5s 连接超时，否则引擎忙碌时会把慢启动误判为失败。
+                    .timeout(Duration.ofMillis(properties.getReviewStartTimeoutMs()))
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofByteArray(body))
                     .build();
@@ -437,6 +439,73 @@ public class RustApiClient {
         }
     }
 
+    // ── 知识库 ──────────────────────────────────────────────────
+
+    /**
+     * 通知 Rust 对知识库文件做向量化入库（解析 → 切分 → 嵌入 → 写 Qdrant）。
+     *
+     * <p>对应 Rust {@code POST /api/v1/knowledge/ingest}，multipart 上传。
+     * ingest 含解析/嵌入等耗时步骤，使用 readTimeoutMs（默认 15 分钟）。</p>
+     */
+    public RustKnowledgeIngestResponse ingestKnowledge(
+            Path filePath, String filename, String category, String applicableScope, String documentName) {
+        try {
+            byte[] fileBytes = Files.readAllBytes(filePath);
+            byte[] body = buildKnowledgeIngestMultipartBody(filename, fileBytes, category, applicableScope, documentName);
+
+            URI uri = URI.create(properties.apiUrl("/api/v1/knowledge/ingest"));
+            HttpRequest request = signedRequestBuilder("POST", uri, body)
+                    .timeout(Duration.ofMillis(properties.getReadTimeoutMs()))
+                    .header("Content-Type", "multipart/form-data; boundary=" + MULTIPART_BOUNDARY)
+                    .POST(HttpRequest.BodyPublishers.ofByteArray(body))
+                    .build();
+
+            log.info("Rust knowledge ingest: file={}, size={} bytes, category={}", filename, fileBytes.length, category);
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+                RustKnowledgeIngestResponse result = objectMapper.readValue(response.body(), RustKnowledgeIngestResponse.class);
+                log.info("Rust knowledge ingest ok: docId={}, chunks={}", result.getDocumentId(), result.getChunkCount());
+                return result;
+            }
+
+            throw new BizException(5708, "知识库入库失败: HTTP " + response.statusCode() + " — " + truncate(response.body()));
+        } catch (BizException e) {
+            throw e;
+        } catch (IOException e) {
+            throw new BizException(5701, "Rust 连接失败 (ingest): " + e.getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BizException(5701, "Rust 调用被中断 (ingest)");
+        }
+    }
+
+    /**
+     * 删除某份知识库文件在 Qdrant 中的全部向量（软删除联动，失败仅告警不阻断）。
+     *
+     * <p>对应 Rust {@code DELETE /api/v1/knowledge/document/:document_id}。</p>
+     */
+    public void deleteKnowledgeDocument(String documentId) {
+        if (documentId == null || documentId.isEmpty()) {
+            return;
+        }
+        try {
+            URI uri = URI.create(properties.apiUrl("/api/v1/knowledge/document/" + documentId));
+            HttpRequest request = signedRequestBuilder("DELETE", uri, new byte[0])
+                    .timeout(Duration.ofMillis(properties.getConnectTimeoutMs()))
+                    .DELETE()
+                    .build();
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() == 200) {
+                log.info("Rust deleteKnowledgeDocument ok: docId={}", documentId);
+            } else {
+                log.warn("Rust deleteKnowledgeDocument failed: docId={}, HTTP {}", documentId, response.statusCode());
+            }
+        } catch (Exception e) {
+            log.warn("Rust deleteKnowledgeDocument error: docId={}, {}", documentId, e.getMessage());
+        }
+    }
+
     // ── 健康检查 ──────────────────────────────────────────────────
 
     /**
@@ -492,6 +561,53 @@ public class RustApiClient {
         parts.add(closing.getBytes(StandardCharsets.UTF_8));
 
         // Concatenate
+        int totalLen = parts.stream().mapToInt(b -> b.length).sum();
+        byte[] result = new byte[totalLen];
+        int offset = 0;
+        for (byte[] part : parts) {
+            System.arraycopy(part, 0, result, offset, part.length);
+            offset += part.length;
+        }
+        return result;
+    }
+
+    /**
+     * 构建知识库入库（ingest）的 multipart/form-data 请求体。
+     * 字段：category、applicable_scope、document_name、file。
+     */
+    private byte[] buildKnowledgeIngestMultipartBody(
+            String filename,
+            byte[] fileBytes,
+            String category,
+            String applicableScope,
+            String documentName
+    ) throws IOException {
+        List<byte[]> parts = new ArrayList<>();
+
+        parts.add(("--" + MULTIPART_BOUNDARY + "\r\n"
+                + "Content-Disposition: form-data; name=\"category\"\r\n\r\n"
+                + (category == null || category.isEmpty() ? "regulation" : category)
+                + "\r\n").getBytes(StandardCharsets.UTF_8));
+
+        parts.add(("--" + MULTIPART_BOUNDARY + "\r\n"
+                + "Content-Disposition: form-data; name=\"applicable_scope\"\r\n\r\n"
+                + (applicableScope == null || applicableScope.isEmpty() ? "general" : applicableScope)
+                + "\r\n").getBytes(StandardCharsets.UTF_8));
+
+        parts.add(("--" + MULTIPART_BOUNDARY + "\r\n"
+                + "Content-Disposition: form-data; name=\"document_name\"\r\n\r\n"
+                + (documentName == null || documentName.isEmpty() ? filename : documentName)
+                + "\r\n").getBytes(StandardCharsets.UTF_8));
+
+        // File part
+        parts.add(("--" + MULTIPART_BOUNDARY + "\r\n"
+                + "Content-Disposition: form-data; name=\"file\"; filename=\"" + filename + "\"\r\n"
+                + "Content-Type: application/octet-stream\r\n\r\n").getBytes(StandardCharsets.UTF_8));
+        parts.add(fileBytes);
+
+        // Closing boundary
+        parts.add(("\r\n--" + MULTIPART_BOUNDARY + "--\r\n").getBytes(StandardCharsets.UTF_8));
+
         int totalLen = parts.stream().mapToInt(b -> b.length).sum();
         byte[] result = new byte[totalLen];
         int offset = 0;

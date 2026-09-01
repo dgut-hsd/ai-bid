@@ -1,4 +1,4 @@
-import { forwardRef } from 'react';
+import { forwardRef, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Typography } from 'antd';
@@ -15,17 +15,26 @@ export const ReportPreview = forwardRef<HTMLDivElement, ReportPreviewProps>(
    ({ scale, markdownContent }, ref) => {
       const { styles } = useStyles();
 
+      // 性能优化：Markdown 大文本（数十条 findings + 大量 URL）渲染昂贵。
+      // 缩放(scale)、文件名输入等高频状态变化会触发本组件重渲染，
+      // 用 useMemo 让 ReactMarkdown 仅在内容变化时重建，缩放只改 CSS transform。
+      const renderedMarkdown = useMemo(
+         () =>
+            markdownContent ? (
+               <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {markdownContent}
+               </ReactMarkdown>
+            ) : null,
+         [markdownContent]
+      );
+
       return (
          <div className={styles.previewArea} ref={ref}>
             <div
                className={styles.a4Paper}
                style={{ transform: `scale(${scale / 100})` }}
             >
-               {markdownContent ? (
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                     {markdownContent}
-                  </ReactMarkdown>
-               ) : (
+               {renderedMarkdown ?? (
                   <div
                      style={{
                         display: 'flex',

@@ -125,16 +125,34 @@ export interface AuditIssue {
   tierEscalated?: boolean;
   /** 是否因 maxTurns 耗尽而截断（需人工复核） */
   truncated?: boolean;
+  /** 证据核验结论（EvidenceVerifier 回写）：support=坐实 / refute=被反驳 / insufficient=证据不足 */
+  evidenceVerdict?: 'support' | 'refute' | 'insufficient';
+  /** 证据核验理由（EvidenceVerifier 回写的一句话结论） */
+  verifierReason?: string;
   /** 关联的条款 chunk_id 列表（支持跨条款组合风险） */
   clauseIds?: string[];
   /** 关联的原始 block_id 列表（用于 bbox-based PDF 精确高亮） */
   blockIds?: string[];
+  /** 词级精确高亮矩形（后端 source_quote → 命中词的逐行 bbox，非空时优先渲染） */
+  highlightRects?: HighlightRect[];
   /** 搜索来源引用（结构化，可点击链接） */
   citations?: Citation[];
   /** BlindSpot 建议的动态 Agent */
   suggestedAgent?: SuggestedAgent;
   /** Agent 标签（与 agentName 独立表示，避免冲突） */
   agent?: string;
+}
+
+/** 词级精确高亮矩形（对齐 Rust HighlightRect / Java HighlightRectVO） */
+export interface HighlightRect {
+  /** 所在页码 (0-based，渲染时 +1 转 data-page-num) */
+  page: number;
+  x0: number;
+  top: number;
+  x1: number;
+  bottom: number;
+  /** 原始 PDF 页面宽度 (pt) */
+  pageWidth: number;
 }
 
 /** 对齐 Rust RoutingSummary + 4 级统计 */
@@ -435,6 +453,8 @@ export interface FindingAddedEvent {
   lifecycle: FindingLifecycle;
   page_number?: number;
   section_path?: string[];
+  /** 关联的原始 block_id（Rust 流式补发，用于直接查 bbox 画高亮框） */
+  block_ids?: string[];
 }
 
 /** 对齐 Rust ReviewEvent::FindingUpdated */

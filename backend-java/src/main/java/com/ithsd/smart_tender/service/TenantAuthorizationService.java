@@ -10,13 +10,17 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * Small authorization boundary for the MVP tenant and knowledge APIs.
+ * Small authorization boundary for the MVP tenant, enterprise and platform APIs.
  * The request context is authoritative; request parameters are only resource
  * selectors and never establish tenant ownership.
  */
 @Component
 public class TenantAuthorizationService {
 
+    /**
+     * 租户角色到权限的单一权威矩阵（与 ADR-001 §2.7 对齐）。
+     * 平台管理员是全局标量，不属于任何租户角色，见 {@link #requirePlatformAdmin()}。
+     */
     private static final Map<String, List<String>> ROLE_PERMISSIONS = Map.of(
             "OWNER", List.of(
                     "tenant.read", "tenant.settings.write", "tenant.members.invite",
@@ -25,18 +29,25 @@ public class TenantAuthorizationService {
             ),
             "ADMIN", List.of(
                     "tenant.read", "tenant.settings.write", "tenant.members.invite",
-                    "tenant.members.remove", "tenant.members.role.write", "tender.write",
-                    "audit.start", "audit.report.read", "knowledge.write"
+                    "tenant.members.remove", "tenant.members.role.write",
+                    "tender.write", "audit.start", "audit.report.read", "knowledge.write"
             ),
-            "AUDITOR", List.of("tenant.read", "tender.write", "audit.start", "audit.report.read", "knowledge.write"),
-            "MEMBER", List.of("tenant.read", "tender.write", "audit.start", "audit.report.read", "knowledge.write"),
-            "VIEWER", List.of("tenant.read", "audit.report.read")
+            "MEMBER", List.of("tenant.read", "tender.write", "audit.start", "audit.report.read", "knowledge.write")
     );
 
     public TenantRequestContext requireAuthenticated() {
         TenantRequestContext context = TenantContext.get();
         if (context == null || context.userId() == null) {
             throw error(401, "AUTH_REQUIRED", "Authentication is required", null);
+        }
+        return context;
+    }
+
+    /** 平台管理员（系统管理者）专用检查，不依赖租户上下文。 */
+    public TenantRequestContext requirePlatformAdmin() {
+        TenantRequestContext context = requireAuthenticated();
+        if (!context.platformAdmin()) {
+            throw error(403, "PLATFORM_ADMIN_REQUIRED", "需要系统管理员权限", context.requestId());
         }
         return context;
     }

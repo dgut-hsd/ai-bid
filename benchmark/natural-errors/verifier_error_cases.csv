@@ -1,0 +1,9 @@
+﻿doc,risk_id,risk_type,source_quote,ground_truth,v2_verdict,v2_correct,note
+MAOMING,R_004/R_006/R_007/R_078,地域注册限制/特定区域业绩限制,供应商注册地为茂名市的，每提供一个业绩另加1分，最多另加3分,真违规,support,Y,地域加分铁证，v1曾2条insufficient，v2去reason后4条一致support
+ERZHONGYI,R_066/R_072,指定品牌且不接受同等产品,仅限华润、林德、空气产品（Air Products）等品牌，其他品牌不得分,真违规,support,Y,品牌锁定铁证，v1/v2均一致
+ERZHONGYI,R_065,主观评分未细化量化,酌情给分，最高2分，且不设具体量化标准,真违规,support,Y,v1被reason里的100分错误带偏判refute，去reason后修复
+ERZHONGYI,R_085,联合体投标限制,本采购包不接受联合体投标,非违规,support,N,不接受联合体≠排斥供应商，采购人有权；去reason后验证器脑补成违规
+ERZHONGYI,R_030,进口产品限制,本项目提供的气体产品不允许采购进口产品,非违规,support,N,不允许进口是合规方向（本国产品政策），Agent reason把方向搞反，验证器跟着误判
+ERZHONGYI,R_059,地域注册限制,在广东省内…电子认证服务机构签发的CA数字证书,存疑,support,?,省域CA属行业惯例，需法规专家终审
+MAOMING,R_014,评分标准不明确,节能环保产品给予1%-5%价格扣除，具体比例根据重要性、比重确定,非违规,support,N,1-5%是财库政策合法区间，非评分标准不明确
+ERZHONGYI,R_031,本地奖项加分,(原文实为)不接受联合体投标,数据错乱,support,-,引擎上游bug：risk_type标签与source_quote内容对不上，非验证器问题

@@ -1,5 +1,5 @@
 import React from 'react';
-import { Typography, Tooltip, theme } from 'antd';
+import { Typography, Tooltip, theme, Spin } from 'antd';
 import {
   RobotOutlined,
   UserOutlined,
@@ -201,7 +201,7 @@ const getSourceRefs = (message: ChatMessage): SourceRef[] => {
         : undefined;
     const previewUrl =
       fileId && sourceType === 'knowledge'
-        ? `/api/knowledge-files/${fileId}/preview`
+        ? `${import.meta.env.VITE_API_BASE_URL}/api/knowledge-files/${fileId}/preview`
         : undefined;
     const key = `${sourceType || 'unknown'}-${fileId || fileName}-${pageNumber || 'na'}`;
     if (dedupe.has(key)) {
@@ -284,7 +284,10 @@ export const MessageBubble: React.FC<{ message: ChatMessage }> = React.memo(
           >
             {/* ── Reasoning chain (AI messages only) ── */}
             {!isUser && message.reasoning && message.reasoning.length > 0 && (
-              <details open style={{ marginBottom: 12 }}>
+              <details
+                open={message.status === 'streaming' && !message.content}
+                style={{ marginBottom: 12 }}
+              >
                 <summary style={{
                   fontSize: 12,
                   color: token.colorTextSecondary,
@@ -331,6 +334,18 @@ export const MessageBubble: React.FC<{ message: ChatMessage }> = React.memo(
 
             {/* ── Content parsing ── */}
             {(() => {
+              // AI 思考中（尚无正文输出）：显示"分析中"动画，避免空泡让人误以为卡住
+              if (!isUser && message.status === 'streaming' && !message.content) {
+                return (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' }}>
+                    <Spin size="small" />
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      正在分析标书内容…
+                    </Text>
+                  </div>
+                );
+              }
+
               const savedBlocks =
                 !isUser && message.content ? parseSavedSummary(message.content) : null;
               if (savedBlocks && savedBlocks.length > 0) {

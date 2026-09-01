@@ -5,6 +5,7 @@ import {
    connectStream,
    getAuditResult,
    getAuditStatus,
+   getAuditStatusByBid,
 } from '../api/auditDetail';
 import type {
   AuditIssue, AgentProgress, TraceEvent,
@@ -88,12 +89,49 @@ export const useAuditTask = (bidId?: number) => {
    const [phaseHistory, setPhaseHistory] = useState<PhaseEvent[]>([]);
    const [statsEvent, setStatsEvent] = useState<StatsEvent | null>(null);
    const [liveFindings, setLiveFindings] = useState<FindingAddedEvent[]>([]);
+   /** 部分失败阶段名（如 evidence_verify），非空表示结果经过降级、未经完整核验 */
+   const [failedStages, setFailedStages] = useState<string[]>([]);
    const pollFailRef = useRef(0);
    const updateFinalElapsed = useCallback(() => {
       if (auditStartedAt <= 0) return;
       const finalSeconds = Math.max(0, Math.floor((Date.now() - auditStartedAt) / 1000));
       setElapsedSeconds((prev) => Math.max(prev, finalSeconds));
    }, [auditStartedAt]);
+
+   /**
+    * 接管一个已确认存在的任务，进入流式/轮询阶段。
+    * 既用于「建任务成功」，也用于「建任务失败但服务端对账发现任务已建」的兜底恢复。
+    */
+   const acceptTask = useCallback(
+      (nextTaskId: string) => {
+         const startedAt = Date.now();
+         if (storageKey) {
+            try {
+               localStorage.setItem(storageKey, JSON.stringify({ taskId: nextTaskId, startedAt }));
+            } catch (storageError) {
+               console.error('[AuditTask] taskId 持久化失败:', storageError);
+            }
+         }
+         setAuditStartedAt((prev) => prev || startedAt);
+         setShouldConnectStream(true);
+         setHasStartedAudit(true);
+         setTaskId(nextTaskId);
+         setHydrated(true);
+         setProgress(0);
+         setIssues([]);
+         setIsComplete(false);
+         setError(null);
+         setCurrentStage('任务已创建，等待流式数据...');
+      },
+      [storageKey]
+   );
+
+   /** 创建任务最终失败（且服务端对账无任务）时的收尾 */
+   const failTask = useCallback((err: Error) => {
+      setError(err.message || '任务创建失败');
+      setCurrentStage('任务创建失败');
+      setHasStartedAudit(false);
+   }, []);
 
    const { mutate: startAudit, isPending: isStarting } = useMutation({
       mutationFn: (payload: { bidId: number; webSearchEnabled?: boolean; forceRefresh?: boolean }) =>
@@ -117,6 +155,7 @@ export const useAuditTask = (bidId?: number) => {
          setPhaseHistory([]);
          setStatsEvent(null);
          setLiveFindings([]);
+         setFailedStages([]);
          setCurrentStage('正在创建审核任务...');
       },
 
@@ -126,32 +165,60 @@ export const useAuditTask = (bidId?: number) => {
             setError('任务创建响应异常');
             return;
          }
-         const startedAt = Date.now();
-         if (storageKey) {
-            try {
-               localStorage.setItem(storageKey, JSON.stringify({ taskId: data.taskId, startedAt }));
-            } catch (storageError) {
-               console.error('[AuditTask] taskId 持久化失败:', storageError);
-            }
-         }
-         setAuditStartedAt((prev) => prev || startedAt);
-         setShouldConnectStream(true);
-         setTaskId(data.taskId);
-         setHydrated(true);
-         setProgress(0);
-         setIssues([]);
-         setIsComplete(false);
-         setError(null);
-         setCurrentStage('任务已创建，等待流式数据...');
+         acceptTask(data.taskId);
       },
       
       onError: (err: Error) => {
          console.error('[AuditTask] 任务创建失败:', err);
-         setError(err.message || '任务创建失败');
-         setCurrentStage('任务创建失败');
-         setHasStartedAudit(false);
+         // 兜底对账：后端「创建任务」是异步的（秒回 taskId，审核后台跑），
+         // 网络抖动/超时可能把「已建好」误判成「失败」。失败后先按标书向服务端对账一次，
+         // 若确有任务则直接接管（acceptTask），否则才真正报失败。
+         if (typeof bidId === 'number' && !Number.isNaN(bidId)) {
+            getAuditStatusByBid(bidId)
+               .then((status) => {
+                  if (status?.taskId) {
+                     acceptTask(status.taskId);
+                  } else {
+                     failTask(err);
+                  }
+               })
+               .catch(() => failTask(err));
+            return;
+         }
+         failTask(err);
       },
    });
+
+   // 首次进入详情页且无 localStorage taskId 时，由服务端按标书(bid)裁决「当前任务」：
+   // 能直接加载已有的完成结果 / 进行中任务，而不是只丢一个「开始审核」按钮。
+   // 有 taskId（localStorage 命中）时不覆盖，交给下方 hydrate 处理。
+   useEffect(() => {
+      if (typeof bidId !== 'number' || Number.isNaN(bidId)) return;
+      if (taskId || isStarting || lastStartAt > 0) return;
+      let cancelled = false;
+      (async () => {
+         try {
+            const status = await getAuditStatusByBid(bidId);
+            if (cancelled || !status?.taskId) return;
+            if (storageKey) {
+               try {
+                  localStorage.setItem(
+                     storageKey,
+                     JSON.stringify({ taskId: status.taskId, startedAt: 0 })
+                  );
+               } catch (e) {
+                  console.error('[AuditTask] 服务端 taskId 持久化失败:', e);
+               }
+            }
+            setTaskId(status.taskId);
+         } catch (e) {
+            console.warn('[AuditTask] 按标书裁决当前任务失败（该标书尚未发起审核）:', e);
+         }
+      })();
+      return () => {
+         cancelled = true;
+      };
+   }, [bidId, taskId, storageKey, isStarting, lastStartAt]);
 
    useEffect(() => {
       let cancelled = false;
@@ -181,6 +248,7 @@ export const useAuditTask = (bidId?: number) => {
             const completed = status.status === 'completed';
             setIsComplete(completed);
             if (completed) {
+               setFailedStages(status.failedStages || []);
                const result = await getAuditResult(taskId, { page: 1, size: 200 });
                if (cancelled) return;
                setIssues((result.issues || []).map(withAnchorFallback));
@@ -345,6 +413,7 @@ export const useAuditTask = (bidId?: number) => {
                   if (!isMounted) return;
                   const completed = status.status === 'completed';
                   if (completed) {
+                     setFailedStages(status.failedStages || []);
                      const result = await getAuditResult(taskId, { page: 1, size: 200 });
                      if (!isMounted) return;
                      setIssues((result.issues || []).map(withAnchorFallback));
@@ -403,6 +472,7 @@ export const useAuditTask = (bidId?: number) => {
             if (status.stage) setCurrentStage(status.stage);
 
             if (status.status === 'completed') {
+               setFailedStages(status.failedStages || []);
                const result = await getAuditResult(taskId, { page: 1, size: 200 });
                if (stopped) return;
                setIssues((result.issues || []).map(withAnchorFallback));
@@ -415,27 +485,11 @@ export const useAuditTask = (bidId?: number) => {
                setError(null);
                return;
             }
-            setAuditStartedAt((prev) => prev || Date.now());
-
-            const fallbackResult = await getAuditResult(taskId, {
-               page: 1,
-               size: 200,
-            });
-            if (stopped) return;
-            const hasResult =
-               (fallbackResult.issues?.length || 0) > 0 ||
-               (status.status === 'completed' && !!fallbackResult.auditResult);
-            if (hasResult) {
-               setIssues((fallbackResult.issues || []).map(withAnchorFallback));
-               updateFinalElapsed();
-               setIsComplete(true);
-               setProgress(100);
-               setCurrentStage('审核完成');
-               setShouldConnectStream(false);
-               setHasStartedAudit(false);
-               setError(null);
-               return;
-            }
+            // 进行中(PROCESSING)不再用 getResult 的 issues 数量去推断“已完成”：
+            // 长审核期间一旦有一段增量 finding，就会与 hydrate() 的 status=processing
+            // 判定互相翻转 setIsComplete/shouldConnectStream，导致 SSE 反复重连
+            // （详情页闪烁/卡死）。完成态统一由上方 status === 'completed' 分支与
+            // SSE 的 complete 事件收敛；此处仅保留 failed 的收尾。
 
             if (status.status === 'failed') {
                setError('审核任务执行失败，请点击重新审核');
@@ -518,5 +572,6 @@ export const useAuditTask = (bidId?: number) => {
       phaseHistory,
       statsEvent,
       liveFindings,
+      failedStages,
    };
 };

@@ -1,6 +1,5 @@
 import React from 'react';
-import { Spin } from 'antd';
-import { LoadingOutlined } from '@ant-design/icons';
+import { Skeleton } from 'antd';
 
 interface LoadingProps {
    loading: boolean;
@@ -9,29 +8,37 @@ interface LoadingProps {
    fullScreen?: boolean;
 }
 
+/**
+ * 通用加载占位：以骨架屏替代转圈 Spin。
+ * - loading=true 时渲染骨架屏（标题条 + 内容块）
+ * - loading=false 时直接渲染 children（保留作为包裹容器的用法）
+ */
 export const Loading: React.FC<LoadingProps> = ({
    loading,
    children,
-   description = '加载中...',
    fullScreen = false,
 }) => {
+   if (!loading) {
+      return <>{children}</>;
+   }
+
    return (
-      <Spin
-         spinning={loading}
-         tip={children || fullScreen ? description : undefined}
-         indicator={<LoadingOutlined style={{ fontSize: 24 }} spin />}
-         style={
-            fullScreen
-               ? {
-                    minHeight: '300px',
-                    display: 'flex',
-                    justifyContent: 'center',
-                    alignItems: 'center',
-                 }
-               : {}
-         }
+      <div
+         style={{
+            padding: fullScreen ? 24 : 8,
+            minHeight: fullScreen ? 320 : undefined,
+         }}
       >
-         {children}
-      </Spin>
+         <Skeleton
+            active
+            title={{ width: 180 }}
+            paragraph={{ rows: 1 }}
+         />
+         <Skeleton
+            active
+            paragraph={{ rows: 6 }}
+            style={{ marginTop: 24 }}
+         />
+      </div>
    );
 };

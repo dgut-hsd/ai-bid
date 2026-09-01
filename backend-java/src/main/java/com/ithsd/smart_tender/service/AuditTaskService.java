@@ -15,6 +15,8 @@ public interface AuditTaskService {
 
     AuditTaskStatusVO getStatus(String taskId);
 
+    AuditTaskStatusVO getStatusByBid(Long bidId);
+
     ResultVO getResult(String taskId, Integer page, Integer size, String sinceIssueNo);
 
     SseEmitter subscribeStream(String taskId, String lastEventId);

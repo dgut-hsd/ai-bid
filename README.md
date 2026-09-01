@@ -27,7 +27,7 @@
 | 缓存 | Redis 7.2 | 6379 |
 | 图数据库 | Neo4j 5.21 | 7474/7687 |
 | 向量库 | Qdrant 1.7 | 6333 |
-| 文档转换 | JODConverter + LibreOffice | 8088 |
+| 文档转换 |LibreOffice | 8088 |
 
 ## 目录结构
 
@@ -88,7 +88,7 @@ docker compose ps
 
 ```bash
 # ==== 必填：LLM API 密钥 ====
-DASHSCOPE_API_KEY=sk-ws-H.EIPLYIY.oH9a.MEUCIQD4TkLMZBXWRdaYiC8ZyfLTtR6iuz48RRj_3gXUUrMDiQIgX9TFgBQPR8xHkcZpDZ2KUCjuolnysol6GxKe_VSP7ho
+DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # ==== LLM 协议（dashscope / openai_compatible）====
 AIBID_LLM_PROTOCOL=dashscope
@@ -272,7 +272,6 @@ pnpm install && pnpm dev
 
 ## 文档
 
-- [CLAUDE.md](CLAUDE.md) — 项目总览与环境变量
 - [backend-rust/CLAUDE.md](backend-rust/CLAUDE.md) — Rust 引擎架构
 - [backend-java/CLAUDE.md](backend-java/CLAUDE.md) — Java 网关架构
 - [frontend/CLAUDE.md](frontend/CLAUDE.md) — 前端开发指南

@@ -1,5 +1,7 @@
 import { store } from '@/store';
-import { logout } from '@/store/slices/authSlice';
+import { logout, setAuthSession } from '@/store/slices/authSlice';
+import { normalizeAuthSession } from '@/features/login/api/session';
+import type { BaseResponse } from './types';
 import axios from 'axios';
 import type { AxiosError, AxiosRequestConfig } from 'axios';
 
@@ -15,34 +17,47 @@ let isLoggingOut = false;
 // refresh 成功后所有排队请求用新 token 重放，避免误触发 logout 踢用户下线。
 let refreshPromise: Promise<string> | null = null;
 
-function getRefreshToken(): string | null {
-  return localStorage.getItem('refreshToken') || sessionStorage.getItem('refreshToken');
+function getAccessToken(): string | null {
+  return localStorage.getItem('token') || sessionStorage.getItem('token');
 }
 
-function getCurrentStorage(): Storage {
-  return localStorage.getItem('token') ? localStorage : sessionStorage;
+export function extractErrorCode(value: unknown): string | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.error_code === 'string') return record.error_code;
+  if (
+    typeof record.data === 'object' &&
+    record.data !== null &&
+    !Array.isArray(record.data)
+  ) {
+    const data = record.data as Record<string, unknown>;
+    if (typeof data.error_code === 'string') return data.error_code;
+  }
+  return undefined;
 }
 
 function doRefresh(): Promise<string> {
   if (refreshPromise) return refreshPromise;
   refreshPromise = (async () => {
-    const refreshToken = getRefreshToken();
-    if (!refreshToken) throw new Error('no refresh token');
-    const resp = await axios.post(
+    const accessToken = getAccessToken();
+    if (!accessToken) throw new Error('no access token');
+    const resp = await axios.post<BaseResponse<unknown>>(
       `${import.meta.env.VITE_API_BASE_URL}/api/auth/refresh`,
       {},
-      { headers: { Authorization: `Bearer ${refreshToken}` } }
+      { headers: { Authorization: `Bearer ${accessToken}` } }
     );
-    if (resp.data?.code !== 200 || !resp.data?.data) {
+    if (
+      resp.data.code !== 200 ||
+      resp.data.data === null ||
+      resp.data.data === undefined
+    ) {
       throw new Error('refresh failed');
     }
-    const newToken: string = resp.data.data.token;
-    const storage = getCurrentStorage();
-    storage.setItem('token', newToken);
-    if (resp.data.data.refresh_token) {
-      storage.setItem('refreshToken', resp.data.data.refresh_token);
-    }
-    return newToken;
+    const session = normalizeAuthSession(resp.data.data);
+    store.dispatch(setAuthSession({ session }));
+    return session.token;
   })();
   refreshPromise
     .catch(() => { /* 错误由调用方处理 */ })
@@ -57,7 +72,7 @@ function forceLogout() {
   isLoggingOut = true;
   console.error('登录过期，请重新登录');
   store.dispatch(logout());
-  window.location.href = '/login';
+  window.location.href = `${import.meta.env.BASE_URL}login`;
   setTimeout(() => { isLoggingOut = false; }, 500);
 }
 
@@ -88,20 +103,19 @@ request.interceptors.response.use(
     }
     return response.data;
   },
-  async (error: AxiosError<{ code?: number; msg?: string; error_code?: string }>) => {
+  async (error: AxiosError<{ code?: number; msg?: string; error_code?: string; data?: unknown }>) => {
     const status = error.response?.status;
-    const errorCode = error.response?.data?.error_code;
+    const errorCode = extractErrorCode(error.response?.data);
     const errorMsg = error.response?.data?.msg;
     const originalConfig = error.config as AxiosRequestConfig | undefined;
 
     // ── 401：认证相关，按 error_code 细分 ──────────────────────────
     if (status === 401) {
-      // 登录 / 注册 / 刷新接口自身的 401（如密码错误）不代表"需要刷新登录态"，
+      // 登录 / 刷新接口自身的 401（如密码错误）不代表"需要刷新登录态"，
       // 直接 reject 交给 UI 层展示错误提示，避免误触发 refresh → forceLogout → 整页刷新。
       const reqUrl = (originalConfig?.url || '').toLowerCase();
       if (
         reqUrl.includes('/api/auth/login') ||
-        reqUrl.includes('/api/auth/register') ||
         reqUrl.includes('/api/auth/refresh')
       ) {
         return Promise.reject(error);
@@ -122,7 +136,7 @@ request.interceptors.response.use(
             originalConfig.headers.Authorization = `Bearer ${newToken}`;
           }
           return request(originalConfig!);
-        } catch (refreshError) {
+        } catch {
           forceLogout();
           return Promise.reject(error);
         }
@@ -158,18 +172,5 @@ request.interceptors.response.use(
     return Promise.reject(error);
   }
 );
-
-/**
- * 从后端错误响应包络（{ data: { error_code } }）中提取业务错误码。
- * 响应拦截器里直接读 error.response?.data?.error_code；此函数供测试与
- * 需要单独判断 error_code 的调用方复用。
- */
-export function extractErrorCode(error: unknown): string | undefined {
-  if (typeof error !== 'object' || error === null) return undefined;
-  const data = (error as { data?: unknown }).data;
-  if (typeof data !== 'object' || data === null) return undefined;
-  const code = (data as { error_code?: unknown }).error_code;
-  return typeof code === 'string' ? code : undefined;
-}
 
 export default request;

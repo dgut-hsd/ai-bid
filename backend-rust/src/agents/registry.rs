@@ -58,6 +58,8 @@ impl AgentRegistry {
                     "compare_with_template",
                     // 数值/计算校验
                     "validate_calculation",
+                    // 版本差异对比
+                    "compare_versions",
                 ],
             },
         );
@@ -136,6 +138,8 @@ impl AgentRegistry {
                     // 义务提取识别排他性组合
                     "extract_obligations",
                     "check_cross_reference",
+                    // 模板残骸检测
+                    "detect_boilerplate",
                 ],
             },
         );
@@ -242,6 +246,7 @@ impl AgentRegistry {
                     "search_knowledge_base",
                     "search_document",
                     "output_finding",
+                    "output_verification_batch",
                 ],
             },
         );

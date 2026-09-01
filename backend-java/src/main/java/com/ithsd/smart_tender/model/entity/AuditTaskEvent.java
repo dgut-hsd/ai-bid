@@ -13,6 +13,9 @@ public class AuditTaskEvent implements Serializable {
     @TableId(value = "id", type = IdType.AUTO)
     private Long id;
 
+    @TableField("tenant_id")
+    private Long tenantId;
+
     @TableField("task_id")
     private String taskId;
 
@@ -27,6 +30,14 @@ public class AuditTaskEvent implements Serializable {
 
     public Long getId() {
         return id;
+    }
+
+    public Long getTenantId() {
+        return tenantId;
+    }
+
+    public void setTenantId(Long tenantId) {
+        this.tenantId = tenantId;
     }
 
     public String getTaskId() {

@@ -34,9 +34,15 @@ public class IssueVO {
     private String finalTier;
     private Boolean tierEscalated;
     private Boolean truncated;
+    /** 证据核验结论：support / refute / insufficient（EvidenceVerifier 回写） */
+    private String evidenceVerdict;
+    /** 证据核验理由（EvidenceVerifier 回写的一句话结论） */
+    private String verifierReason;
     private List<String> clauseIds;
     /** 关联的原始 block_id 列表（用于前端 bbox-based PDF 精确高亮） */
     private List<String> blockIds;
+    /** 词级精确高亮矩形（来自 Rust highlight_rects，非空时前端优先渲染） */
+    private List<HighlightRectVO> highlightRects;
     private List<CitationVO> citations;
     private SuggestedAgentVO suggestedAgent;
     private String agent;
@@ -96,10 +102,16 @@ public class IssueVO {
     public void setTierEscalated(Boolean tierEscalated) { this.tierEscalated = tierEscalated; }
     public Boolean getTruncated() { return truncated; }
     public void setTruncated(Boolean truncated) { this.truncated = truncated; }
+    public String getEvidenceVerdict() { return evidenceVerdict; }
+    public void setEvidenceVerdict(String evidenceVerdict) { this.evidenceVerdict = evidenceVerdict; }
+    public String getVerifierReason() { return verifierReason; }
+    public void setVerifierReason(String verifierReason) { this.verifierReason = verifierReason; }
     public List<String> getClauseIds() { return clauseIds; }
     public void setClauseIds(List<String> clauseIds) { this.clauseIds = clauseIds; }
     public List<String> getBlockIds() { return blockIds; }
     public void setBlockIds(List<String> blockIds) { this.blockIds = blockIds; }
+    public List<HighlightRectVO> getHighlightRects() { return highlightRects; }
+    public void setHighlightRects(List<HighlightRectVO> highlightRects) { this.highlightRects = highlightRects; }
     public List<CitationVO> getCitations() { return citations; }
     public void setCitations(List<CitationVO> citations) { this.citations = citations; }
     public SuggestedAgentVO getSuggestedAgent() { return suggestedAgent; }
@@ -153,5 +165,29 @@ public class IssueVO {
         public void setSectionKeywords(List<String> sectionKeywords) { this.sectionKeywords = sectionKeywords; }
         public String getReason() { return reason; }
         public void setReason(String reason) { this.reason = reason; }
+    }
+
+    // ── HighlightRectVO（对齐 Rust HighlightRect） ──
+
+    public static class HighlightRectVO {
+        private Integer page;
+        private Double x0;
+        private Double top;
+        private Double x1;
+        private Double bottom;
+        private Double pageWidth;
+
+        public Integer getPage() { return page; }
+        public void setPage(Integer page) { this.page = page; }
+        public Double getX0() { return x0; }
+        public void setX0(Double x0) { this.x0 = x0; }
+        public Double getTop() { return top; }
+        public void setTop(Double top) { this.top = top; }
+        public Double getX1() { return x1; }
+        public void setX1(Double x1) { this.x1 = x1; }
+        public Double getBottom() { return bottom; }
+        public void setBottom(Double bottom) { this.bottom = bottom; }
+        public Double getPageWidth() { return pageWidth; }
+        public void setPageWidth(Double pageWidth) { this.pageWidth = pageWidth; }
     }
 }

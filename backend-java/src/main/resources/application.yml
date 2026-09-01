@@ -8,7 +8,7 @@ spring:
       request-timeout: 600000
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://localhost:3306/smart_tender_system?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8&zeroDateTimeBehavior=convertToNull&useSSL=false&allowPublicKeyRetrieval=true&socketTimeout=30000&connectTimeout=5000
+    url: jdbc:mysql://localhost:3306/smart_tender_system?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8&zeroDateTimeBehavior=convertToNull&useSSL=false&allowPublicKeyRetrieval=true&socketTimeout=60000&connectTimeout=5000
     username: root
     password: "1234"
     type: com.alibaba.druid.pool.DruidDataSource
@@ -36,12 +36,17 @@ spring:
           max-idle: 8
           min-idle: 0
   flyway:
-    enabled: false
+    enabled: true
     baseline-on-migrate: true
+    # 存量库（已手动应用过 V1~V6、但没有 flyway_schema_history 表）首次启用时，
+    # baseline 到 6 以跳过已应用的迁移；全新空库不受影响，会从 V1 完整执行。
+    baseline-version: 6
+    locations: classpath:db/migration
   sql:
     init:
-      mode: always
-      schema-locations: classpath:audit_task_event.sql,classpath:trace_schema.sql
+      # schema 已交由 Flyway 接管；禁用启动期脚本初始化，
+      # 避免 audit_task_event.sql / trace_schema.sql 里的 DROP TABLE 在每次重启时清空数据。
+      mode: never
   servlet:
     encoding:
       charset: UTF-8
@@ -56,7 +61,20 @@ security:
     # Local/test fallback only; production profile requires ST_JWT_SECRET.
     secret: ${ST_JWT_SECRET:local-test-only-jwt-secret-change-me}
     ttl-millis: ${ST_JWT_TTL_MILLIS:86400000}
+    session-ttl-millis: ${ST_SESSION_TTL_MILLIS:604800000}
     accept-legacy-user-id: false
+
+# 平台管理员（系统管理者）初始化：首次启动只播种 is_platform_admin=1 的系统管理者
+# 账号，供其登录后进入「系统管理」页管理所有企业；企业不再由启动器自动创建。
+# 默认账号 platform-admin / 密码 123456（仅在新装且该账号不存在时创建，不会覆盖
+# 已存在账号）。生产安装务必通过 AIBID_PLATFORM_ADMIN_PASSWORD 覆盖默认密码，
+# 并在首次登录后立即修改。
+app:
+  bootstrap:
+    enabled: ${AIBID_BOOTSTRAP_ENABLED:true}
+    platform-username: ${AIBID_PLATFORM_ADMIN_USERNAME:platform-admin}
+    platform-password: ${AIBID_PLATFORM_ADMIN_PASSWORD:123456}
+    platform-realname: ${AIBID_PLATFORM_ADMIN_REALNAME:系统管理员}
 
 # 文件存储配置
 file:
@@ -95,8 +113,6 @@ management:
 preview:
   cache:
     path: ${ST_PREVIEW_CACHE_DIR:D:/smart-tender/data/preview-cache}
-  converter:
-    base-url: http://localhost:8088
 
 audit:
   queue:
@@ -109,6 +125,7 @@ audit:
     poll-delay-ms: 500
     max-retry: 3
     dlq-stream-key: queue:audit:tasks:dlq
+    dlq-list-key: queue:audit:tasks:list-dlq
   sse:
     replay-max-events: 100
   async:
@@ -116,11 +133,21 @@ audit:
     max-pool-size: 4
     queue-capacity: 100
     keep-alive-seconds: 60
+  # 孤儿任务守护：周期性对账滞留的 PENDING/PROCESSING 任务。
+  # 详见 docs/审核稳定性修复计划.md（F3）。
+  orphan:
+    enabled: true
+    sweep-interval-ms: 60000     # 守护扫描周期
+    stale-after-ms: 600000       # updated_at 落后超过 10 分钟视为陈旧候选（对齐单份标书审核时长）
 # Rust 审核引擎 HTTP API（唯一 AI 引擎）
 rust:
   api:
     base-url: http://127.0.0.1:3001
     connect-timeout-ms: 5000
     read-timeout-ms: 900000
+    # 启动审核（POST /review）的整体请求超时，独立于连接超时
+    review-start-timeout-ms: 30000
+    # 异步审核总超时（分钟），大标书可调大；未配置回退默认 60
+    review-timeout-minutes: ${RUST_REVIEW_TIMEOUT_MINUTES:60}
     health-check-enabled: true
     internal-secret: ${RUST_API_INTERNAL_SECRET:dev-internal-secret-key-2024}

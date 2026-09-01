@@ -23,7 +23,7 @@ export const Header: React.FC<HeaderProps> = ({
 
    return (
       <AntHeader className={styles.header}>
-         <Space size='middle' align='center'>
+         <Space size='middle' align='center' className={styles.headerLeft}>
             {!isMobile && (
                <div className={styles.trigger} onClick={onToggle}>
                   {collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}

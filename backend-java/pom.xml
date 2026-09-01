@@ -159,6 +159,12 @@
             <artifactId>jjwt</artifactId>
             <version>0.9.1</version>
         </dependency>
+
+        <!-- BCrypt 密码哈希（替代 MD5），版本由 spring-boot-starter-parent BOM 管理 -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-crypto</artifactId>
+        </dependency>
         <!-- For Java 11+ compatibility with jjwt -->
         <dependency>
             <groupId>javax.xml.bind</groupId>

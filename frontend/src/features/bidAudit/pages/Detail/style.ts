@@ -14,6 +14,24 @@ export const useStyles = createStyles(({ css, token, isDarkMode }) => ({
       .ant-tabs-tab-btn {
          font-size: 1.5rem;
       }
+
+      @media (max-width: 768px) {
+         // 移动端扣除底部 60px 导航栏，dvh 规避手机地址栏高度抖动
+         height: calc(100dvh - 120px);
+         min-height: 0;
+      }
+   `,
+
+   mobileSwitcher: css`
+      display: none;
+
+      @media (max-width: 768px) {
+         display: block;
+         flex-shrink: 0;
+         padding: 0.5rem 0.75rem;
+         background-color: ${token.colorBgContainer};
+         border-bottom: 1px solid ${token.colorBorderSecondary};
+      }
    `,
 
    mainContent: css`
@@ -40,9 +58,10 @@ export const useStyles = createStyles(({ css, token, isDarkMode }) => ({
       overflow: hidden;
 
       @media (max-width: 768px) {
-         flex: none;
+         flex: 1 1 auto;
          width: 100%;
-         height: 80vh;
+         height: auto;
+         min-height: 0;
          border-right: none;
       }
    `,
@@ -64,6 +83,13 @@ export const useStyles = createStyles(({ css, token, isDarkMode }) => ({
       display: flex;
       flex-direction: column;
       gap: 0.5rem;
+
+      @media (max-width: 768px) {
+         flex: 1 1 auto;
+         width: 100%;
+         height: auto;
+         min-height: 0;
+      }
 
       .ant-tabs-nav-list {
          display: grid !important;

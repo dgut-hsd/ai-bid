@@ -27,6 +27,7 @@ export const useDashboardColumns = ({
          title: '项目名称',
          dataIndex: 'projectName',
          key: 'projectName',
+         fixed: 'left',
          width: isMobile ? 110 : 150,
          align: 'center',
          ellipsis: true,
@@ -47,6 +48,7 @@ export const useDashboardColumns = ({
          dataIndex: 'supplierName',
          key: 'supplierName',
          width: isMobile ? 110 : 130,
+         responsive: ['md', 'lg', 'xl', 'xxl'],
          align: 'center',
          ellipsis: true,
          render: (text: string) => <EllipsisTooltip text={text ?? '-'} />,
@@ -86,6 +88,7 @@ export const useDashboardColumns = ({
          dataIndex: 'latestVersion',
          key: 'latestVersion',
          align: 'center',
+         responsive: ['md', 'lg', 'xl', 'xxl'],
          width: 70,
          render: (version: number) =>
             typeof version === 'number' && version > 0 ? `V${version}` : '-',
@@ -95,6 +98,7 @@ export const useDashboardColumns = ({
          key: 'action',
          align: 'center',
          width: 130,
+         fixed: 'right',
          render: (record: ProjectItem) => {
             return (
                <Space size={4} wrap={false}>

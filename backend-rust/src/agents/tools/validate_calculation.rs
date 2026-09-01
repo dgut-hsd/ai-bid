@@ -1,16 +1,14 @@
-//! `validate_calculation` 工具 — 验证标书中的数值计算。
+//! `validate_calculation` 工具 — 通用确定性数值计算。
 //!
-//! LLM 做数学不可靠，代码执行精确。本工具提供：
+//! LLM 做数学不可靠，代码执行精确。本工具只负责：
 //! - 数学表达式求值（加减乘除、括号）
-//! - 法定阈值比对（如履约保证金 ≤ 10%）
-//! - 合规判定（compliant / violation / uncertain）
+//! - 数值阈值比较（actual vs threshold 的纯数学判断）
+//! - 数值 diagnostic
 //!
-//! ## 典型使用场景
-//!
-//! ① 价格分计算公式是否公平（权重 × 报价/基准价）
-//! ② 履约保证金比例是否超法定上限（≤ 10%）
-//! ③ 付款比例是否合规（预付款 + 进度款 + 尾款 = 合同金额）
-//! ④ 评分加权是否满 100%
+//! 不负责：
+//! - 识别/猜测采购法规
+//! - 根据数字或关键词自动匹配法条
+//! - 判断阈值本身的法律正确性（由专门 verification Tool 负责）
 
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
@@ -37,12 +35,10 @@ struct CalculationResult {
     computed: f64,
     /// 计算表达式（变量已代入）
     resolved_formula: String,
-    /// 法定阈值描述（如有）
+    /// 阈值描述（如有）
     threshold: Option<String>,
-    /// 合规判定
+    /// 数值比较判定（compliant = 满足阈值，violation = 不满足；纯数学语义，非法规判定）
     verdict: Verdict,
-    /// 法条依据（如设置阈值时提供）
-    legal_ref: Option<String>,
     /// 计算步骤说明
     steps: Vec<String>,
 }
@@ -82,8 +78,10 @@ impl ValidateCalculationTool {
         let mut steps: Vec<String> = Vec::new();
         let mut resolved = formula.to_string();
 
-        // 1. 替换变量为数值
-        for (var, val) in values {
+        // 1. 替换变量为数值（按名称长度降序替换，避免短名覆盖长名，如 "x" 破坏 "xy"、"成交价" 破坏 "成交价格"）
+        let mut sorted_vars: Vec<(&String, &f64)> = values.iter().collect();
+        sorted_vars.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(b.0)));
+        for (var, val) in sorted_vars {
             resolved = resolved.replace(var, &val.to_string());
         }
 
@@ -157,29 +155,12 @@ impl ValidateCalculationTool {
         Err(anyhow!("无法解析阈值表达式: {}", threshold))
     }
 
-    /// 判定合规性。
+    /// 判定数值是否满足阈值（纯数学比较，不涉及法规）。
     fn judge(computed: f64, lo: f64, hi: f64) -> Verdict {
         if computed >= lo && computed <= hi {
             Verdict::Compliant
         } else {
             Verdict::Violation
-        }
-    }
-
-    /// 获取阈值对应的法条依据。
-    fn threshold_legal_basis(threshold: &str) -> Option<String> {
-        let t = threshold.to_lowercase();
-        if t.contains("10") && (t.contains("保证金") || t.contains("履约")) {
-            Some("《政府采购法实施条例》第48条：履约保证金不得超过合同金额的10%".into())
-        } else if t.contains("20") && (t.contains("日") || t.contains("公告") || t.contains("等标"))
-        {
-            Some("《政府采购法》第35条：公开招标公告期不少于20日".into())
-        } else if t.contains("100") && (t.contains("评分") || t.contains("权重")) {
-            Some("评分权重总和须等于100%".into())
-        } else if t.contains("30") && (t.contains("预付款") || t.contains("预付")) {
-            Some("《政府采购法实施条例》第48条：预付款不得超过合同金额的30%".into())
-        } else {
-            None
         }
     }
 }
@@ -354,28 +335,32 @@ impl AgentTool for ValidateCalculationTool {
             "type": "function",
             "function": {
                 "name": "validate_calculation",
-                "description": "【使用场景】验证标书中的数值计算——LLM 做数学不可靠，代码执行精确。\
-                    ① 价格分计算公式是否公平（权重 × 报价/基准价）；\
-                    ② 履约保证金比例是否超法定上限（履约保证金 / 合同金额 ≤ 10%）；\
-                    ③ 付款比例是否合规（预付款 + 进度款 + 尾款 = 合同金额）；\
-                    ④ 评分加权是否满 100%。\
-                    【不使用场景】需要语义理解的'合理性'判断——LLM 做推理，计算器做算术。\
+                "description": "【使用场景】执行确定性数值计算与阈值比较——LLM 做数学不可靠，代码执行精确。\
+                    ① 数值重算（金额/数量/比例）；\
+                    ② 百分比计算；\
+                    ③ 总和计算（如各项分值合计）；\
+                    ④ 数值阈值比较（actual 是否满足 ≥ / ≤ / == / 区间）。\
+                    【不使用场景】需要语义理解的'合理性'判断——LLM 做推理，计算器做算术；\
+                    法定期限/保证金比例/评分权重等法规阈值判断——使用 verify_bid_preparation_period / \
+                    verify_announcement_period / verify_bid_deposit / validate_scoring_formula 等专门 verification 工具，\
+                    本工具不判断阈值本身的法律正确性。\
                     【注意】formula 支持加减乘除和括号，不支持复杂函数。\
-                    变量名支持中文（如'履约保证金'），会自动替换为 values 中对应的数值。",
+                    变量名支持中文，会自动替换为 values 中对应的数值。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "formula": {
                             "type": "string",
-                            "description": "数学表达式，如 '(履约保证金 / 合同金额) * 100'。支持 + - * / ( )，变量名可包含中文。"
+                            "description": "数学表达式，如 '(金额A / 金额B) * 100'。支持 + - * / ( )，变量名可包含中文。"
                         },
                         "values": {
                             "type": "object",
-                            "description": "变量→数值映射，如 {\"履约保证金\": 500000, \"合同金额\": 5000000}。键为 formula 中的变量名，值为 f64 数值。"
+                            "description": "变量→数值映射，如 {\"金额A\": 500000, \"金额B\": 5000000}。键为 formula 中的变量名，值为 f64 数值。"
                         },
                         "legal_threshold": {
                             "type": "string",
-                            "description": "法定阈值表达式，如 '≤ 10'（结果不应超过10）、'≥ 20'（结果不应低于20）、'10 ≤ x ≤ 100'（区间）。可选参数。"
+                            "description": "数值阈值表达式（纯数学比较），如 '≤ 10'（结果不应超过10）、'≥ 20'（结果不应低于20）、'10 ≤ x ≤ 100'（区间）。\
+                                本工具只比较数值，不判断该阈值对应的法规是否正确。可选参数。"
                         }
                     },
                     "required": ["formula", "values"]
@@ -394,36 +379,32 @@ impl AgentTool for ValidateCalculationTool {
         // 1. 计算
         let (computed, resolved_formula, steps) = Self::evaluate(&parsed.formula, &parsed.values)?;
 
-        // 2. 阈值判定（如有）
-        let (threshold_desc, verdict, legal_ref) =
-            if let Some(ref threshold) = parsed.legal_threshold {
-                let threshold = threshold.trim();
-                if threshold.is_empty() {
-                    (None, Verdict::Uncertain, None)
-                } else {
-                    match Self::parse_threshold(threshold) {
-                        Ok((lo, hi, desc)) => {
-                            let v = Self::judge(computed, lo, hi);
-                            let legal = Self::threshold_legal_basis(threshold);
-                            (Some(desc), v, legal)
-                        }
-                        Err(_) => (
-                            Some(format!("无法解析: {}", threshold)),
-                            Verdict::Uncertain,
-                            None,
-                        ),
-                    }
-                }
+        // 2. 阈值判定（如有）— 纯数学比较，不推断法规
+        let (threshold_desc, verdict) = if let Some(ref threshold) = parsed.legal_threshold {
+            let threshold = threshold.trim();
+            if threshold.is_empty() {
+                (None, Verdict::Uncertain)
             } else {
-                (None, Verdict::Uncertain, None)
-            };
+                match Self::parse_threshold(threshold) {
+                    Ok((lo, hi, desc)) => {
+                        let v = Self::judge(computed, lo, hi);
+                        (Some(desc), v)
+                    }
+                    Err(_) => (
+                        Some(format!("无法解析: {}", threshold)),
+                        Verdict::Uncertain,
+                    ),
+                }
+            }
+        } else {
+            (None, Verdict::Uncertain)
+        };
 
         let result = CalculationResult {
             computed: (computed * 10000.0).round() / 10000.0, // 保留 4 位小数
             resolved_formula,
             threshold: threshold_desc,
             verdict,
-            legal_ref,
             steps,
         };
 
@@ -539,5 +520,90 @@ mod tests {
         vals.insert("b".to_string(), 0.0);
         let result = ValidateCalculationTool::evaluate("a / b", &vals);
         assert!(result.is_err());
+    }
+
+    // ── Group A Final P2 Seal：纯数值工具，无自动法规推断 ────────
+
+    async fn run_execute(json: serde_json::Value) -> serde_json::Value {
+        ValidateCalculationTool
+            .execute(json)
+            .await
+            .expect("execute 应成功")
+    }
+
+    fn numeric_args(formula: &str, values: serde_json::Value, threshold: Option<&str>) -> serde_json::Value {
+        let mut v = serde_json::json!({ "formula": formula, "values": values });
+        if let Some(t) = threshold {
+            v["legal_threshold"] = serde_json::json!(t);
+        }
+        v
+    }
+
+    #[tokio::test]
+    async fn pure_numeric_comparison_still_works() {
+        // actual=8 ≤ 10 → compliant；actual=12 ≤ 10 → violation；纯数学比较不受法规推断删除影响
+        let out = run_execute(numeric_args("a + b", serde_json::json!({"a": 3.0, "b": 5.0}), Some("≤ 10"))).await;
+        assert_eq!(out["verdict"], "compliant");
+        assert_eq!(out["computed"], 8.0);
+
+        let out = run_execute(numeric_args("a + b", serde_json::json!({"a": 7.0, "b": 5.0}), Some("≤ 10"))).await;
+        assert_eq!(out["verdict"], "violation");
+        assert_eq!(out["computed"], 12.0);
+
+        // 无阈值 → uncertain，但不产生任何法规字段
+        let out = run_execute(numeric_args("a * b", serde_json::json!({"a": 10.0, "b": 10.0}), None)).await;
+        assert_eq!(out["verdict"], "uncertain");
+        assert_eq!(out["computed"], 100.0);
+    }
+
+    #[tokio::test]
+    async fn no_auto_legal_basis_for_20_days() {
+        // 旧错误口径：threshold 含"公告期/20"曾自动输出 35 条 → 现在必须无任何法规引用
+        let out = run_execute(numeric_args(
+            "(a / b) * 100",
+            serde_json::json!({"a": 20.0, "b": 100.0}),
+            Some("公告期不得少于20日"),
+        ))
+        .await;
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            !json.contains("第35条") && !json.contains("政府采购法") && !json.contains("legal"),
+            "不得自动输出法规引用: {}",
+            json
+        );
+    }
+
+    #[tokio::test]
+    async fn no_auto_legal_basis_for_percent_threshold() {
+        // 旧映射关键词：10%（履约保证金）/ 30%（预付款）/ 100%（权重）→ 不得自动匹配法条
+        for threshold in ["≤ 10", "≤ 30", "== 100", "履约保证金 ≤ 10", "预付款不得超过30%"] {
+            let out = run_execute(numeric_args("a + b", serde_json::json!({"a": 5.0, "b": 5.0}), Some(threshold))).await;
+            let json = serde_json::to_string(&out).unwrap();
+            assert!(
+                !json.contains("第48条") && !json.contains("政府采购法实施条例") && !json.contains("legal_ref"),
+                "threshold='{}' 不得自动输出法规: {}",
+                threshold,
+                json
+            );
+        }
+    }
+
+    #[test]
+    fn definition_does_not_claim_legal_rule_inference() {
+        let def = ValidateCalculationTool.definition();
+        let desc = def["function"]["description"].as_str().unwrap();
+        assert!(
+            !desc.contains("法定阈值") && !desc.contains("法条") && !desc.contains("法律依据")
+                && !desc.contains("自动匹配") && !desc.contains("合规判定"),
+            "definition 不得宣称自动法规推断: {}",
+            desc
+        );
+        // 仍保留数值计算必要字段
+        let props = &def["function"]["parameters"]["properties"];
+        assert!(props.get("formula").is_some());
+        assert!(props.get("values").is_some());
+        assert!(props.get("legal_threshold").is_some());
+        // 不暴露自动法律推断字段
+        assert!(props.get("rule_type").is_none() && props.get("automatic_legal_basis").is_none());
     }
 }

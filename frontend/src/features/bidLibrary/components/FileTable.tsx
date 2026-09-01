@@ -4,6 +4,7 @@ import { useStyles } from '../style';
 import { CategoryMap, ApplicableScopeMap, type KnowledgeFile } from '../types';
 import { EllipsisTooltip } from '@/components/EllipsisTooltip/EllipsisTooltip';
 import { useIsMobile } from '@/hooks/useMediaQuery';
+import { MobileFileCard } from './MobileFileCard';
 
 interface FileTableProps {
    files: KnowledgeFile[]; // 文件列表数据
@@ -157,6 +158,7 @@ export function FileTable({
          title: '操作',
          key: 'action',
          width: 240,
+         fixed: 'right',
          align: 'center',
          render: (_: unknown, record: KnowledgeFile) => (
             <span style={{ whiteSpace: 'nowrap' }}>
@@ -193,6 +195,46 @@ export function FileTable({
       },
    ];
 
+   // 移动端：紧凑卡片列表，替代横向滚动的表格
+   if (isMobile) {
+      return (
+         <div className={styles.mobileListContainer}>
+            <div className={styles.mobileCardList}>
+               {files.map((file) => (
+                  <MobileFileCard
+                     key={file.id}
+                     file={file}
+                     styles={styles}
+                     onView={onView}
+                     onDownload={onDownload}
+                     onEdit={onEdit}
+                     onDelete={onDelete}
+                  />
+               ))}
+            </div>
+
+            {files.length > 0 && (
+               <div
+                  style={{
+                     display: 'flex',
+                     justifyContent: 'center',
+                     marginTop: 12,
+                  }}
+               >
+                  <Pagination
+                     current={currentPage}
+                     pageSize={pageSize}
+                     total={total}
+                     size='small'
+                     showSizeChanger={false}
+                     onChange={onPageChange}
+                  />
+               </div>
+            )}
+         </div>
+      );
+   }
+
    return (
       <div className={styles.tableContainer}>
          {/* 文件表格 */}
@@ -203,7 +245,7 @@ export function FileTable({
             loading={loading}
             pagination={false}
             bordered={false}
-            scroll={{ x: 800 }}
+            scroll={{ x: 'max-content' }}
          />
 
          <div className={styles.paginationRow}>

@@ -71,14 +71,14 @@ class TenantAuthServiceImplTest {
     @Test
     void login_shouldCreateCurrentTenantSessionAndReturnContractSnapshot() {
         UserLoginDTO request = new UserLoginDTO();
-        request.setPhone("13800138000");
+        request.setUsername("alice");
         request.setPassword("password");
 
         User user = User.builder()
                 .id(10001L)
                 .username("alice")
                 .realName("Alice")
-                .phone(request.getPhone())
+                .phone("13800138000")
                 .status(1)
                 .build();
         Tenant tenant = Tenant.builder()
@@ -94,7 +94,7 @@ class TenantAuthServiceImplTest {
                 .id(30001L)
                 .tenantId(tenant.getId())
                 .userId(user.getId())
-                .role("ADMIN")
+                .role("OWNER")
                 .status("ACTIVE")
                 .joinedAt(LocalDateTime.now())
                 .build();
@@ -113,7 +113,7 @@ class TenantAuthServiceImplTest {
         assertThat(response.getUserInfo().getId()).isEqualTo(user.getId());
         assertThat(response.getUserInfo().getUsername()).isEqualTo("alice");
         assertThat(response.getCurrentTenant().getTenantId()).isEqualTo(tenant.getId());
-        assertThat(response.getCurrentTenant().getRole()).isEqualTo("ADMIN");
+        assertThat(response.getCurrentTenant().getRole()).isEqualTo("OWNER");
         assertThat(response.getCurrentTenant().getPermissions())
                 .contains("tenant.read", "tenant.settings.write", "tender.write");
         assertThat(response.getTenants()).hasSize(1);
@@ -122,7 +122,7 @@ class TenantAuthServiceImplTest {
         TenantJwtClaims claims = jwtTokenService.parse(response.getToken());
         assertThat(claims.userId()).isEqualTo(user.getId());
         assertThat(claims.tenantId()).isEqualTo(tenant.getId());
-        assertThat(claims.role()).isEqualTo("ADMIN");
+        assertThat(claims.role()).isEqualTo("OWNER");
         assertThat(claims.sessionVersion()).isEqualTo(1L);
 
         var savedSession = org.mockito.ArgumentCaptor.forClass(TenantSessionStateVO.class);
@@ -130,7 +130,7 @@ class TenantAuthServiceImplTest {
         assertThat(savedSession.getValue().getUserId()).isEqualTo(user.getId());
         assertThat(savedSession.getValue().getCurrentTenantId()).isEqualTo(tenant.getId());
         assertThat(savedSession.getValue().getSessionVersion()).isEqualTo(1L);
-        assertThat(savedSession.getValue().getRole()).isEqualTo("ADMIN");
+        assertThat(savedSession.getValue().getRole()).isEqualTo("OWNER");
     }
 
     @Test
@@ -167,7 +167,7 @@ class TenantAuthServiceImplTest {
         Tenant firstTenant = tenant(20001L, "first", "ACTIVE");
         Tenant secondTenant = tenant(20002L, "second", "ACTIVE");
         TenantMember firstMember = member(30001L, firstTenant.getId(), user.getId(), "ADMIN", "ACTIVE");
-        TenantMember secondMember = member(30002L, secondTenant.getId(), user.getId(), "VIEWER", "ACTIVE");
+        TenantMember secondMember = member(30002L, secondTenant.getId(), user.getId(), "MEMBER", "ACTIVE");
         TenantSessionStateVO previous = session(user.getId(), firstTenant.getId(), 3L, "session-first", "ADMIN");
         String oldToken = jwtTokenService.issue(
                 user.getId(), firstTenant.getId(), "ADMIN", List.of("tenant.read"), 3L, "session-first");
@@ -187,7 +187,7 @@ class TenantAuthServiceImplTest {
 
         assertThat(response.getSessionVersion()).isEqualTo(4L);
         assertThat(response.getCurrentTenant().getTenantId()).isEqualTo(secondTenant.getId());
-        assertThat(response.getCurrentTenant().getRole()).isEqualTo("VIEWER");
+        assertThat(response.getCurrentTenant().getRole()).isEqualTo("MEMBER");
         TenantJwtClaims switchedClaims = jwtTokenService.parse(response.getToken());
         assertThat(switchedClaims.tenantId()).isEqualTo(secondTenant.getId());
         assertThat(switchedClaims.sessionVersion()).isEqualTo(4L);
@@ -207,7 +207,7 @@ class TenantAuthServiceImplTest {
         Tenant currentTenant = tenant(20001L, "first", "ACTIVE");
         Tenant disabledTenant = tenant(20002L, "disabled", "DISABLED");
         TenantMember currentMember = member(30001L, currentTenant.getId(), user.getId(), "ADMIN", "ACTIVE");
-        TenantMember disabledMember = member(30002L, disabledTenant.getId(), user.getId(), "VIEWER", "ACTIVE");
+        TenantMember disabledMember = member(30002L, disabledTenant.getId(), user.getId(), "MEMBER", "ACTIVE");
         TenantSessionStateVO previous = session(user.getId(), currentTenant.getId(), 1L, "session", "ADMIN");
         String token = jwtTokenService.issue(
                 user.getId(), currentTenant.getId(), "ADMIN", List.of("tenant.read"), 1L, "session");
@@ -237,7 +237,7 @@ class TenantAuthServiceImplTest {
         Tenant disabledTenant = tenant(20001L, "disabled", "DISABLED");
         TenantMember disabledMember = member(30001L, disabledTenant.getId(), user.getId(), "OWNER", "ACTIVE");
         UserLoginDTO request = new UserLoginDTO();
-        request.setPhone("13800138000");
+        request.setUsername("alice");
         request.setPassword("password");
 
         when(userService.login(request)).thenReturn(user);

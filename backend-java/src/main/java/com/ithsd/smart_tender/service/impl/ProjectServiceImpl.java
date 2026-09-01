@@ -86,9 +86,11 @@ public class ProjectServiceImpl implements ProjectService {
             if (CollectionUtils.isNotEmpty(auditIds)) {
                 auditIssueMapper.delete(
                         new LambdaQueryWrapper<AuditIssue>().in(AuditIssue::getAuditId, auditIds)
+                                .eq(AuditIssue::getTenantId, tenantId)
                 );
                 auditReportMapper.delete(
                         new LambdaQueryWrapper<AuditReport>().in(AuditReport::getAuditId, auditIds)
+                                .eq(AuditReport::getTenantId, tenantId)
                 );
                 auditTaskMapper.delete(
                         new LambdaQueryWrapper<AuditTask>().in(AuditTask::getId, auditIds)
@@ -173,7 +175,9 @@ public class ProjectServiceImpl implements ProjectService {
             );
 
             if (!tenders.isEmpty()) {
-                pVO.setFileCategory(tenders.get(0).getFileCategory());
+                // 文件类型：DB 存英文码(bid/contract)，前端要中文标签(标书/合同)
+                String rawCategory = tenders.get(0).getFileCategory();
+                pVO.setFileCategory("bid".equals(rawCategory) ? "标书" : "合同");
             }
 
             List<TenderWithAuditVO> tenderWithAuditVOs = new ArrayList<>();
@@ -194,7 +198,9 @@ public class ProjectServiceImpl implements ProjectService {
                 if (task != null) {
                     tVO.setAuditTask(task);
                     AuditReport report = auditReportMapper.selectOne(
-                            new LambdaQueryWrapper<AuditReport>().eq(AuditReport::getAuditId, task.getId())
+                            new LambdaQueryWrapper<AuditReport>()
+                                    .eq(AuditReport::getAuditId, task.getId())
+                                    .eq(AuditReport::getTenantId, tenantId)
                     );
                     tVO.setAuditReport(report);
                 }
@@ -285,9 +291,14 @@ public class ProjectServiceImpl implements ProjectService {
         if (task == null) {
             return null;
         }
-        // auditResult 已废弃，基于 taskStatus 映射结果
+        // 基于 taskStatus + 是否发现风险点映射结果：
+        // 完成且无风险点 → 已通过(pass)；完成但有风险点 → 需修改(reject)
         Integer status = task.getTaskStatus();
-        if (AuditTaskStatusEnum.COMPLETED.getCode().equals(status)) return "pass";
+        if (AuditTaskStatusEnum.COMPLETED.getCode().equals(status)) {
+            Long issueCount = auditIssueMapper.selectCount(new LambdaQueryWrapper<AuditIssue>()
+                    .eq(AuditIssue::getAuditId, task.getId()));
+            return (issueCount != null && issueCount > 0) ? "reject" : "pass";
+        }
         if (AuditTaskStatusEnum.FAILED.getCode().equals(status)) return "reject";
         return "pending";
     }

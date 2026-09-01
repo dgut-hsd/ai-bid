@@ -21,7 +21,12 @@ export const createTask = async (
 ): Promise<{ taskId: string }> => {
    const res = await request.post<unknown, BaseResponse<{ taskId: string }>>(
       '/api/audit-tasks',
-      params
+      params,
+      {
+         // 创建任务会触发后端异步审核调度；网络抖动时全局 30s 超时易把「已建好」误判为失败。
+         // 对齐 chat.ts 的 120s 长操作超时。
+         timeout: 120000,
+      }
    );
    
    return res.data;
@@ -33,6 +38,17 @@ export const getAuditStatus = async (taskId: string): Promise<AuditStatus> => {
    );
 
    return res.data;
+};
+
+/** 按标书(bid)取「当前任务」状态（服务端裁决 taskId，不再依赖 localStorage）。 */
+export const getAuditStatusByBid = async (
+   bidId: number
+): Promise<AuditStatus | null> => {
+   const res = await request.get<unknown, BaseResponse<AuditStatus>>(
+      `/api/audit-tasks/by-bid/${bidId}`
+   );
+
+   return res.data ?? null;
 };
 
 export const getAuditResult = async (

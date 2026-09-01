@@ -12,7 +12,7 @@
 //! ### MVP 零依赖（3 个 — 已实现）
 //! - [`validate_calculation`] — 数值计算验证（公式求值 + 法定阈值比对）
 //! - [`check_cross_reference`] — 交叉引用完整性检查（"详见附件X"→是否存在）
-//! - [`calculate_timeline`] — 时间线计算与校验（日期差 + 法定时限 + 矛盾检测）
+//! - [`calculate_timeline`] — 时间线日期关系计算（日历日/工作日 + 时序矛盾检测）
 //!
 //! ### V1 模板依赖（3 个 — 已实现）
 //! - [`compare_with_template`] — 模板比对（发现"没写什么"）
@@ -48,12 +48,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod answer_user;
+#[cfg(test)]
+pub mod benchmark_test;
 pub mod bid_evaluation_test;
 pub mod calculate_timeline;
+pub mod calendar;
 pub mod check_cross_reference;
 pub mod compare_versions;
 pub mod compare_with_template;
+#[cfg(test)]
+pub mod contract_test;
 pub mod detect_boilerplate;
+pub mod eval_harness;
+#[cfg(test)]
+pub mod eval_test;
 pub mod extract_obligations;
 pub mod output_finding;
 pub mod output_verification_batch;
@@ -61,6 +69,7 @@ pub mod read_section;
 pub mod search_contradiction;
 pub mod search_document;
 pub mod search_knowledge;
+pub mod time_domain;
 pub mod search_knowledge_base;
 pub mod validate_calculation;
 pub mod verify_announcement_period;

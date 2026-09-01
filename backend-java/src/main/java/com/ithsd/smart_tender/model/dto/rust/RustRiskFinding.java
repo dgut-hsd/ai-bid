@@ -26,6 +26,8 @@ public class RustRiskFinding {
     private List<String> clauseIds = new ArrayList<>();
     /** 关联的原始 block_id 列表（用于前端 bbox-based PDF 精确高亮） */
     private List<String> blockIds = new ArrayList<>();
+    /** 词级精确高亮矩形（后端 source_quote → 命中词的逐行 union bbox） */
+    private List<RustHighlightRect> highlightRects = new ArrayList<>();
     private String agent;
 
     // ── 核心判定 ──
@@ -47,6 +49,12 @@ public class RustRiskFinding {
     // ── 推理 ──
     private String reason;
     private String suggestion;
+    /** 证据核验结论：support / refute / insufficient（EvidenceVerifier 回写） */
+    @JsonProperty("evidence_verdict")
+    private String evidenceVerdict;
+    /** 证据核验理由（EvidenceVerifier 回写的一句话结论） */
+    @JsonProperty("verifier_reason")
+    private String verifierReason;
 
     // ── 置信度 ──
     private float confidence;
@@ -89,6 +97,19 @@ public class RustRiskFinding {
         private String title;
         private String url;
         private String siteName;
+    }
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class RustHighlightRect {
+        /** 所在页码 (0-based) */
+        private Integer page;
+        private double x0;
+        private double top;
+        private double x1;
+        private double bottom;
+        /** 原始 PDF 页面宽度 (pt) */
+        private double pageWidth;
     }
 
     // ── 便捷方法 ──

@@ -111,8 +111,10 @@ public class GlobalExceptionHandler {
     }
 
     @ExceptionHandler(ClientAbortException.class)
-    public Result<Void> handleClientAbortException(ClientAbortException ex) {
+    public void handleClientAbortException(ClientAbortException ex) {
+        // 客户端已主动断开，连接不可写：只记录日志、不返回响应体。
+        // 若返回 Result 且原请求 Content-Type 非 JSON（如 application/pdf），会触发
+        // "No converter for Result with preset Content-Type" 二次异常。
         log.info("客户端主动断开连接: {}", ex.getMessage());
-        return Result.error(499, "客户端已取消请求或连接中断");
     }
 }

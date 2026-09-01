@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { message, Spin } from 'antd';
 import { useParams } from 'react-router-dom';
 
@@ -9,9 +9,8 @@ import { useStyles } from './style';
 
 import {
    MOCK_REPORT,
-   parseMarkdownToSections,
    generateWordDocument,
-   REPORT_SECTIONS,
+   extractBidName,
 } from './utils';
 
 import { useCtrlWheelZoom } from '../../hooks/useCtrlWheelZoom';
@@ -35,13 +34,8 @@ export const ReportPage: React.FC = () => {
    const [scale, setScale] = useState<number>(100);
    const [isExporting, setIsExporting] = useState<boolean>(false);
 
-   // C区状态：默认全选模块，并设定默认文件名
-   const [selectedSections, setSelectedSections] = useState<string[]>([
-      ...REPORT_SECTIONS,
-   ]);
-   const [fileName, setFileName] = useState<string>(
-      '审核报告_2026年度数字校园智慧基座建设项目.docx'
-   );
+   // C区状态：默认文件名
+   const [fileName, setFileName] = useState<string>('标书审核报告.docx');
 
    const previewContainerRef = useCtrlWheelZoom(setScale, {
       min: 50,
@@ -49,11 +43,23 @@ export const ReportPage: React.FC = () => {
       step: 10,
    });
 
+   // 根据报告内容推导默认导出文件名（避免写死的示例项目名）
+   const fileNameInitializedRef = useRef<boolean>(false);
+   const applyDefaultFileName = useCallback((docContent?: string | null) => {
+      if (fileNameInitializedRef.current) return;
+      const projectName = extractBidName(docContent || '');
+      setFileName(
+         projectName ? `${projectName}_审核报告.docx` : '标书审核报告.docx'
+      );
+      fileNameInitializedRef.current = true;
+   }, []);
+
    // ================= 数据获取 =================
    useEffect(() => {
       const fetchReport = async () => {
          if (USE_MOCK) {
             setReport(MOCK_REPORT);
+            applyDefaultFileName(MOCK_REPORT.docContent);
             return;
          }
 
@@ -64,15 +70,23 @@ export const ReportPage: React.FC = () => {
 
          setLoading(true);
          try {
-            const data = await getReport(auditIdOrTaskId);
-            // 后端可能返回业务失败但不抛异常，统一在这里兜底触发生成
+            // getReport 无内容时返回空数据；若旧后端仍返回 404（报告未生成）也降级为直接生成
+            let data: Report | null = null;
+            try {
+               data = await getReport(auditIdOrTaskId);
+            } catch (getErr) {
+               console.warn('获取报告为空，改为直接生成', getErr);
+               data = null;
+            }
             if (data?.docContent?.trim()) {
                setReport(data);
+               applyDefaultFileName(data.docContent);
                return;
             }
             const generated = await generateReport(auditIdOrTaskId);
             if (generated?.docContent?.trim()) {
                setReport(generated);
+               applyDefaultFileName(generated.docContent);
                return;
             }
             setReport(null);
@@ -87,24 +101,11 @@ export const ReportPage: React.FC = () => {
       };
 
       fetchReport();
-   }, [auditIdOrTaskId, messageApi]);
+   }, [auditIdOrTaskId, messageApi, applyDefaultFileName]);
 
-   // ================= 核心计算 (难点1 联动渲染) =================
-   const currentMarkdownContent = useMemo(() => {
-      if (!report) return '';
-
-      const docContent = report.docContent;
-      // 解析完整 Markdown 为各模块字典
-      const sectionsDict = parseMarkdownToSections(docContent);
-
-      // 强制按照 REPORT_SECTIONS 原有顺序进行拼接 (防止用户乱点导致结构错乱)
-      return REPORT_SECTIONS.filter((section) =>
-         selectedSections.includes(section)
-      )
-         .map((section) => sectionsDict[section])
-         .filter((content) => !!content)
-         .join('\n\n---\n');
-   }, [report, selectedSections]);
+   // ================= 核心计算 =================
+   // 报告内容配置（章节勾选）已移除，预览与导出始终使用完整报告内容
+   const currentMarkdownContent = report?.docContent ?? '';
 
    // ================= 核心导出 (难点2 纯前端导出) =================
    const handleExportWord = async () => {
@@ -177,10 +178,8 @@ export const ReportPage: React.FC = () => {
                ref={previewContainerRef}
             />
 
-            {/* 右侧 C 区：导出设置联动区 */}
+            {/* 右侧 C 区：导出设置区 */}
             <ReportSettings
-               selectedSections={selectedSections}
-               onSelectionChange={setSelectedSections}
                fileName={fileName}
                onFileNameChange={setFileName}
             />

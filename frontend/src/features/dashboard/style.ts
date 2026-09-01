@@ -107,7 +107,8 @@ export const useStyles = createStyles(({ css, token }) => ({
       border-radius: 8px;
       padding: 1.5rem 1rem;
       box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
-      height: 100%;
+      /* 去掉 height:100%：它和 flex:1 冲突，会让每张卡片撑到整列高度导致面板超高 */
+      min-height: 0;
       min-width: 0;
       flex: 1;
       display: flex;

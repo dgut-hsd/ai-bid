@@ -2,6 +2,10 @@ package com.ithsd.smart_tender.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.ithsd.smart_tender.common.BaseContext;
+import com.ithsd.smart_tender.common.BizException;
+import com.ithsd.smart_tender.common.TenantContext;
+import com.ithsd.smart_tender.common.TenantRequestContext;
 import com.ithsd.smart_tender.config.RustApiProperties;
 import com.ithsd.smart_tender.mapper.AuditIssueMapper;
 import com.ithsd.smart_tender.mapper.AuditTaskMapper;
@@ -19,11 +23,13 @@ import com.ithsd.smart_tender.service.TraceService;
 import com.ithsd.smart_tender.service.engine.rust.RustApiClient;
 import com.ithsd.smart_tender.service.engine.rust.RustDocumentService;
 import com.ithsd.smart_tender.service.engine.rust.RustSseClient;
+import com.ithsd.smart_tender.service.engine.queue.AuditTaskEnvelope;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewAcceptedResponse;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewRequest;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewResponse;
 import com.ithsd.smart_tender.model.dto.rust.RustReviewResultResponse;
 import com.ithsd.smart_tender.model.dto.rust.RustRiskFinding;
+import com.ithsd.smart_tender.model.dto.rust.RustStageFailure;
 import com.ithsd.smart_tender.sse.AuditTaskEventService;
 import com.ithsd.smart_tender.sse.SseHub;
 import org.slf4j.Logger;
@@ -35,9 +41,8 @@ import org.springframework.util.StringUtils;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
@@ -48,7 +53,6 @@ import java.util.stream.Collectors;
 @Service
 public class AuditEngineServiceImpl implements AuditEngineService {
 
-    private static final Set<String> RUNNING_TASKS = ConcurrentHashMap.newKeySet();
     private static final Logger log = LoggerFactory.getLogger(AuditEngineServiceImpl.class);
 
     private final AuditTaskMapper auditTaskMapper;
@@ -60,6 +64,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
     private final RustSseClient rustSseClient;
     private final RustApiProperties rustApiProperties;
     private final TraceService traceService;
+    private final RunningTaskRegistry runningTaskRegistry;
     private final ObjectMapper objectMapper = new ObjectMapper()
             .setPropertyNamingStrategy(
                 com.fasterxml.jackson.databind.PropertyNamingStrategies.SNAKE_CASE);
@@ -73,7 +78,8 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             RustDocumentService rustDocumentService,
             RustSseClient rustSseClient,
             RustApiProperties rustApiProperties,
-            TraceService traceService
+            TraceService traceService,
+            RunningTaskRegistry runningTaskRegistry
     ) {
         this.auditTaskMapper = auditTaskMapper;
         this.auditIssueMapper = auditIssueMapper;
@@ -84,37 +90,59 @@ public class AuditEngineServiceImpl implements AuditEngineService {
         this.rustSseClient = rustSseClient;
         this.rustApiProperties = rustApiProperties;
         this.traceService = traceService;
+        this.runningTaskRegistry = runningTaskRegistry;
     }
 
     @Override
     @Async("auditTaskExecutor")
-    public void start(String taskId) {
-        log.info("audit async task started: taskId={}, thread={}", taskId, Thread.currentThread().getName());
-        if (!RUNNING_TASKS.add(taskId)) {
-            log.warn("audit task skipped due to concurrent start, taskId={}", taskId);
-            return;
-        }
+    public void start(AuditTaskEnvelope envelope) {
+        Objects.requireNonNull(envelope, "envelope");
+        TenantRequestContext previous = TenantContext.get();
+        Long previousUserId = BaseContext.getCurrentId();
+        TenantContext.set(envelope.toContext());
+        String taskId = envelope.taskId();
+        String runningKey = envelope.tenantId() + ":" + taskId;
         try {
-            runEngine(taskId);
+            log.info("audit async task started: taskId={}, tenantId={}, thread={}"
+                    , taskId, envelope.tenantId(), Thread.currentThread().getName());
+            if (!runningTaskRegistry.register(runningKey)) {
+                log.warn("audit task skipped due to concurrent start, taskId={}, tenantId={}"
+                        , taskId, envelope.tenantId());
+                return;
+            }
+            try {
+                runEngine(taskId);
+            } finally {
+                runningTaskRegistry.remove(runningKey);
+            }
         } finally {
-            RUNNING_TASKS.remove(taskId);
+            TenantContext.clear();
+            if (previous != null) {
+                TenantContext.set(previous);
+            } else if (previousUserId != null) {
+                BaseContext.setCurrentId(previousUserId);
+            }
         }
     }
 
     @Override
-    public boolean recover(String taskId) {
+    public RecoverOutcome recover(String taskId) {
         AuditTask task = loadTask(taskId);
         if (task == null) {
-            return false;
+            log.warn("recover: task not found, taskId={}", taskId);
+            return RecoverOutcome.NOT_FOUND;
         }
         if (AuditTaskStatusEnum.COMPLETED.getCode().equals(task.getTaskStatus())) {
-            return true;
+            return RecoverOutcome.COMPLETED;
+        }
+        if (AuditTaskStatusEnum.FAILED.getCode().equals(task.getTaskStatus())) {
+            return RecoverOutcome.FAILED;
         }
 
-        String rustDocId = rustDocumentService.getCachedDocumentId(task.getBidId(), task.getTenantId());
+        String rustDocId = rustDocumentService.getCachedDocumentId(task.getBidId());
         if (!StringUtils.hasText(rustDocId)) {
             log.warn("recover: no cached Rust document id, taskId={}", taskId);
-            return false;
+            return RecoverOutcome.STATE_LOST;
         }
 
         RustReviewResultResponse result;
@@ -122,25 +150,110 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             result = rustApiClient.getReviewResult(rustDocId);
         } catch (Exception e) {
             log.warn("recover: Rust result unavailable, taskId={}, {}", taskId, e.getMessage());
-            return false;
+            return RecoverOutcome.UNREACHABLE;
         }
-        if (result != null && result.isCompleted() && result.getResult() != null) {
-            log.info("recover: completed Rust result found, taskId={}, docId={}",
-                    taskId, rustDocId);
+        if (result != null && result.getResult() != null
+                && (result.isCompleted() || result.isPartialFailed())) {
+            log.info("recover: {} Rust result found, taskId={}, docId={}",
+                    result.isPartialFailed() ? "partial_failed" : "completed", taskId, rustDocId);
             completeTaskFromReview(task, result.getResult());
-            return true;
+            return RecoverOutcome.COMPLETED;
         }
         if (result != null && result.isFailed()) {
             failTask(task, "Rust 审核失败: " + result.getError());
+            return RecoverOutcome.FAILED;
         }
-        return false;
+        if (result == null) {
+            log.warn("recover: Rust has no review record (state lost?), taskId={}, docId={}",
+                    taskId, rustDocId);
+            return RecoverOutcome.STATE_LOST;
+        }
+        // pending → 审核仍在 Rust 进行中
+        return RecoverOutcome.STILL_RUNNING;
+    }
+
+    @Override
+    public void failOrphan(String taskId) {
+        AuditTask task = loadTask(taskId);
+        if (task == null) {
+            log.warn("failOrphan: task not found, taskId={}", taskId);
+            return;
+        }
+        Integer status = task.getTaskStatus();
+        if (AuditTaskStatusEnum.COMPLETED.getCode().equals(status)
+                || AuditTaskStatusEnum.FAILED.getCode().equals(status)) {
+            log.info("failOrphan: task already terminal, taskId={}, status={}", taskId, status);
+            return;
+        }
+        log.warn("failOrphan: marking orphan task failed, taskId={}, status={}", taskId, status);
+        failTask(task, "审核任务因引擎中断成为孤儿，已自动判定失败，请重新发起审核");
     }
 
     // ── 主流程 ──────────────────────────────────────────────────────
 
     private AuditTask loadTask(String taskId) {
         return auditTaskMapper.selectOne(
-                new LambdaQueryWrapper<AuditTask>().eq(AuditTask::getTaskId, taskId));
+                new LambdaQueryWrapper<AuditTask>()
+                        .eq(AuditTask::getTaskId, taskId)
+                        .eq(AuditTask::getTenantId, TenantScope.requiredTenantId()));
+    }
+
+    /**
+     * Stage 1 上传：对「瞬时」故障做有界重试（幂等）。
+     *
+     * <p>上传成功后仅剩 DB 回写/提交可能偶发瞬断（如 {@code Communications link failure}、
+     * {@code SocketTimeoutException}），此时任务不应直接判失败。只对瞬时异常重试，
+     * 业务性错误（文件不存在、资源不存在等）仍立即失败。</p>
+     */
+    private String uploadWithRetry(AuditTask task) {
+        final int maxAttempts = 3;
+        final long[] delaysMs = {1000, 2000};
+        Exception last = null;
+        for (int i = 0; i < maxAttempts; i++) {
+            try {
+                return rustDocumentService.ensureUploaded(task.getBidId());
+            } catch (Exception ex) {
+                last = ex;
+                if (!isTransient(ex) || i == maxAttempts - 1) {
+                    break;
+                }
+                log.warn("Stage 1 上传瞬时故障，重试 {}/{}: taskId={}, err={}",
+                        i + 1, maxAttempts - 1, task.getTaskId(), ex.getMessage());
+                sleepSafe(delaysMs[i]);
+            }
+        }
+        if (last instanceof RuntimeException runtimeEx) {
+            throw runtimeEx;
+        }
+        // 理论上不会触发（ensureUploaded 抛的都是 RuntimeException）；安全兜底。
+        throw new RuntimeException(last != null ? last.getMessage() : "Rust 上传失败", last);
+    }
+
+    /** 沿 cause 链判定是否为瞬时故障（DB 断连 / 网络超时），值得重试。 */
+    private boolean isTransient(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof org.springframework.dao.RecoverableDataAccessException) {
+                return true; // Spring 对 Communications link failure / 死连接 的分类
+            }
+            if (c instanceof java.sql.SQLRecoverableException) {
+                return true; // MySQL CommunicationsException 等可恢复连接错误
+            }
+            if (c instanceof java.net.SocketTimeoutException) {
+                return true; // socket 读超时
+            }
+            if (c instanceof java.io.IOException) {
+                return true; // Rust HTTP 网络异常
+            }
+        }
+        return false; // 业务异常（BizException、resourceNotFound 等）→ 不重试
+    }
+
+    private void sleepSafe(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void runEngine(String taskId) {
@@ -156,13 +269,18 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             return;
         }
 
+        // 主流程结束标记：任何路径退出（完成/失败/超时）后都应停止 SSE 重连。
+        // 声明在 try 外，finally 块统一置位。
+        final java.util.concurrent.atomic.AtomicBoolean relayStop =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+
         try {
             // Stage 1: 上传文件到 Rust（幂等）
             log.info("═══ [审核 Stage 1/4] 开始上传文件到 Rust 引擎: taskId={}, bidId={} ═══", taskId, task.getBidId());
             updateStage(task, AuditStageEnum.UPLOADING, 10);
             String rustDocId;
             try {
-                rustDocId = rustDocumentService.ensureUploaded(task.getBidId(), task.getTenantId());
+                rustDocId = uploadWithRetry(task);
                 log.info("═══ [审核 Stage 1/4] 文件上传完成 → rustDocId={} ═══", rustDocId);
             } catch (Exception ex) {
                 log.error("❌ [审核 Stage 1/4] Rust 上传失败: taskId={}, bidId={} — {}", taskId, task.getBidId(), ex.getMessage(), ex);
@@ -184,8 +302,8 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             CompletableFuture<String> reviewErrorSignal = new CompletableFuture<>();
 
             // 启动 Rust SSE 实时推送 relay（在调用 Rust POST /review 之前连接，
-            // 确保不丢失早期事件）
-            CompletableFuture<Void> sseRelay = rustSseClient.connect(rustDocId, (eventType, data) -> {
+            // 确保不丢失早期事件）。断线后按退避策略重连，直到审核结束。
+            CompletableFuture<Void> sseRelay = rustSseClient.connectWithReconnect(rustDocId, (eventType, data) -> {
                 try {
                     switch (eventType) {
                         case "agent_progress" -> {
@@ -211,14 +329,14 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                             String phase = data.has("phase") ? data.get("phase").asText() : "";
                             int progress = "execute".equals(phase) ? 35 : "merge".equals(phase) ? 45 : "legal_verify".equals(phase) ? 55 : 60;
                             // 使用无乐观锁的单调推进 SQL。不要在多个异步回调中共享并修改 task.version。
-                            CompletableFuture.runAsync(() -> {
+                            CompletableFuture.runAsync(TenantContext.wrap(() -> {
                                 try {
                                     auditTaskMapper.advanceReviewProgress(
                                             taskId, task.getTenantId(), progress, LocalDateTime.now());
                                 } catch (Exception e) {
                                     log.warn("advanceReviewProgress async failed: {}", e.getMessage());
                                 }
-                            });
+                            }));
                         }
                         case "stats" -> {
                             emitSafe(taskId, SseEventTypeEnum.STATS, data);
@@ -226,27 +344,50 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                         case "finding_added" -> {
                             // 1. 透传原始数据给前端的 liveFindings（增量更新）
                             emitTransient(taskId, SseEventTypeEnum.FINDING_ADDED, data);
-                            // 2. 同时映射为 ISSUE（兼容 AnalysisList 实时显示）
+                            // 2. 同时映射为 ISSUE（兼容 AnalysisList 实时显示）+ 增量落库（P2）
                             try {
                                 RustRiskFinding rf = objectMapper.convertValue(data, RustRiskFinding.class);
                                 if (!rf.shouldSkip()) {
                                     emitTransient(taskId, SseEventTypeEnum.ISSUE, toIssueVO(rf));
+                                    persistFindingIncremental(task, rf);
                                 }
                             } catch (Exception ignored) {
                                 log.debug("SSE finding_added map failed: {}", ignored.getMessage());
                             }
                         }
                         case "finding_removed" -> {
-                            // 去重合并时移除 → 前端从 liveFindings 中删除
+                            // 去重合并时移除 → 前端从 liveFindings 中删除 + 增量删除（P2）
                             emitTransient(taskId, SseEventTypeEnum.FINDING_REMOVED, data);
+                            try {
+                                RustRiskFinding rf = objectMapper.convertValue(data, RustRiskFinding.class);
+                                deleteFindingIncremental(task, rf);
+                            } catch (Exception ignored) {
+                                log.debug("SSE finding_removed map failed: {}", ignored.getMessage());
+                            }
                         }
                         case "finding_updated" -> {
-                            // 字段变更（降级/辩论） → 前端就地更新 liveFindings
+                            // 字段变更（降级/辩论） → 前端就地更新 liveFindings + 增量更新（P2）
                             emitTransient(taskId, SseEventTypeEnum.FINDING_UPDATED, data);
+                            try {
+                                RustRiskFinding rf = objectMapper.convertValue(data, RustRiskFinding.class);
+                                persistFindingIncremental(task, rf);
+                            } catch (Exception ignored) {
+                                log.debug("SSE finding_updated map failed: {}", ignored.getMessage());
+                            }
                         }
                         case "done" -> {
                             log.info("Rust SSE done received: docId={}", rustDocId);
                             // 标记所有 running session 为 completed
+                            try {
+                                traceService.markSessionsCompleted(taskId);
+                            } catch (Exception e) {
+                                log.warn("Trace markSessionsCompleted failed: taskId={}", taskId, e);
+                            }
+                            reviewDoneSignal.complete(null);
+                        }
+                        case "partial_done" -> {
+                            log.warn("Rust SSE partial_done received: docId={} (部分 clause 失败，结果仍可落库)", rustDocId);
+                            // 部分完成同样视为审核结束，最终结果通过 GET /result 获取（status=partial_failed）
                             try {
                                 traceService.markSessionsCompleted(taskId);
                             } catch (Exception e) {
@@ -277,7 +418,9 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                 } catch (Exception e) {
                     log.debug("SSE relay event process failed: {}", e.getMessage());
                 }
-            });
+            },
+            () -> relayStop.get() || reviewDoneSignal.isDone() || reviewErrorSignal.isDone(),
+            com.ithsd.smart_tender.service.engine.rust.SseRetryPolicy.defaults());
 
             // 等待 SSE 连接就绪（避免丢失早期事件）
             waitForSseConnection(sseRelay);
@@ -325,6 +468,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
             log.error("❌ [审核] 未预期的异常导致审核失败: taskId={} — {}", taskId, ex.getMessage(), ex);
             failTask(task, crop(ex.getMessage()));
         } finally {
+            relayStop.set(true);
             sseHub.close(taskId);
         }
     }
@@ -352,7 +496,8 @@ public class AuditEngineServiceImpl implements AuditEngineService {
         List<RustRiskFinding> activeFindings = new ArrayList<>();
         // 先删除旧数据，确保恢复操作可安全重试。
         auditIssueMapper.delete(new LambdaQueryWrapper<AuditIssue>()
-                .eq(AuditIssue::getAuditId, task.getId()));
+                .eq(AuditIssue::getAuditId, task.getId())
+                .eq(AuditIssue::getTenantId, task.getTenantId()));
 
         if (reviewResp.getFindings() != null) {
             int seq = 0;
@@ -360,28 +505,7 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                 if (finding.shouldSkip()) continue;
                 activeFindings.add(finding);
                 try {
-                    AuditIssue issue = AuditIssue.builder()
-                            .auditId(task.getId())
-                            .issueNo("ISSUE-" + (finding.getRiskId() != null
-                                    ? finding.getRiskId() : String.valueOf(++seq)))
-                            .severity(finding.mappedSeverity())
-                            .isCritical(finding.isCritical())
-                            .criticalReason(finding.getCriticalReason())
-                            .category(finding.getRiskType())
-                            .description(finding.getReason() != null
-                                    ? finding.getReason() : finding.getRiskType())
-                            .suggestion(finding.getSuggestion())
-                            .pageNumber(finding.getPageNumber())
-                            .sectionName(finding.getSectionPath() != null
-                                    ? String.join(" > ", finding.getSectionPath()) : null)
-                            .context(finding.getContext() != null
-                                    ? finding.getContext() : finding.getSourceQuote())
-                            .reference(finding.getLegalBasis() != null
-                                    && !finding.getLegalBasis().isEmpty()
-                                    ? String.join("; ", finding.getLegalBasis()) : null)
-                            .createTime(LocalDateTime.now())
-                            .build();
-                    auditIssueMapper.insert(issue);
+                    auditIssueMapper.insert(toIssue(task, finding, ++seq));
                 } catch (Exception e) {
                     log.warn("Failed to persist finding {}: {}", finding.getRiskId(), e.getMessage());
                 }
@@ -389,7 +513,31 @@ public class AuditEngineServiceImpl implements AuditEngineService {
         }
 
         LocalDateTime completedAt = LocalDateTime.now();
-        auditTaskMapper.markCompleted(task.getTaskId(), task.getTenantId(), completedAt);
+
+        // 透传 Rust 的「部分失败」信号：EvidenceVerify 等阶段被跳过时，Rust 返回
+        // status=partial_failed 且 failed_stages 非空。这里把失败阶段名写入 audit_task.failed_stages，
+        // 使 COMPLETE 事件的 failedStages 不再恒空（据此可提示结果经过降级而非完整核验）。
+        List<String> failedStages = new ArrayList<>();
+        if (reviewResp != null
+                && reviewResp.getExecutionSummary() != null
+                && reviewResp.getExecutionSummary().getFailedStages() != null) {
+            for (RustStageFailure sf : reviewResp.getExecutionSummary().getFailedStages()) {
+                if (sf != null && sf.getStage() != null && !sf.getStage().isBlank()) {
+                    failedStages.add(sf.getStage());
+                }
+            }
+        }
+        task.setFailedStages(failedStages);
+        String failedStagesJson = null;
+        if (!failedStages.isEmpty()) {
+            try {
+                failedStagesJson = objectMapper.writeValueAsString(failedStages);
+            } catch (Exception e) {
+                log.warn("failedStages serialize failed: taskId={}, {}", task.getTaskId(), e.getMessage());
+            }
+        }
+
+        auditTaskMapper.markCompleted(task.getTaskId(), task.getTenantId(), completedAt, failedStagesJson);
         task.setTaskStatus(AuditTaskStatusEnum.COMPLETED.getCode());
         task.setStage(AuditStageEnum.SUMMARY.name());
         task.setProgress(100);
@@ -403,6 +551,71 @@ public class AuditEngineServiceImpl implements AuditEngineService {
                 activeFindings.stream().filter(i -> "medium".equals(i.mappedSeverity())).count(),
                 activeFindings.stream().filter(i -> "low".equals(i.mappedSeverity())).count(),
                 activeFindings.stream().filter(i -> "info".equals(i.mappedSeverity())).count());
+    }
+
+    // ── P2 增量落库：RustRiskFinding → AuditIssue（统一映射 + 进行中 upsert/删除） ──
+
+    private AuditIssue toIssue(AuditTask task, RustRiskFinding finding, int seq) {
+        String riskId = finding.getRiskId() != null
+                ? finding.getRiskId() : String.valueOf(seq);
+        return AuditIssue.builder()
+                .tenantId(task.getTenantId())
+                .auditId(task.getId())
+                .issueNo("ISSUE-" + riskId)
+                .riskId(riskId)
+                .severity(finding.mappedSeverity())
+                .isCritical(finding.isCritical())
+                .criticalReason(finding.getCriticalReason())
+                .category(finding.getRiskType())
+                .description(finding.getReason() != null ? finding.getReason() : finding.getRiskType())
+                .suggestion(finding.getSuggestion())
+                .pageNumber(finding.getPageNumber())
+                .sectionName(finding.getSectionPath() != null
+                        ? String.join(" > ", finding.getSectionPath()) : null)
+                .context(finding.getContext() != null ? finding.getContext() : finding.getSourceQuote())
+                .blockIds(toJsonOrNull(finding.getBlockIds()))
+                .highlightRects(toJsonOrNull(finding.getHighlightRects()))
+                .reference(finding.getLegalBasis() != null && !finding.getLegalBasis().isEmpty()
+                        ? String.join("; ", finding.getLegalBasis()) : null)
+                .confidence(finding.getConfidence() > 0 ? (double) finding.getConfidence() : null)
+                .createTime(LocalDateTime.now())
+                .build();
+    }
+
+    /** 空集合归一为 null，避免给无 bbox 的 finding 落下无意义的 "[]" 噪声 */
+    private String toJsonOrNull(Object value) {
+        if (value instanceof java.util.Collection<?> c && c.isEmpty()) {
+            return null;
+        }
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (Exception e) {
+            log.warn("bbox 序列化失败: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private void persistFindingIncremental(AuditTask task, RustRiskFinding finding) {
+        if (finding.shouldSkip()) return;
+        try {
+            auditIssueMapper.upsert(toIssue(task, finding, 0));
+        } catch (Exception e) {
+            log.warn("persist finding incremental failed: taskId={}, riskId={}, {}",
+                    task.getTaskId(), finding.getRiskId(), e.getMessage());
+        }
+    }
+
+    private void deleteFindingIncremental(AuditTask task, RustRiskFinding finding) {
+        if (finding.getRiskId() == null) return;
+        try {
+            auditIssueMapper.delete(new LambdaQueryWrapper<AuditIssue>()
+                    .eq(AuditIssue::getTenantId, task.getTenantId())
+                    .eq(AuditIssue::getAuditId, task.getId())
+                    .eq(AuditIssue::getRiskId, finding.getRiskId()));
+        } catch (Exception e) {
+            log.warn("delete finding incremental failed: taskId={}, riskId={}, {}",
+                    task.getTaskId(), finding.getRiskId(), e.getMessage());
+        }
     }
 
     // ── 映射：RustRiskFinding → IssueVO（SSE 推送用） ────────────────
@@ -553,12 +766,18 @@ public class AuditEngineServiceImpl implements AuditEngineService {
 
             try {
                 RustReviewResultResponse result = rustApiClient.getReviewResult(rustDocId);
-                if (result != null && result.isCompleted()) {
-                    return result.getResult();
+                RustReviewResponse response = classifyPollResult(result);
+                if (response != null) {
+                    return response;
                 }
-                if (result != null && result.isFailed()) {
-                    log.error("Rust review failed: docId={}, error={}", rustDocId, result.getError());
-                    return null;
+                // response == null → Rust 侧仍为 pending，继续轮询
+            } catch (BizException e) {
+                if (e.getCode() != null && e.getCode() == 5701) {
+                    // 5701 = Rust 连接失败（引擎可能暂时不可达），保持重试
+                    log.warn("Rust result poll failed, will retry: docId={}, {}", rustDocId, e.getMessage());
+                } else {
+                    // 终态判定（failed / 状态丢失）→ 快速失败，携带真实原因
+                    throw e;
                 }
             } catch (Exception e) {
                 log.warn("Rust result poll failed, will retry: docId={}, {}", rustDocId, e.getMessage());
@@ -585,6 +804,39 @@ public class AuditEngineServiceImpl implements AuditEngineService {
 
         log.error("Rust review timed out after {}min: docId={}",
                 rustApiProperties.getReviewTimeoutMinutes(), rustDocId);
+        return null;
+    }
+
+    /**
+     * 单次轮询结果的处置（纯函数，便于单测）。
+     *
+     * <ul>
+     *   <li>null（Rust 404：无任何审核记录）→ 审核已启动则状态丢失，抛 5705</li>
+     *   <li>completed / partial_failed（带结果）→ 返回结果</li>
+     *   <li>failed → 抛 5705，透传 Rust 原始错误</li>
+     *   <li>pending → 返回 null，继续轮询</li>
+     * </ul>
+     */
+    static RustReviewResponse classifyPollResult(RustReviewResultResponse result) {
+        if (result == null) {
+            throw new BizException(5705,
+                    "Rust 审核状态丢失（引擎可能重启），请重新发起审核");
+        }
+        if (result.isCompleted()) {
+            return result.getResult();
+        }
+        if (result.isPartialFailed()) {
+            if (result.getResult() != null) {
+                return result.getResult();
+            }
+            throw new BizException(5705,
+                    "Rust 审核部分失败且无可用结果，请重新发起审核");
+        }
+        if (result.isFailed()) {
+            String reason = result.getError();
+            throw new BizException(5705, "Rust 审核失败: "
+                    + (reason == null || reason.isBlank() ? "未知原因" : reason));
+        }
         return null;
     }
 

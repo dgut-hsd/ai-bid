@@ -22,7 +22,10 @@ export const useStyles = createStyles(({ css, token }) => ({
       display: flex;
       gap: 24px;
       flex: 1;
-      max-width: 1920px;
+      width: 100%;
+      max-width: 1280px;
+      margin: 0 auto;
+      align-items: flex-start;
 
       @media (max-width: 768px) {
          flex-direction: column;
@@ -32,6 +35,7 @@ export const useStyles = createStyles(({ css, token }) => ({
 
    contentArea: css`
       flex: 1;
+      min-width: 0;
    `,
 
    cardWrapper: css`

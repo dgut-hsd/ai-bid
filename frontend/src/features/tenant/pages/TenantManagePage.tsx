@@ -94,8 +94,11 @@ export const TenantManagePage: React.FC = () => {
       key: 'role',
       render: (role?: string) => {
         if (!role) return '-';
-        const color = role === 'owner' ? 'gold' : 'blue';
-        const label = role === 'owner' ? '拥有者' : role === 'admin' ? '管理员' : '成员';
+        const normalized = role.toUpperCase();
+        const color =
+          normalized === 'OWNER' ? 'gold' : normalized === 'ADMIN' ? 'blue' : 'default';
+        const label =
+          normalized === 'OWNER' ? '拥有者' : normalized === 'ADMIN' ? '管理员' : '成员';
         return <Tag color={color}>{label}</Tag>;
       },
     },
@@ -103,12 +106,14 @@ export const TenantManagePage: React.FC = () => {
       title: '创建时间',
       dataIndex: 'created_at',
       key: 'created_at',
+      responsive: ['md', 'lg', 'xl', 'xxl'],
       render: (t?: string) => (t ? new Date(t).toLocaleString('zh-CN') : '-'),
     },
     {
       title: '操作',
       key: 'action',
       width: 200,
+      fixed: 'right',
       render: (_: unknown, record: TenantSummary) => (
         <Space>
           <Button
@@ -158,8 +163,11 @@ export const TenantManagePage: React.FC = () => {
       dataIndex: 'role',
       key: 'role',
       render: (role: string) => {
-        const color = role === 'owner' ? 'gold' : role === 'admin' ? 'blue' : 'default';
-        const label = role === 'owner' ? '拥有者' : role === 'admin' ? '管理员' : '成员';
+        const normalized = role.toUpperCase();
+        const color =
+          normalized === 'OWNER' ? 'gold' : normalized === 'ADMIN' ? 'blue' : 'default';
+        const label =
+          normalized === 'OWNER' ? '拥有者' : normalized === 'ADMIN' ? '管理员' : '成员';
         return <Tag color={color}>{label}</Tag>;
       },
     },
@@ -167,6 +175,7 @@ export const TenantManagePage: React.FC = () => {
       title: '加入时间',
       dataIndex: 'joined_at',
       key: 'joined_at',
+      responsive: ['md', 'lg', 'xl', 'xxl'],
       render: (t?: string) => (t ? new Date(t).toLocaleString('zh-CN') : '-'),
     },
   ];
@@ -196,6 +205,7 @@ export const TenantManagePage: React.FC = () => {
           loading={isLoading}
           pagination={false}
           size='middle'
+          scroll={{ x: 'max-content' }}
         />
       </Card>
 
@@ -254,6 +264,7 @@ export const TenantManagePage: React.FC = () => {
           dataSource={membersQuery.data?.items || []}
           loading={membersQuery.isLoading}
           size='middle'
+          scroll={{ x: 'max-content' }}
           pagination={{
             current: memberPage,
             pageSize: 20,

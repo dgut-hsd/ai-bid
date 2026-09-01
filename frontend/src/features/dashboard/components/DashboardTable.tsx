@@ -54,6 +54,7 @@ export const DashboardTable: React.FC<DashboardTableProps> = ({
                dataSource={currentData}
                rowKey='id'
                tableLayout='fixed'
+               scroll={{ x: 'max-content' }}
                onRow={(record) => {
                   return {
                      onClick: () => {
