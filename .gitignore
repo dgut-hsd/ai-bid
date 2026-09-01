@@ -18,6 +18,8 @@ backend-java/node_modules
 backend-java/logs
 backend-java/hs_err_pid*.log
 backend-java/replay_pid*.log
+# 运行数据卷（Milvus/MinIO/Redis 落盘数据，历史曾误提交，勿再入库）
+backend-java/src/main/resources/volumes/
 
 # ── 前端 (React) ──
 frontend/node_modules
