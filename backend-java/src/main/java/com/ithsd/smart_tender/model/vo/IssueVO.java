@@ -34,6 +34,10 @@ public class IssueVO {
     private String finalTier;
     private Boolean tierEscalated;
     private Boolean truncated;
+    /** 证据核验结论：support / refute / insufficient（EvidenceVerifier 回写） */
+    private String evidenceVerdict;
+    /** 证据核验理由（EvidenceVerifier 回写的一句话结论） */
+    private String verifierReason;
     private List<String> clauseIds;
     /** 关联的原始 block_id 列表（用于前端 bbox-based PDF 精确高亮） */
     private List<String> blockIds;
@@ -98,6 +102,10 @@ public class IssueVO {
     public void setTierEscalated(Boolean tierEscalated) { this.tierEscalated = tierEscalated; }
     public Boolean getTruncated() { return truncated; }
     public void setTruncated(Boolean truncated) { this.truncated = truncated; }
+    public String getEvidenceVerdict() { return evidenceVerdict; }
+    public void setEvidenceVerdict(String evidenceVerdict) { this.evidenceVerdict = evidenceVerdict; }
+    public String getVerifierReason() { return verifierReason; }
+    public void setVerifierReason(String verifierReason) { this.verifierReason = verifierReason; }
     public List<String> getClauseIds() { return clauseIds; }
     public void setClauseIds(List<String> clauseIds) { this.clauseIds = clauseIds; }
     public List<String> getBlockIds() { return blockIds; }

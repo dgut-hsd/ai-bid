@@ -6,6 +6,7 @@ import {
   SafetyCertificateOutlined,
   BookOutlined,
   BulbOutlined,
+  AuditOutlined,
 } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -259,6 +260,20 @@ const ReasoningDrawer: React.FC<Props> = ({ issue, open, onClose, onLocatePage }
               <Tag key={idx} color="purple">{c}</Tag>
             ))}
           </Space>
+        </>
+      )}
+
+      {/* ── 证据核验 ── */}
+      {issue.verifierReason && (
+        <>
+          <Divider style={{ margin: '8px 0 16px' }} />
+          <Title level={5}>
+            <AuditOutlined style={{ marginRight: 6 }} />
+            证据核验
+          </Title>
+          <Text style={{ display: 'block', marginBottom: 24, paddingLeft: 4, fontSize: 15, lineHeight: 1.9, whiteSpace: 'pre-wrap' }}>
+            {issue.verifierReason}
+          </Text>
         </>
       )}
 

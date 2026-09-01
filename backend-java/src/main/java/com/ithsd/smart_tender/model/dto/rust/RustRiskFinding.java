@@ -49,6 +49,12 @@ public class RustRiskFinding {
     // ── 推理 ──
     private String reason;
     private String suggestion;
+    /** 证据核验结论：support / refute / insufficient（EvidenceVerifier 回写） */
+    @JsonProperty("evidence_verdict")
+    private String evidenceVerdict;
+    /** 证据核验理由（EvidenceVerifier 回写的一句话结论） */
+    @JsonProperty("verifier_reason")
+    private String verifierReason;
 
     // ── 置信度 ──
     private float confidence;

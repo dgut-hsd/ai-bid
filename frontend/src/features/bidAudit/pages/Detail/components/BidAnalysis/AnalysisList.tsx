@@ -1,5 +1,5 @@
 import React, { useMemo, useRef, useEffect } from 'react';
-import { Segmented, Typography, Tag, Space, Progress, Alert } from 'antd';
+import { Segmented, Typography, Tag, Space, Alert } from 'antd';
 import { useStyles } from '../../style';
 import type { AuditIssue } from '../../types';
 import type { BBoxData } from '../../components/PDFPreview/PdfPreview';
@@ -534,6 +534,11 @@ const buildIssueExplanation = (issue: AuditIssue, raw?: string): string => {
    return text;
 };
 
+const EVIDENCE_VERDICT_META: Record<string, { label: string; color: string }> = {
+   refute: { label: '被反驳', color: 'error' },
+   insufficient: { label: '证据不足', color: 'default' },
+};
+
 interface AnalysisListProps {
    issues: AuditIssue[];
    isComplete: boolean;
@@ -728,7 +733,9 @@ export const AnalysisList: React.FC<AnalysisListProps> = React.memo(
                   issue,
                   parsed?.rationale || rawDescription
                );
-               const rationale = `${buildAnchorPrefix(issue)}\n【问题说明】${rationaleBody}`;
+               const verdictMeta = issue.evidenceVerdict ? EVIDENCE_VERDICT_META[issue.evidenceVerdict] : undefined;
+               const isVerifierSupported = issue.evidenceVerdict === 'support' && Boolean((issue.verifierReason || '').trim());
+               const rationale = isVerifierSupported ? `${buildAnchorPrefix(issue)}\n【证据核验】${String(issue.verifierReason || '').trim()}` : `${buildAnchorPrefix(issue)}\n【问题说明】${rationaleBody}`;
                if (!hasMeaningfulContent(title, rationale)) {
                   return null;
                }
@@ -823,20 +830,13 @@ export const AnalysisList: React.FC<AnalysisListProps> = React.memo(
                         </Space>
                      </div>
 
-                     {/* Confidence + Truncated */}
+                     {/* 核验结论 + Truncated */}
                      <div style={{ marginTop: 4, marginBottom: 6 }}>
-                        {issue.confidence !== undefined && (
+                        {verdictMeta && (
                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                              <Progress
-                                 percent={Math.round(issue.confidence * 100)}
-                                 size="small"
-                                 style={{ width: 120, margin: 0 }}
-                                 format={(p) => `置信度 ${p}%`}
-                                 strokeColor={
-                                    issue.confidence < 0.5 ? '#f5222d' :
-                                    issue.confidence < 0.7 ? '#fa8c16' : '#52c41a'
-                                 }
-                              />
+                              <Tag color={verdictMeta.color} style={{ fontSize: 12, margin: 0 }}>
+                                 {verdictMeta.label}
+                              </Tag>
                            </div>
                         )}
                         {issue.truncated && (

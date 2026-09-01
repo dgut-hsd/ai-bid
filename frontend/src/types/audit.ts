@@ -125,6 +125,10 @@ export interface AuditIssue {
   tierEscalated?: boolean;
   /** 是否因 maxTurns 耗尽而截断（需人工复核） */
   truncated?: boolean;
+  /** 证据核验结论（EvidenceVerifier 回写）：support=坐实 / refute=被反驳 / insufficient=证据不足 */
+  evidenceVerdict?: 'support' | 'refute' | 'insufficient';
+  /** 证据核验理由（EvidenceVerifier 回写的一句话结论） */
+  verifierReason?: string;
   /** 关联的条款 chunk_id 列表（支持跨条款组合风险） */
   clauseIds?: string[];
   /** 关联的原始 block_id 列表（用于 bbox-based PDF 精确高亮） */

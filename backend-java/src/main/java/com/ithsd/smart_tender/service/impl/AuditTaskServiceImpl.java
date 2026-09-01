@@ -244,7 +244,7 @@ public class AuditTaskServiceImpl implements AuditTaskService {
                 try {
                     RustReviewResultResponse rustResult =
                         rustApiClient.getReviewResult(tender.getRustDocumentId());
-                    if (rustResult != null && rustResult.isCompleted()) {
+                    if (rustResult != null && (rustResult.isCompleted() || rustResult.isPartialFailed())) {
                         review = rustResult.getResult();
                     }
                 } catch (Exception e) {
@@ -558,6 +558,8 @@ public class AuditTaskServiceImpl implements AuditTaskService {
         vo.setFinalTier(f.getFinalTier());
         vo.setTierEscalated(f.isTierEscalated());
         vo.setTruncated(f.isTruncated());
+        vo.setVerifierReason(f.getVerifierReason());
+        vo.setEvidenceVerdict(f.getEvidenceVerdict());
         vo.setClauseIds(f.getClauseIds());
         vo.setBlockIds(f.getBlockIds());
         // 词级精确高亮矩形（非空时前端跳过段落级 block 与文本层收敛，直接渲染）
