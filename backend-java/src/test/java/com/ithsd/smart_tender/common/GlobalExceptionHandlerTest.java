@@ -285,11 +285,10 @@ class GlobalExceptionHandlerTest {
     // ========================================================================
 
     @Test
-    void handleClientAbortException_shouldReturn499() {
+    void handleClientAbortException_shouldNotThrow() {
         ClientAbortException ex = new ClientAbortException("连接被客户端重置");
-        Result<Void> result = handler.handleClientAbortException(ex);
-        assertEquals(499, result.getCode());
-        assertTrue(result.getMsg().contains("客户端"));
+        // 处理器已改为 void：客户端断开时连接不可写，仅记录日志、不返回响应体。
+        assertDoesNotThrow(() -> handler.handleClientAbortException(ex));
     }
 
     // ========================================================================

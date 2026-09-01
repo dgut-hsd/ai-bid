@@ -16,6 +16,8 @@ public class JwtProperties {
 
     private String secret;
     private long ttlMillis = 86_400_000L;
+    /** 会话（Redis）存活时长，也作为 access token 过期后的续期窗口上限。默认 7 天。 */
+    private long sessionTtlMillis = 604_800_000L;
     private boolean acceptLegacyUserId;
 
     public String getSecret() {
@@ -32,6 +34,14 @@ public class JwtProperties {
 
     public void setTtlMillis(long ttlMillis) {
         this.ttlMillis = ttlMillis;
+    }
+
+    public long getSessionTtlMillis() {
+        return sessionTtlMillis;
+    }
+
+    public void setSessionTtlMillis(long sessionTtlMillis) {
+        this.sessionTtlMillis = sessionTtlMillis;
     }
 
     public boolean isAcceptLegacyUserId() {

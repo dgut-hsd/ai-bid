@@ -1083,10 +1083,24 @@ pub async fn review_document(
         active.insert(key.clone());
     }
 
+    // ★ 修复重复审核竞态：清除上一次审核遗留的内存结果，否则 GET /result 会
+    //   在本次审核完成前读到旧的 completed 结果，被 Java 误判为"本次已完成"。
+    {
+        state.review_results.lock().await.remove(&key);
+        state.review_errors.lock().await.remove(&key);
+        state.review_usages.lock().await.remove(&key);
+    }
+
     // 落盘"审核进行中"状态：进程重启后 get_review_result 可据此识别中断，
     // 让 Java 侧快速失败而不是盲等超时。
     if let Some(findings_dir) = tenant_output_path(&key.tenant_id, "findings") {
         let _ = std::fs::create_dir_all(&findings_dir);
+        // 同步清除上一次的 _result.json，避免进程重启后 disk_recovery 读到旧的
+        // completed 结果（disk_recovery 优先读 _result.json 而非 _review_state.json）。
+        let stale_result = findings_dir.join(format!("{}_result.json", doc_id));
+        if stale_result.exists() {
+            let _ = std::fs::remove_file(&stale_result);
+        }
         if let Err(e) = crate::api::review_state::write_running(
             &findings_dir,
             &doc_id,

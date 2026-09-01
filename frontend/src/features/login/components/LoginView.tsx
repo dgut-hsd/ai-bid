@@ -44,7 +44,7 @@ export function LoginView({
                      <LogoIcon />
                      <h2 className={styles.loginCardTitle}>智能标书审核系统</h2>
                   </div>
-                  <p className={styles.loginCardSubtitle}>登录以继续使用</p>
+                  <p className={styles.loginCardSubtitle}>欢迎登录</p>
                </div>
 
                <LoginForm

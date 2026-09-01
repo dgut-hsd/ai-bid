@@ -44,8 +44,19 @@ public class JwtTokenService {
 
     public TenantJwtClaims parse(String token) {
         requireConfigured();
-        Claims claims = JwtUtil.parseJWT(properties.getSecret(), token);
+        return toClaims(JwtUtil.parseJWT(properties.getSecret(), token));
+    }
 
+    /**
+     * 容忍「签名有效、仅 exp 过期」的 token（签名错误、格式错误仍会抛异常）。
+     * 仅供 refresh 在 Redis 会话存活窗口内续期使用，续期窗口上限由会话 TTL 决定。
+     */
+    public TenantJwtClaims parsePermissive(String token) {
+        requireConfigured();
+        return toClaims(JwtUtil.parseJWTPermissive(properties.getSecret(), token));
+    }
+
+    private TenantJwtClaims toClaims(Claims claims) {
         String userIdValue = textClaim(claims, "user_id");
         if (userIdValue == null && properties.isAcceptLegacyUserId()) {
             userIdValue = textClaim(claims, "userId");
@@ -75,6 +86,10 @@ public class JwtTokenService {
 
     public long getTtlMillis() {
         return properties.getTtlMillis();
+    }
+
+    public long getSessionTtlMillis() {
+        return properties.getSessionTtlMillis();
     }
 
     public long getExpiresInSeconds() {

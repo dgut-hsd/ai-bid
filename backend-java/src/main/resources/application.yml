@@ -61,6 +61,7 @@ security:
     # Local/test fallback only; production profile requires ST_JWT_SECRET.
     secret: ${ST_JWT_SECRET:local-test-only-jwt-secret-change-me}
     ttl-millis: ${ST_JWT_TTL_MILLIS:86400000}
+    session-ttl-millis: ${ST_SESSION_TTL_MILLIS:604800000}
     accept-legacy-user-id: false
 
 # 平台管理员（系统管理者）初始化：首次启动只播种 is_platform_admin=1 的系统管理者

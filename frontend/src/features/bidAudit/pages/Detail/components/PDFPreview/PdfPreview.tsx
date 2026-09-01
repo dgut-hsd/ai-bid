@@ -29,14 +29,18 @@ export type BBoxData = {
   page?: number; // ← 新增：该 BBox 属于哪一页
 };
 
+/** 高亮框：存「原始 PDF points + 该页原生宽」，渲染时按当前 pageWidth 实时换算。
+ *  这样窗口缩放 / zoom 改变渲染宽度后重渲染即自动跟随，不会因缓存像素而错位。 */
 type HighlightBox = {
-   left: number;
+   x0: number;
    top: number;
-   width: number;
-   height: number;
+   x1: number;
+   bottom: number;
+   nativeWidth: number;
    primary: boolean;
 };
 
+/** 字符框（PDF points，左上角原点、Y 向下）——仅用于文本匹配与合并，不落渲染态。 */
 type CharBox = {
    left: number;
    top: number;
@@ -47,6 +51,7 @@ type CharBox = {
 type PageTextIndex = {
    compactText: string;
    charBoxes: CharBox[];
+   nativeWidth: number;
 };
 
 export interface PdfPreviewRef {
@@ -141,10 +146,11 @@ const findAllCompactPositions = (text: string, keyword: string, limit: number = 
    return out;
 };
 
-const mergeCharBoxes = (charBoxes: CharBox[], tolerancePx: number = 2): CharBox[] => {
+// 合并同一行的相邻字符框。tolerance 单位为 PDF points。
+const mergeCharBoxes = (charBoxes: CharBox[], tolerance: number = 2): CharBox[] => {
    if (!charBoxes.length) return [];
    const sorted = [...charBoxes].sort((a, b) => {
-      if (Math.abs(a.top - b.top) > tolerancePx) {
+      if (Math.abs(a.top - b.top) > tolerance) {
          return a.top - b.top;
       }
       return a.left - b.left;
@@ -156,7 +162,7 @@ const mergeCharBoxes = (charBoxes: CharBox[], tolerancePx: number = 2): CharBox[
          merged.push({ ...box });
          continue;
       }
-      const sameLine = Math.abs(last.top - box.top) <= tolerancePx;
+      const sameLine = Math.abs(last.top - box.top) <= tolerance;
       const touching = box.left <= last.left + last.width + 1.5;
       if (sameLine && touching) {
          const right = Math.max(last.left + last.width, box.left + box.width);
@@ -281,14 +287,13 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
       async (page: number): Promise<PageTextIndex | null> => {
          const doc = pdfDocRef.current;
          if (!doc || !page || page < 1) return null;
-         const cacheKey = `${page}@${fitWidth.toFixed(0)}@${scale.toFixed(3)}`;
+         const cacheKey = `${page}`;
          const cached = pageTextIndexCacheRef.current[cacheKey];
          if (cached) return cached;
          try {
             const pdfPage = await doc.getPage(page);
             const baseViewport = pdfPage.getViewport({ scale: 1 });
-            const renderWidth = pageWidth;
-            const renderScale = renderWidth / Math.max(baseViewport.width || 1, 1);
+            const nativeWidth = baseViewport.width;
             const textContent = await pdfPage.getTextContent();
             const compactChars: string[] = [];
             const charBoxes: CharBox[] = [];
@@ -300,10 +305,12 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
                const compact = compactForMatch(raw);
                if (!compact) return;
                const t = Array.isArray(item?.transform) ? item.transform : [1, 0, 0, 1, 0, 0];
-               const x = Number(t[4] || 0) * renderScale;
-               const yBase = (Number(baseViewport.height || 0) - Number(t[5] || 0)) * renderScale;
-               const h = Math.max(Math.abs(Number(t[3] || 0) * renderScale), 9);
-               const wRaw = Number(item?.width || 0) * renderScale;
+               // 直接产出 PDF points（左上角原点、Y 向下），不乘渲染缩放；
+               // 渲染时再用「当前 pageWidth / nativeWidth」统一换算。
+               const x = Number(t[4] || 0);
+               const yBase = Number(baseViewport.height || 0) - Number(t[5] || 0);
+               const h = Math.max(Math.abs(Number(t[3] || 0)), 9);
+               const wRaw = Number(item?.width || 0);
                const w = Math.max(wRaw, Math.max(6, compact.length * 6));
                const top = Math.max(0, yBase - h);
                const perChar = w / compact.length;
@@ -323,6 +330,7 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
             const built: PageTextIndex = {
                compactText: compactChars.join(''),
                charBoxes,
+               nativeWidth,
             };
             pageTextIndexCacheRef.current[cacheKey] = built;
             return built;
@@ -331,7 +339,7 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
             return null;
          }
       },
-      [scale, fitWidth]
+      []
    );
 
    const applyPdfJsHighlights = React.useCallback(
@@ -433,7 +441,11 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
             const merged = mergeCharBoxes(perOcc);
             merged.forEach((b) =>
                boxes.push({
-                  ...b,
+                  x0: b.left,
+                  top: b.top,
+                  x1: b.left + b.width,
+                  bottom: b.top + b.height,
+                  nativeWidth: index.nativeWidth,
                   primary: occIdx === 0,
                })
             );
@@ -543,6 +555,8 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
             return false;
          }
          const pageRect = pageRoot.getBoundingClientRect();
+         const nativeWidth = pageDimRef.current[page]?.width || 595;
+         const scaleFactor = pageRect.width / Math.max(nativeWidth, 0.1);
          const allBoxes: HighlightBox[] = [];
          selectedIndexes.forEach((start, occIdx) => {
             const spanIndexes = new Set<number>();
@@ -559,11 +573,14 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
                if (!span) return;
                const rect = span.getBoundingClientRect();
                if (rect.width <= 0 || rect.height <= 0) return;
+               const leftPx = rect.left - pageRect.left;
+               const topPx = rect.top - pageRect.top;
                allBoxes.push({
-                  left: rect.left - pageRect.left,
-                  top: rect.top - pageRect.top,
-                  width: rect.width,
-                  height: rect.height,
+                  x0: leftPx / scaleFactor,
+                  top: topPx / scaleFactor,
+                  x1: (leftPx + rect.width) / scaleFactor,
+                  bottom: (topPx + rect.height) / scaleFactor,
+                  nativeWidth,
                   primary: isPrimary,
                });
             });
@@ -664,23 +681,26 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
                               zIndex: 3,
                            }}
                         >
-                           {(highlightBoxesByPage[pageNum] || []).map((box, idx) => (
-                              <div
-                                 key={`${pageNum}_${idx}`}
-                                 data-overlay-hit={box.primary ? '1' : '2'}
-                                 style={{
-                                    position: 'absolute',
-                                    left: `${box.left}px`,
-                                    top: `${box.top}px`,
-                                    width: `${box.width}px`,
-                                    height: `${box.height}px`,
-                                    background: box.primary
-                                       ? 'rgba(255, 230, 0, 0.46)'
-                                       : 'rgba(255, 230, 0, 0.22)',
-                                    borderRadius: 2,
-                                 }}
-                              />
-                           ))}
+                           {(highlightBoxesByPage[pageNum] || []).map((box, idx) => {
+                              const scaleFactor = pageWidth / Math.max(box.nativeWidth || 595, 0.1);
+                              return (
+                                 <div
+                                    key={`${pageNum}_${idx}`}
+                                    data-overlay-hit={box.primary ? '1' : '2'}
+                                    style={{
+                                       position: 'absolute',
+                                       left: `${box.x0 * scaleFactor}px`,
+                                       top: `${box.top * scaleFactor}px`,
+                                       width: `${Math.max(1, (box.x1 - box.x0) * scaleFactor)}px`,
+                                       height: `${Math.max(1, (box.bottom - box.top) * scaleFactor)}px`,
+                                       background: box.primary
+                                          ? 'rgba(255, 230, 0, 0.46)'
+                                          : 'rgba(255, 230, 0, 0.22)',
+                                       borderRadius: 2,
+                                    }}
+                                 />
+                              );
+                           })}
                         </div>
                      )}
                   </>
@@ -903,7 +923,7 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
             });
             jumpToPage(page);
 
-            // 2. 等 DOM 渲染完（pdfjs 异步），再读每页真实宽度
+            // 2. 稍等一帧让 overlay DOM 渲染出来（滚动定位依赖它）；高亮框本身存 points，不再依赖 DOM 宽度。
             window.setTimeout(() => {
                if (!containerRef.current) return;
 
@@ -915,29 +935,20 @@ const PdfPreview = React.forwardRef<PdfPreviewRef, PdfPreviewProps>(({
                   groups.get(p)!.push(b);
                });
 
-               // 2b. 逐页：查该页 DOM → 算 scaleFactor → 生成高亮框
+               // 2b. 逐页：直接存「原始 PDF points + 原生宽」，渲染时再按当前 pageWidth 换算
                const newBoxesByPage: Record<number, HighlightBox[]> = {};
                groups.forEach((groupBboxes, pageNum) => {
-                  // 用 data-page-num 选中该页根元素（不是 canvas，是 pageItem div）
-                  const pageEl = containerRef.current?.querySelector(
-                     `[data-page-num="${pageNum}"]`
-                  ) as HTMLElement | null;
-                  if (!pageEl) return;                 // 该页还没渲染，跳过
-                  const renderedWidth = pageEl.clientWidth;
-                  if (renderedWidth <= 0) return;
-
                   // 原生 PDF 点宽：后端 b.pageWidth 优先 → pageDimRef 兜底 → 595
                   const nativeWidth =
                      groupBboxes[0].pageWidth ||
                      pageDimRef.current[pageNum]?.width ||
                      595;
-                  const scaleFactor = renderedWidth / nativeWidth;
-
                   newBoxesByPage[pageNum] = groupBboxes.map((b, idx) => ({
-                     left: b.x0 * scaleFactor,
-                     top: b.top * scaleFactor,
-                     width: Math.max(1, (b.x1 - b.x0) * scaleFactor),
-                     height: Math.max(1, (b.bottom - b.top) * scaleFactor),
+                     x0: b.x0,
+                     top: b.top,
+                     x1: b.x1,
+                     bottom: b.bottom,
+                     nativeWidth,
                      // 仅"主目标页"的第一个框是 primary（更醒目 + 滚动锚点）
                      primary: pageNum === page && idx === 0,
                   }));

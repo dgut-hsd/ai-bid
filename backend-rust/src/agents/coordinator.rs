@@ -35,7 +35,10 @@ use crate::agents::risk_taxonomy;
 use crate::agents::session_graph::SessionGraph;
 use crate::agents::tools::ToolRegistry;
 use crate::agents::trace::TraceLog;
-use crate::agents::evidence_verifier::{evidence_core_key, verify_evidence};
+use crate::agents::evidence_verifier::{
+    deterministic_weight_sum_check, evidence_core_key, fmt_weight_sum, is_weight_related,
+    verify_evidence, EvidenceVerdict,
+};
 use crate::agents::types::*;
 use crate::paths::data_path_str;
 use anyhow::Result;
@@ -185,6 +188,9 @@ pub struct Coordinator {
     metrics: Option<Arc<Mutex<crate::metrics::MetricsCollector>>>,
     /// ★ 跨 Agent 共享搜索缓存（避免不同 Agent 重复搜索相同的法规）
     pub shared_search_cache: Arc<Mutex<HashMap<(String, String), serde_json::Value>>>,
+    /// ★ 确定性数值核验用的 clause 全文缓存：(chunk_id → 全文)。
+    /// preload_chunks 时写入，evidence_verify 时读取做权重和求和。
+    clause_texts: Arc<std::sync::Mutex<HashMap<String, String>>>,
     global_execution_limiter: Arc<GlobalExecutionLimiter>,
 }
 
@@ -222,6 +228,7 @@ impl Coordinator {
             review_events: None,
             metrics: None,
             shared_search_cache,
+            clause_texts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             global_execution_limiter: Arc::new(GlobalExecutionLimiter::from_env()),
         };
 
@@ -1159,6 +1166,14 @@ impl Coordinator {
 
         let count = chunk_nodes.len();
         self.graph.add_chunks(chunk_nodes);
+        // 顺带缓存 clause 全文：证据核验阶段的确定性权重和校验依赖完整数字（graph 只存 200 字 preview）。
+        {
+            let mut full = self.clause_texts.lock().unwrap();
+            full.clear();
+            for c in clauses {
+                full.insert(c.chunk_id.clone(), c.text.clone());
+            }
+        }
         eprintln!("  [PRELOAD] SessionGraph ← {} 个 Chunk 节点", count);
     }
 
@@ -1707,14 +1722,26 @@ impl Coordinator {
         for vf in verified {
             let mut merged = false;
             for existing in stage1.iter_mut() {
-                let same_type = finding_category(existing) == finding_category(&vf);
+                let existing_cat = finding_category(existing);
+                let vf_cat = finding_category(&vf);
+                let same_type = existing_cat == vf_cat;
                 let same_clause = existing
                     .clause_ids
                     .iter()
                     .any(|c| vf.clause_ids.contains(c));
-                let same_evidence = evidence_similarity(existing, &vf) >= 0.70;
-                if same_type && same_clause && same_evidence {
-                    // 同风险类型 + 同条款 → 合并
+                let sim = evidence_similarity(existing, &vf);
+                // 精确同文（日期/空格归一化后逐字相同）→ 放宽去重：
+                //   · 同风险类型可跨 chunk 合并（同一句被重叠分块重复审出）；
+                //   · 同 chunk 且两个标签都没落进 15 类内置分类（均为 LLM 自造码的近义标签）也合并。
+                // 非精确同文仍走原逻辑：同风险类型 + 同条款 + 证据相似度 ≥ 0.70。
+                let exact_quote = sim >= 0.999;
+                let both_uncategorized = risk_taxonomy::display_name(&existing_cat).is_none()
+                    && risk_taxonomy::display_name(&vf_cat).is_none();
+                if (same_type && same_clause && sim >= 0.70)
+                    || (exact_quote && same_type)
+                    || (exact_quote && same_clause && both_uncategorized)
+                {
+                    // 同风险类型 + 同条款 → 合并（精确同文可跨 chunk）
                     merge_contributors(existing, &vf);
                     for cid in &vf.clause_ids {
                         if !existing.clause_ids.contains(cid) {
@@ -2949,6 +2976,25 @@ impl Coordinator {
         blind_findings
     }
 
+    /// 取 finding 关联 clause 的全文（多个 clause 换行拼接）；查不到则回退 source_quote。
+    fn clause_text_for(&self, f: &RiskFinding) -> String {
+        let guard = match self.clause_texts.lock() {
+            Ok(g) => g,
+            Err(_) => return f.source_quote.clone(),
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        for cid in &f.clause_ids {
+            if let Some(t) = guard.get(cid) {
+                parts.push(t.as_str());
+            }
+        }
+        if parts.is_empty() {
+            f.source_quote.clone()
+        } else {
+            parts.join("\n")
+        }
+    }
+
     // ── [6.5] EVIDENCE VERIFY: 证据核验（证伪导向 NLI 三分类）──
     /// 对每条 Verified finding 仅凭 source_quote + risk_type 做独立证据核验，不喂 reason。
     /// support → 放行；refute/insufficient → 降级 Info（疑似）。
@@ -2958,7 +3004,48 @@ impl Coordinator {
         findings: &mut [RiskFinding],
         execution_control: Arc<ReviewExecutionControl>,
     ) -> usize {
-        // 1) 去重：同一核心原文只裁决一次
+        // 0) 确定性权重/分值构成核验：按 clause 全文求和比 100，命中即定稿，不喂 LLM。
+        let mut det_cache: HashMap<String, EvidenceVerdict> = HashMap::new();
+        for f in findings.iter() {
+            if f.no_risk || f.source_quote.trim().is_empty() {
+                continue;
+            }
+            if !is_weight_related(&f.category_code, &f.risk_type) {
+                continue;
+            }
+            let full = self.clause_text_for(f);
+            if let Some(outcome) = deterministic_weight_sum_check(&full) {
+                let key = evidence_core_key(&f.source_quote);
+                let sum_text = fmt_weight_sum(outcome.sum);
+                if outcome.closed {
+                    det_cache.entry(key).or_insert_with(|| EvidenceVerdict {
+                        verdict: "refute".into(),
+                        reason: format!(
+                            "确定性数值核验：商务/技术/报价分值合计 {} = 100，权重闭合，疑似违规不成立。",
+                            sum_text
+                        ),
+                        severity: None,
+                    });
+                } else {
+                    det_cache.entry(key).or_insert_with(|| EvidenceVerdict {
+                        verdict: "support".into(),
+                        reason: format!(
+                            "确定性数值核验：商务/技术/报价分值合计 {} ≠ 100，权重和不闭合。",
+                            sum_text
+                        ),
+                        severity: Some("medium".into()),
+                    });
+                }
+            }
+        }
+        if !det_cache.is_empty() {
+            eprintln!(
+                "  [EVIDENCE_VERIFY] 确定性权重和核验定稿 {} 组（跳过 LLM）",
+                det_cache.len()
+            );
+        }
+
+        // 1) 去重：同一核心原文只裁决一次（已确定性定稿的 key 跳过）
         let mut reps: Vec<(String, String, String)> = Vec::new(); // (key, quote, risk_type)
         let mut seen: HashSet<String> = HashSet::new();
         for f in findings.iter() {
@@ -2966,16 +3053,20 @@ impl Coordinator {
                 continue;
             }
             let key = evidence_core_key(&f.source_quote);
+            if det_cache.contains_key(&key) {
+                continue;
+            }
             if seen.insert(key.clone()) {
                 reps.push((key, f.source_quote.clone(), f.risk_type.clone()));
             }
         }
         eprintln!(
-            "  [EVIDENCE_VERIFY] 收到 {} 条 findings，去重后 {} 组",
+            "  [EVIDENCE_VERIFY] 收到 {} 条 findings，去重后 {} 组（确定性定稿 {} 组）",
             findings.len(),
-            reps.len()
+            reps.len(),
+            det_cache.len()
         );
-        if reps.is_empty() {
+        if reps.is_empty() && det_cache.is_empty() {
             return 0;
         }
 
@@ -2991,7 +3082,7 @@ impl Coordinator {
         let call_timeout = execution_control.limits().call_timeout;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let llm_factory = self.llm_factory.clone();
-        let mut join_set: JoinSet<(String, Option<(String, String)>)> = JoinSet::new();
+        let mut join_set: JoinSet<(String, Option<EvidenceVerdict>)> = JoinSet::new();
 
         for (key, quote, risk_type) in reps {
             let semaphore = semaphore.clone();
@@ -3013,12 +3104,12 @@ impl Coordinator {
         }
 
         // 汇总结果：全部在途任务完成后才回写，保持"超时即不落半成品"的原子语义。
-        let mut cache: HashMap<String, (String, String)> = HashMap::new();
+        let mut cache: HashMap<String, EvidenceVerdict> = HashMap::new();
         let mut verified = 0usize;
         while let Some(res) = join_set.join_next().await {
-            if let Ok((key, Some((verdict, reason)))) = res {
+            if let Ok((key, Some(verdict))) = res {
                 verified += 1;
-                cache.insert(key, (verdict, reason));
+                cache.insert(key, verdict);
             }
         }
 
@@ -3029,21 +3120,35 @@ impl Coordinator {
                 continue;
             }
             let key = evidence_core_key(&f.source_quote);
-            if let Some((verdict, reason)) = cache.get(&key) {
-                f.evidence_verdict = Some(verdict.clone());
-                f.verifier_reason = Some(reason.clone());
-                if verdict == "support" {
+            // 确定性数值核验优先，其次 NLI 缓存。
+            let ev = det_cache
+                .get(&key)
+                .cloned()
+                .or_else(|| cache.get(&key).cloned());
+            if let Some(ev) = ev {
+                f.evidence_verdict = Some(ev.verdict.clone());
+                f.verifier_reason = Some(ev.reason.clone());
+                if ev.verdict == "support" {
                     f.reason.push_str(&format!(
                         "\n[EvidenceVerify] ✅ 证据核验通过: {}。",
-                        reason
+                        ev.reason
                     ));
+                    // severity 校准：只降不升——核验器判 medium 时，把 high 拉回 medium。
+                    if ev.severity.as_deref() == Some("medium")
+                        && f.severity == RiskSeverity::High
+                    {
+                        f.severity = RiskSeverity::Medium;
+                        f.reason.push_str(
+                            "\n[EvidenceVerify] 🔻 severity 校准：证据成立但非红线级，high 降为 medium。",
+                        );
+                    }
                 } else {
                     dropped += 1;
                     f.severity = RiskSeverity::Info;
                     f.clear_criticality();
                     f.reason.push_str(&format!(
                         "\n[EvidenceVerify] ❓ 证据核验未通过（{}）: {}。已降级为疑似。",
-                        verdict, reason
+                        ev.verdict, ev.reason
                     ));
                 }
             }
@@ -3531,6 +3636,7 @@ mod tests {
             review_events: None,
             metrics: None,
             shared_search_cache: Arc::new(Mutex::new(HashMap::new())),
+            clause_texts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             global_execution_limiter: Arc::new(GlobalExecutionLimiter::new(
                 crate::agents::execution_control::ExecutionLimits::default(),
             )),
@@ -4047,6 +4153,94 @@ mod tests {
             merged.len(),
             2,
             "同一chunk中的不同风险类别不得因理由或证据文本相似而合并"
+        );
+    }
+
+    // 精确同文跨 chunk：同一句被重叠分块、同一风险被重复审出 → 合并为 1 条，clause 取并集。
+    #[test]
+    fn test_merge_v3_merges_exact_quote_across_chunks_same_category() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let quote = "本项目的液氧、医用氧产品仅限华润、林德、空气产品等品牌，其他品牌不得分。";
+        let mut f1 = make_test_finding("R_001", "ch_115", "ScoringAgent");
+        f1.category_code = "BRAND_LOCK".into();
+        f1.risk_type = "指定品牌且不接受同等产品".into();
+        f1.source_quote = quote.into();
+
+        let mut f2 = make_test_finding("R_002", "ch_116", "SemanticRiskAgent");
+        f2.category_code = "BRAND_LOCK".into();
+        f2.risk_type = "指定品牌且不接受同等产品".into();
+        f2.source_quote = quote.into();
+
+        let mut f3 = make_test_finding("R_003", "ch_122", "SemanticRiskAgent");
+        f3.category_code = "BRAND_LOCK".into();
+        f3.risk_type = "指定品牌且不接受同等产品".into();
+        f3.source_quote = quote.into();
+
+        let merged = coordinator
+            .merge_findings_v3(vec![f1, f2, f3], &|_| {})
+            .retained;
+        assert_eq!(
+            merged.len(),
+            1,
+            "同一句原文被重叠分块重复审出的同风险应合并为 1 条"
+        );
+        assert_eq!(
+            merged[0].clause_ids.len(),
+            3,
+            "跨 chunk 合并后 clause_ids 应取并集保留 3 处位置"
+        );
+    }
+
+    // 精确同文同 chunk、两个 LLM 自造码（未落入 15 类内置分类）的近义标签 → 合并为 1 条。
+    #[test]
+    fn test_merge_v3_merges_exact_quote_same_chunk_uncategorized_labels() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let quote = "（八）★投标文件中提供医用氧产品有效的《药品注册证》。";
+        let mut f1 = make_test_finding("R_001", "ch_014", "SemanticRiskAgent");
+        f1.category_code = "SR01".into();
+        f1.risk_type = "隐性排他性".into();
+        f1.source_quote = quote.into();
+
+        let mut f2 = make_test_finding("R_002", "ch_014", "DemandAgent");
+        f2.category_code = "DEMAND_EXCLUSIONARY".into();
+        f2.risk_type = "排他性条款/资格门槛过高".into();
+        f2.source_quote = quote.into();
+
+        let merged = coordinator
+            .merge_findings_v3(vec![f1, f2], &|_| {})
+            .retained;
+        assert_eq!(
+            merged.len(),
+            1,
+            "同 chunk 同原文、两个自造码近义标签应合并为 1 条"
+        );
+    }
+
+    // 精确同文但跨 chunk 且类别不同（即使都是自造码）→ 不合并，保留两个独立风险。
+    #[test]
+    fn test_merge_v3_keeps_distinct_uncategorized_issues_across_chunks() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let quote = "供应商负责对气瓶进行维护保养、定期检验并有第三方检测合格证明文件。";
+        let mut f1 = make_test_finding("R_001", "ch_032", "ContractAgent");
+        f1.category_code = "C3".into();
+        f1.risk_type = "责任转嫁/显失公平".into();
+        f1.source_quote = quote.into();
+
+        let mut f2 = make_test_finding("R_002", "ch_033", "DemandAgent");
+        f2.category_code = "CONTRACT_AMBIGUITY".into();
+        f2.risk_type = "合同履约风险".into();
+        f2.source_quote = quote.into();
+
+        let merged = coordinator
+            .merge_findings_v3(vec![f1, f2], &|_| {})
+            .retained;
+        assert_eq!(
+            merged.len(),
+            2,
+            "跨 chunk 且不同类别（即使精确同文）不得合并"
         );
     }
 

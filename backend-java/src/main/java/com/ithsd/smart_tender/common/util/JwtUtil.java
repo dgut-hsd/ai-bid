@@ -1,6 +1,7 @@
 package com.ithsd.smart_tender.common.util;
 
 import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.ExpiredJwtException;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.SignatureAlgorithm;
 import java.nio.charset.StandardCharsets;
@@ -29,5 +30,20 @@ public class JwtUtil {
                 .setSigningKey(secretKey.getBytes(StandardCharsets.UTF_8))
                 .parseClaimsJws(token)
                 .getBody();
+    }
+
+    /**
+     * 与 {@link #parseJWT} 相同，但容忍「签名有效、仅 exp 过期」的 token。
+     * <p>
+     * 签名错误、格式错误等仍会向上抛异常（不会被吞掉），只有 {@link ExpiredJwtException}
+     * 被转为可用的 {@link Claims}。是否据此续期由调用方结合 Redis 会话存活状态决定——
+     * 会话 TTL 即续期窗口上限，杜绝“任意旧 token 永不过期”。
+     */
+    public static Claims parseJWTPermissive(String secretKey, String token) {
+        try {
+            return parseJWT(secretKey, token);
+        } catch (ExpiredJwtException ex) {
+            return ex.getClaims();
+        }
     }
 }
