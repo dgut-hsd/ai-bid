@@ -98,6 +98,41 @@ export const useAuditTask = (bidId?: number) => {
       setElapsedSeconds((prev) => Math.max(prev, finalSeconds));
    }, [auditStartedAt]);
 
+   /**
+    * 接管一个已确认存在的任务，进入流式/轮询阶段。
+    * 既用于「建任务成功」，也用于「建任务失败但服务端对账发现任务已建」的兜底恢复。
+    */
+   const acceptTask = useCallback(
+      (nextTaskId: string) => {
+         const startedAt = Date.now();
+         if (storageKey) {
+            try {
+               localStorage.setItem(storageKey, JSON.stringify({ taskId: nextTaskId, startedAt }));
+            } catch (storageError) {
+               console.error('[AuditTask] taskId 持久化失败:', storageError);
+            }
+         }
+         setAuditStartedAt((prev) => prev || startedAt);
+         setShouldConnectStream(true);
+         setHasStartedAudit(true);
+         setTaskId(nextTaskId);
+         setHydrated(true);
+         setProgress(0);
+         setIssues([]);
+         setIsComplete(false);
+         setError(null);
+         setCurrentStage('任务已创建，等待流式数据...');
+      },
+      [storageKey]
+   );
+
+   /** 创建任务最终失败（且服务端对账无任务）时的收尾 */
+   const failTask = useCallback((err: Error) => {
+      setError(err.message || '任务创建失败');
+      setCurrentStage('任务创建失败');
+      setHasStartedAudit(false);
+   }, []);
+
    const { mutate: startAudit, isPending: isStarting } = useMutation({
       mutationFn: (payload: { bidId: number; webSearchEnabled?: boolean; forceRefresh?: boolean }) =>
          createTask({
@@ -130,30 +165,27 @@ export const useAuditTask = (bidId?: number) => {
             setError('任务创建响应异常');
             return;
          }
-         const startedAt = Date.now();
-         if (storageKey) {
-            try {
-               localStorage.setItem(storageKey, JSON.stringify({ taskId: data.taskId, startedAt }));
-            } catch (storageError) {
-               console.error('[AuditTask] taskId 持久化失败:', storageError);
-            }
-         }
-         setAuditStartedAt((prev) => prev || startedAt);
-         setShouldConnectStream(true);
-         setTaskId(data.taskId);
-         setHydrated(true);
-         setProgress(0);
-         setIssues([]);
-         setIsComplete(false);
-         setError(null);
-         setCurrentStage('任务已创建，等待流式数据...');
+         acceptTask(data.taskId);
       },
       
       onError: (err: Error) => {
          console.error('[AuditTask] 任务创建失败:', err);
-         setError(err.message || '任务创建失败');
-         setCurrentStage('任务创建失败');
-         setHasStartedAudit(false);
+         // 兜底对账：后端「创建任务」是异步的（秒回 taskId，审核后台跑），
+         // 网络抖动/超时可能把「已建好」误判成「失败」。失败后先按标书向服务端对账一次，
+         // 若确有任务则直接接管（acceptTask），否则才真正报失败。
+         if (typeof bidId === 'number' && !Number.isNaN(bidId)) {
+            getAuditStatusByBid(bidId)
+               .then((status) => {
+                  if (status?.taskId) {
+                     acceptTask(status.taskId);
+                  } else {
+                     failTask(err);
+                  }
+               })
+               .catch(() => failTask(err));
+            return;
+         }
+         failTask(err);
       },
    });
 

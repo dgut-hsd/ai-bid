@@ -13,7 +13,12 @@ export const createTask = async (
 ): Promise<{ taskId: string }> => {
    const res = await request.post<unknown, BaseResponse<{ taskId: string }>>(
       '/api/audit-tasks',
-      params
+      params,
+      {
+         // 创建任务会触发后端异步审核调度；网络抖动时全局 30s 超时易把「已建好」误判为失败。
+         // 对齐 chat.ts 的 120s 长操作超时。
+         timeout: 120000,
+      }
    );
    
    return res.data;
