@@ -207,9 +207,23 @@ export interface ChunkNode {
   tier: RiskTier;
 }
 
+export type FindingState = 'provisional' | 'confirmed' | 'merged' | 'rejected';
+
 export interface RiskNode {
   finding: AuditIssue;
   lawRefs: string[];
+  state: FindingState;
+  mergedInto?: string;
+  decisionReason?: string;
+}
+
+export interface FindingTransition {
+  riskId: string;
+  from: FindingState;
+  to: FindingState;
+  reason: string;
+  mergedInto?: string;
+  decidedAt: string;
 }
 
 export interface AgentNode {
@@ -235,7 +249,30 @@ export interface LinkedChunk {
   reason: string;
 }
 
+export type ReviewAttemptStatus = 'started' | 'completed' | 'failed';
+export type ReviewAttemptOutcome = 'findings' | 'no_risk';
+export type ReviewAttemptErrorCode =
+  | 'clause_timeout'
+  | 'incomplete_output'
+  | 'task_panic'
+  | 'task_cancelled';
+
+export interface ReviewAttempt {
+  attemptId: string;
+  agentId: string;
+  chunkId: string;
+  status: ReviewAttemptStatus;
+  outcome?: ReviewAttemptOutcome;
+  findingIds: string[];
+  errorCode?: ReviewAttemptErrorCode;
+  errorMessage?: string;
+  startedAt: string;
+  finishedAt?: string;
+}
+
 export interface GraphSnapshot {
+  graphVersion: number;
+  chunkVersions: Record<string, number>;
   chunks: Record<string, ChunkNode>;
   risks: Record<string, RiskNode>;
   hasRisk: Record<string, string[]>;
@@ -248,6 +285,8 @@ export interface GraphSnapshot {
   cases: Record<string, CaseNode>;
   contradicts: Record<string, [string, string][]>;
   sameLaw: Record<string, string[]>;
+  reviewAttempts: Record<string, ReviewAttempt>;
+  findingTransitions: FindingTransition[];
 }
 
 // ─── 创建审核任务 ───

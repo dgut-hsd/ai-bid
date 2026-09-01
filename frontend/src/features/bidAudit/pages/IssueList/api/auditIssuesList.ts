@@ -2,6 +2,14 @@ import request from '@/api/request';
 import { queryOptions } from '@tanstack/react-query';
 import type { BaseResponse } from '@/api/types';
 import type { AuditStatus, AuditResult, BidDetail } from '../types';
+import {
+   mapBackendGraphSnapshot,
+   type BackendGraphSnapshot,
+} from '@/features/bidAudit/utils/mapFinding';
+
+type BackendAuditResult = Omit<AuditResult, 'graphSnapshot'> & {
+   graphSnapshot?: BackendGraphSnapshot;
+};
 
 export const getAuditStatus = async (taskId: string): Promise<AuditStatus> => {
    const res = await request.get<unknown, BaseResponse<AuditStatus>>(
@@ -15,14 +23,19 @@ export const getAuditResult = async (
    taskId: string,
    params?: { page?: number; size?: number; sinceIssueNo?: string }
 ): Promise<AuditResult> => {
-   const res = await request.get<unknown, BaseResponse<AuditResult>>(
+   const res = await request.get<unknown, BaseResponse<BackendAuditResult>>(
       `/api/audit-tasks/${taskId}/result`,
       {
          params,
       }
    );
 
-   return res.data;
+   return {
+      ...res.data,
+      graphSnapshot: res.data.graphSnapshot
+         ? mapBackendGraphSnapshot(res.data.graphSnapshot)
+         : undefined,
+   };
 };
 
 export const getBidDetail = async (id: number): Promise<BidDetail> => {

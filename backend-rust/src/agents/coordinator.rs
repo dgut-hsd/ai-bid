@@ -25,28 +25,397 @@
 //! 每个 Agent 获得独立的 LLM 客户端和工具集。
 
 use crate::agents::bus::AgentBus;
+use crate::agents::evidence_verifier::{
+    EvidenceVerdict, deterministic_weight_sum_check, evidence_core_key, fmt_weight_sum,
+    is_weight_related, verify_evidence,
+};
 use crate::agents::execution_control::{
     ExecutionStage, GlobalExecutionLimiter, ReviewExecutionControl,
 };
-use crate::agents::react_loop::{LlmClient, ReActLoop};
+use crate::agents::react_loop::{
+    ClauseReviewProgress, LlmClient, ReActLoop, classify_review_attempt,
+};
 use crate::agents::registry::AgentRegistry;
-use crate::agents::review_event::{FindingChange, ReviewEvent, ReviewEventBus};
+use crate::agents::review_event::{FindingChange, FindingLifecycle, ReviewEvent, ReviewEventBus};
 use crate::agents::risk_taxonomy;
 use crate::agents::session_graph::SessionGraph;
 use crate::agents::tools::ToolRegistry;
 use crate::agents::trace::TraceLog;
-use crate::agents::evidence_verifier::{
-    deterministic_weight_sum_check, evidence_core_key, fmt_weight_sum, is_weight_related,
-    verify_evidence, EvidenceVerdict,
-};
 use crate::agents::types::*;
 use crate::paths::data_path_str;
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
+/// 返回 RiskSeverity 的纯字符串表示（不含 emoji），用于 SSE 事件。
+fn severity_str(s: &RiskSeverity) -> &'static str {
+    match s {
+        RiskSeverity::High => "high",
+        RiskSeverity::Medium => "medium",
+        RiskSeverity::Low => "low",
+        RiskSeverity::Info => "info",
+    }
+}
+
+/// 仅根据本次 BlindSpot 扫描创建的尝试，找出仍需静态兜底的候选条款。
+fn blind_spot_fallback_chunk_ids(
+    snapshot: &GraphSnapshot,
+    candidate_chunk_ids: &[String],
+    previous_attempt_ids: &HashSet<String>,
+) -> Vec<String> {
+    candidate_chunk_ids
+        .iter()
+        .filter(|chunk_id| {
+            !snapshot.review_attempts.values().any(|attempt| {
+                attempt.agent_id == AgentId::BlindSpot
+                    && attempt.chunk_id == **chunk_id
+                    && !previous_attempt_ids.contains(&attempt.attempt_id)
+                    && attempt.status == ReviewAttemptStatus::Completed
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// 按文档页序稳定排列 BlindSpot 候选，避免 HashMap 遍历顺序影响预算截断结果。
+fn sort_blind_spot_candidate_ids(snapshot: &GraphSnapshot, candidate_ids: &mut [String]) {
+    candidate_ids.sort_by(|left, right| {
+        match (snapshot.chunks.get(left), snapshot.chunks.get(right)) {
+            (Some(left_chunk), Some(right_chunk)) => (
+                left_chunk.page_start,
+                left_chunk.page_end,
+                left_chunk.chunk_id.as_str(),
+            )
+                .cmp(&(
+                    right_chunk.page_start,
+                    right_chunk.page_end,
+                    right_chunk.chunk_id.as_str(),
+                )),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.cmp(right),
+        }
+    });
+}
+
+type DynamicAgentRename = dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync;
+
+struct DynamicAgentReplaceError {
+    error: std::io::Error,
+    recovery_pending: bool,
+}
+
+type DynamicAgentReplace =
+    dyn Fn(&Path, &Path) -> std::result::Result<(), DynamicAgentReplaceError> + Send + Sync;
+
+struct DynamicAgentStore {
+    path: PathBuf,
+    transaction_lock: std::sync::Mutex<()>,
+    replace: Arc<DynamicAgentReplace>,
+    recovery_rename: Arc<DynamicAgentRename>,
+}
+
+impl DynamicAgentStore {
+    fn global() -> Arc<Self> {
+        static STORE: std::sync::OnceLock<Arc<DynamicAgentStore>> = std::sync::OnceLock::new();
+        STORE
+            .get_or_init(|| Arc::new(Self::new(data_path_str("agents/dynamic_agents.json"))))
+            .clone()
+    }
+
+    fn new(path: impl Into<PathBuf>) -> Self {
+        let rename: Arc<DynamicAgentRename> =
+            Arc::new(|source, target| std::fs::rename(source, target));
+        Self {
+            path: path.into(),
+            transaction_lock: std::sync::Mutex::new(()),
+            replace: default_dynamic_agent_replacer(rename.clone()),
+            recovery_rename: rename,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_replacer(
+        path: impl Into<PathBuf>,
+        replace: Arc<dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            transaction_lock: std::sync::Mutex::new(()),
+            replace: Arc::new(move |source, target| {
+                replace(source, target).map_err(|error| DynamicAgentReplaceError {
+                    error,
+                    recovery_pending: false,
+                })
+            }),
+            recovery_rename: Arc::new(|source, target| std::fs::rename(source, target)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_rename_operations(path: impl Into<PathBuf>, rename: Arc<DynamicAgentRename>) -> Self {
+        let replace_rename = rename.clone();
+        Self {
+            path: path.into(),
+            transaction_lock: std::sync::Mutex::new(()),
+            replace: Arc::new(move |source, target| {
+                replace_dynamic_agent_file_with_backup(source, target, &*replace_rename)
+            }),
+            recovery_rename: rename,
+        }
+    }
+
+    fn read_manifest(&self) -> Result<Option<DynamicAgentManifest>> {
+        let _guard = self
+            .transaction_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("动态 Agent 清单锁已中毒"))?;
+        self.read_manifest_unlocked()
+    }
+
+    fn append(&self, definitions: &[DynamicAgentDefinition]) -> Result<usize> {
+        if definitions.is_empty() {
+            return Ok(0);
+        }
+        let _guard = self
+            .transaction_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("动态 Agent 清单锁已中毒"))?;
+        let mut manifest = self
+            .read_manifest_unlocked()?
+            .unwrap_or(DynamicAgentManifest {
+                version: 1,
+                agents: Vec::new(),
+            });
+
+        for definition in definitions {
+            manifest.agents.retain(|agent| agent.id != definition.id);
+            manifest.agents.push(definition.clone());
+        }
+        while manifest.agents.len() > 20 {
+            manifest
+                .agents
+                .sort_by(|left, right| left.created_at.cmp(&right.created_at));
+            manifest.agents.remove(0);
+        }
+        self.persist_manifest_unlocked(&manifest)?;
+        Ok(definitions.len())
+    }
+
+    fn read_manifest_unlocked(&self) -> Result<Option<DynamicAgentManifest>> {
+        let Some(read_path) = self.recover_manifest_path_unlocked()? else {
+            return Ok(None);
+        };
+        let json = std::fs::read_to_string(read_path)?;
+        Ok(Some(serde_json::from_str(&json)?))
+    }
+
+    fn recover_manifest_path_unlocked(&self) -> Result<Option<PathBuf>> {
+        let backups = dynamic_agent_backup_candidates(&self.path)?;
+        if backups.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "发现多个动态 Agent 恢复备份，拒绝随机选择: {}",
+                backups
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let backup = backups.first();
+        if self.path.exists() {
+            if let Some(backup) = backup {
+                if let Err(error) = std::fs::remove_file(backup) {
+                    eprintln!("  [DYNAMIC] 清理已完成恢复备份失败: {}", error);
+                } else {
+                    cleanup_dynamic_agent_temps(&self.path);
+                }
+            }
+            return Ok(Some(self.path.clone()));
+        }
+        let Some(backup) = backup else {
+            return Ok(None);
+        };
+        match (self.recovery_rename)(backup, &self.path) {
+            Ok(()) => {
+                cleanup_dynamic_agent_temps(&self.path);
+                Ok(Some(self.path.clone()))
+            }
+            Err(error) => {
+                eprintln!("  [DYNAMIC] 恢复 canonical 失败，暂从备份读取: {}", error);
+                Ok(Some(backup.clone()))
+            }
+        }
+    }
+
+    fn persist_manifest_unlocked(&self, manifest: &DynamicAgentManifest) -> Result<()> {
+        if !self.path.exists() && !dynamic_agent_backup_candidates(&self.path)?.is_empty() {
+            return Err(anyhow::anyhow!(
+                "动态 Agent canonical 尚待从备份恢复，拒绝覆盖恢复状态"
+            ));
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("动态 Agent 清单路径缺少父目录"))?;
+        std::fs::create_dir_all(parent)?;
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("dynamic_agents.json");
+        let temp_path = parent.join(format!(".{}.tmp-{}", file_name, uuid::Uuid::new_v4()));
+        let json = serde_json::to_vec_pretty(manifest)?;
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            file.write_all(&json)?;
+            file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error.into());
+        }
+
+        if let Err(error) = (self.replace)(&temp_path, &self.path) {
+            if !error.recovery_pending {
+                let _ = std::fs::remove_file(&temp_path);
+            }
+            return Err(anyhow::anyhow!(error.error));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn default_dynamic_agent_replacer(rename: Arc<DynamicAgentRename>) -> Arc<DynamicAgentReplace> {
+    Arc::new(move |source, target| {
+        rename(source, target).map_err(|error| DynamicAgentReplaceError {
+            error,
+            recovery_pending: false,
+        })
+    })
+}
+
+#[cfg(windows)]
+fn default_dynamic_agent_replacer(rename: Arc<DynamicAgentRename>) -> Arc<DynamicAgentReplace> {
+    Arc::new(move |source, target| replace_dynamic_agent_file_with_backup(source, target, &*rename))
+}
+
+fn dynamic_agent_backup_path(target: &Path) -> Result<PathBuf> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("动态 Agent 路径缺少父目录"))?;
+    let file_name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("dynamic_agents.json");
+    Ok(parent.join(format!(".{}.backup", file_name)))
+}
+
+fn dynamic_agent_backup_candidates(target: &Path) -> Result<Vec<PathBuf>> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("动态 Agent 路径缺少父目录"))?;
+    if !parent.exists() {
+        return Ok(Vec::new());
+    }
+    let deterministic = dynamic_agent_backup_path(target)?;
+    let mut backups = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if path == deterministic || name.starts_with(".dynamic_agents.backup-") {
+            backups.push(path);
+        }
+    }
+    backups.sort();
+    Ok(backups)
+}
+
+fn cleanup_dynamic_agent_temps(target: &Path) {
+    let Some(parent) = target.parent() else {
+        return;
+    };
+    let file_name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("dynamic_agents.json");
+    let prefix = format!(".{}.tmp-", file_name);
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_temp = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.starts_with(&prefix));
+        if is_temp && let Err(error) = std::fs::remove_file(&path) {
+            eprintln!("  [DYNAMIC] 清理恢复临时文件失败: {}", error);
+        }
+    }
+}
+
+fn replace_dynamic_agent_file_with_backup(
+    source: &Path,
+    target: &Path,
+    rename: &DynamicAgentRename,
+) -> std::result::Result<(), DynamicAgentReplaceError> {
+    if !target.exists() {
+        return rename(source, target).map_err(|error| DynamicAgentReplaceError {
+            error,
+            recovery_pending: false,
+        });
+    }
+    let backup = dynamic_agent_backup_path(target).map_err(|error| DynamicAgentReplaceError {
+        error: std::io::Error::other(error.to_string()),
+        recovery_pending: false,
+    })?;
+    if backup.exists() {
+        return Err(DynamicAgentReplaceError {
+            error: std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("动态 Agent 恢复备份已存在: {}", backup.display()),
+            ),
+            recovery_pending: true,
+        });
+    }
+    rename(target, &backup).map_err(|error| DynamicAgentReplaceError {
+        error,
+        recovery_pending: false,
+    })?;
+    if let Err(replace_error) = rename(source, target) {
+        return match rename(&backup, target) {
+            Ok(()) => Err(DynamicAgentReplaceError {
+                error: replace_error,
+                recovery_pending: false,
+            }),
+            Err(rollback_error) => Err(DynamicAgentReplaceError {
+                error: std::io::Error::new(
+                    rollback_error.kind(),
+                    format!("替换失败: {}；回滚失败: {}", replace_error, rollback_error),
+                ),
+                recovery_pending: true,
+            }),
+        };
+    }
+    if let Err(error) = std::fs::remove_file(&backup) {
+        eprintln!("  [DYNAMIC] 清理替换备份失败: {}", error);
+    }
+    Ok(())
+}
 struct AgentTaskOutput {
     findings: Vec<RiskFinding>,
     successful_clauses: usize,
@@ -156,6 +525,51 @@ fn extract_clause_keywords(text: &str) -> String {
 /// MERGE 阶段的去重结果。
 struct MergeResult {
     retained: Vec<RiskFinding>,
+    merged: HashMap<String, String>,
+}
+
+/// 将多轮去重关系解析到最终 finding，未抵达最终集合的链保持 provisional。
+fn resolve_merged_findings(
+    merge_history: &[HashMap<String, String>],
+    final_findings: &[RiskFinding],
+) -> Result<HashMap<String, String>> {
+    let final_ids = final_findings
+        .iter()
+        .map(|finding| finding.risk_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut links = BTreeMap::new();
+    for round in merge_history {
+        let mut entries = round.iter().collect::<Vec<_>>();
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (source, target) in entries {
+            if let Some(existing) = links.insert(source.clone(), target.clone())
+                && existing != *target
+            {
+                anyhow::bail!(
+                    "同一 finding 存在冲突的合并目标: {} -> {} / {}",
+                    source,
+                    existing,
+                    target
+                );
+            }
+        }
+    }
+
+    let mut resolved = HashMap::new();
+    for source in links.keys() {
+        let mut current = source.as_str();
+        let mut visited = HashSet::new();
+        while let Some(target) = links.get(current) {
+            if !visited.insert(current.to_string()) {
+                anyhow::bail!("合并关系存在循环，涉及 finding: {}", current);
+            }
+            current = target;
+        }
+        if final_ids.contains(current) {
+            resolved.insert(source.clone(), current.to_string());
+        }
+    }
+    Ok(resolved)
 }
 
 /// 多 Agent 审查协调器。
@@ -192,6 +606,10 @@ pub struct Coordinator {
     /// preload_chunks 时写入，evidence_verify 时读取做权重和求和。
     clause_texts: Arc<std::sync::Mutex<HashMap<String, String>>>,
     global_execution_limiter: Arc<GlobalExecutionLimiter>,
+    /// 同一 Coordinator 的 BlindSpot 后台扫描必须完整串行，避免 attempt 集合互相污染。
+    blind_spot_scan_lock: Mutex<()>,
+    /// 跨 Coordinator 共享的动态 Agent 清单存储，内部事务锁覆盖完整读改写。
+    dynamic_agent_store: Arc<DynamicAgentStore>,
 }
 
 impl Coordinator {
@@ -230,6 +648,8 @@ impl Coordinator {
             shared_search_cache,
             clause_texts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             global_execution_limiter: Arc::new(GlobalExecutionLimiter::from_env()),
+            blind_spot_scan_lock: Mutex::new(()),
+            dynamic_agent_store: DynamicAgentStore::global(),
         };
 
         // 启动时加载已有动态 Agent
@@ -485,6 +905,7 @@ impl Coordinator {
             message: format!("去重合并中 ({} 条原始发现)...", all_findings.len()),
         });
         let merge_result = self.merge_findings_v3(all_findings, &emit);
+        let mut merge_history = vec![merge_result.merged];
         let mut merged = merge_result.retained;
 
         // [4b] LINK: 跨 Agent 同类型风险关联推导
@@ -636,7 +1057,9 @@ impl Coordinator {
         }
         // Debate/LegalVerify 都可能回写 severity 或 Critical。最终出口再次执行
         // 统一分类、证据准入和跨 Agent 去重，禁止下游阶段绕过政策。
-        merged = self.merge_findings_v3(merged, &emit).retained;
+        let final_merge_result = self.merge_findings_v3(merged, &emit);
+        merge_history.push(final_merge_result.merged);
+        merged = final_merge_result.retained;
 
         // ── 指标：Debate 阶段耗时 ──
         let debate_duration = phase_start.elapsed().as_millis() as u64;
@@ -700,11 +1123,12 @@ impl Coordinator {
             );
         }
 
+        let (findings, graph_snapshot) = self.finalize_audit_output(&findings, &merge_history)?;
         let high_risk_count = findings
             .iter()
             .filter(|f| f.severity == RiskSeverity::High)
             .count();
-        let graph_snapshot = Some(self.graph.snapshot());
+        let graph_snapshot = Some(graph_snapshot);
 
         let routing_summary = RoutingSummary {
             total_clauses,
@@ -748,6 +1172,44 @@ impl Coordinator {
         })
     }
 
+    /// 将最终裁决原子写入图，并从 Confirmed 节点重建规范化输出。
+    fn finalize_audit_output(
+        &self,
+        findings: &[RiskFinding],
+        merge_history: &[HashMap<String, String>],
+    ) -> Result<(Vec<RiskFinding>, GraphSnapshot)> {
+        let merged = resolve_merged_findings(merge_history, findings)?;
+        // 当前管线没有可靠的显式 reject 信号；证据不足和 Hypothesis 仅表示尚未证实，继续保持 provisional。
+        self.graph
+            .finalize_audit(findings, &merged, &HashMap::new())
+            .map_err(anyhow::Error::msg)?;
+        let snapshot = self.graph.snapshot();
+        let mut normalized = Vec::with_capacity(findings.len());
+        for finding in findings {
+            let node = snapshot
+                .risks
+                .get(&finding.risk_id)
+                .ok_or_else(|| anyhow::anyhow!("最终快照缺少 finding: {}", finding.risk_id))?;
+            if node.state != FindingState::Confirmed {
+                anyhow::bail!("最终 finding 未进入 Confirmed 状态: {}", finding.risk_id);
+            }
+            normalized.push(node.finding.clone());
+        }
+        let confirmed_count = snapshot
+            .risks
+            .values()
+            .filter(|node| node.state == FindingState::Confirmed)
+            .count();
+        if confirmed_count != normalized.len() {
+            anyhow::bail!(
+                "最终输出与 Confirmed 节点数量不一致: output={}, confirmed={}",
+                normalized.len(),
+                confirmed_count
+            );
+        }
+        Ok((normalized, snapshot))
+    }
+
     // ── BlindSpot: 后台异步经验沉淀 ──────────────────────────────
 
     /// 运行 BlindSpot 盲点扫描并沉淀经验（主流程之外的后台任务）。
@@ -763,6 +1225,7 @@ impl Coordinator {
     /// ★ BlindSpot 的发现**不会**追加到本次审核结果中——
     ///   它的价值在于为**下一次**审核积累经验（自动生成新的检测维度）。
     pub async fn run_blind_spot(&self) {
+        let _run_guard = self.blind_spot_scan_lock.lock().await;
         eprintln!(
             "\n┌──────────────────────────────────────────────────────────────┐\n\
                │  BlindSpot: 后台盲点扫描 + 经验沉淀（异步，不阻塞主结果）    │\n\
@@ -780,6 +1243,15 @@ impl Coordinator {
             Err(_) => {
                 execution_control
                     .record_stage_failure(ExecutionStage::BlindSpot, "BlindSpot 阶段超过 5 分钟");
+                let chunk_ids = self.graph.snapshot().chunks.into_keys().collect::<Vec<_>>();
+                if let Err(error) = self.graph.fail_started_attempts(
+                    &AgentId::BlindSpot,
+                    &chunk_ids,
+                    ReviewAttemptErrorCode::TaskCancelled,
+                    "BlindSpot 阶段超时取消",
+                ) {
+                    eprintln!("  [BLINDSPOT] 收口超时尝试失败: {}", error);
+                }
                 Vec::new()
             }
         };
@@ -792,16 +1264,19 @@ impl Coordinator {
         );
 
         // 提取 suggested_agent → 写入 dynamic_agents.json
-        let registered = self.register_dynamic_agents(&blind_spot_findings);
-        if registered > 0 {
-            eprintln!(
-                "  [BLINDSPOT] 经验沉淀: {} 个新 Agent 定义已写入 dynamic_agents.json（下次审查自动启用）",
-                registered
-            );
-        } else {
-            eprintln!(
-                "  [BLINDSPOT] 本次无新的 Agent 建议（盲区已被现有 Agent 覆盖或无需新增检测维度）"
-            );
+        match self.register_dynamic_agents(&blind_spot_findings) {
+            Ok(registered) if registered > 0 => {
+                eprintln!(
+                    "  [BLINDSPOT] 经验沉淀: {} 个新 Agent 定义已写入 dynamic_agents.json（下次审查自动启用）",
+                    registered
+                );
+            }
+            Ok(_) => {
+                eprintln!(
+                    "  [BLINDSPOT] 本次无新的 Agent 建议（盲区已被现有 Agent 覆盖或无需新增检测维度）"
+                );
+            }
+            Err(error) => eprintln!("  [BLINDSPOT] 持久化动态 Agent 失败: {}", error),
         }
     }
 
@@ -810,7 +1285,7 @@ impl Coordinator {
     /// Phase 0: Scout 初筛。Mini-batch 并行（3 clauses/批），零搜索。
     ///
     /// Scout 对每条 clause 产出 Hypothesis（finding_role=Hypothesis），
-    /// 通过 `add_hypothesis()` 轻量写入 SessionGraph，供 Phase 2 Agent 使用。
+    /// 通过原子提交接口轻量写入 SessionGraph，供 Phase 2 Agent 使用。
     #[allow(dead_code)]
     /// Scout 阶段 — 已被 review() 禁用（成本优化，见第 276 行 mark_scout_complete）。
     /// 保留此函数供未来按需重新启用，当前为死代码。
@@ -844,40 +1319,78 @@ impl Coordinator {
                 let print_lock = self.print_lock.clone();
                 let config = config.clone();
                 let search_cache = self.shared_search_cache.clone();
+                let clause_id = clause.chunk_id.clone();
 
-                handles.push(tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
+                    let attempt_id =
+                        match graph.start_review_attempt(AgentId::Scout, &clause.chunk_id) {
+                            Ok(attempt_id) => attempt_id,
+                            Err(error) => {
+                                eprintln!("  [SCOUT] 创建审查尝试失败: {}", error);
+                                return Vec::new();
+                            }
+                        };
                     let agent = ReActLoop::new(config, llm, tools)
                         .with_print_lock(print_lock)
                         .with_search_cache(search_cache);
                     // NOTE: Scout 不需要 .with_graph() — SessionGraph 此时只有 Chunk 节点
                     let mut findings = agent.review_single(&clause, &risk_id).await;
-                    for finding in &mut findings {
-                        if !finding.no_risk {
-                            finding.finding_role = FindingRole::Hypothesis;
-                            finding.knowledge_source = "training_knowledge".into();
-                            finding.hypothesized_by = vec!["ScoutAgent".into()];
-                            graph.add_hypothesis(
-                                RiskNode {
-                                    finding: finding.clone(),
-                                    law_refs: finding.legal_basis.clone(),
-                                },
-                                &clause.chunk_id,
-                            );
+                    match classify_review_attempt(&findings) {
+                        Ok((outcome, _)) => {
+                            for finding in &mut findings {
+                                if !finding.no_risk {
+                                    finding.finding_role = FindingRole::Hypothesis;
+                                    finding.knowledge_source = "training_knowledge".into();
+                                    finding.hypothesized_by = vec!["ScoutAgent".into()];
+                                }
+                            }
+                            if let Err(error) =
+                                graph.commit_review_result(&attempt_id, outcome, &findings)
+                            {
+                                eprintln!("  [SCOUT] 完成审查尝试失败: {}", error);
+                                if let Err(fail_error) = graph.fail_review_attempt(
+                                    &attempt_id,
+                                    ReviewAttemptErrorCode::IncompleteOutput,
+                                    &format!("SessionGraph 提交失败: {}", error),
+                                ) {
+                                    eprintln!("  [SCOUT] 记录提交失败也失败: {}", fail_error);
+                                }
+                                findings.clear();
+                            }
+                        }
+                        Err(error_code) => {
+                            if let Err(error) = graph.fail_review_attempt(
+                                &attempt_id,
+                                error_code,
+                                "Scout 条款审查未完整结束",
+                            ) {
+                                eprintln!("  [SCOUT] 收口失败审查尝试失败: {}", error);
+                            }
                         }
                     }
-                    graph.add_reviewed_by(&clause.chunk_id, AgentId::Scout);
                     eprintln!(
                         "  [SCOUT] {}: {} hypotheses",
                         clause.chunk_id,
                         findings.iter().filter(|f| !f.no_risk).count(),
                     );
                     findings
-                }));
+                });
+                handles.push((clause_id, handle));
             }
 
             // 等待本批完成再启动下一批
-            for h in handles {
-                let _ = h.await;
+            for (clause_id, handle) in handles {
+                if let Err(error) = handle.await {
+                    let message = format!("Scout 条款审查任务异常终止: {}", error);
+                    if let Err(graph_error) = self.graph.fail_started_attempts(
+                        &AgentId::Scout,
+                        &[clause_id],
+                        ReviewAttemptErrorCode::TaskPanic,
+                        &message,
+                    ) {
+                        eprintln!("  [SCOUT] 收口崩溃尝试失败: {}", graph_error);
+                    }
+                }
             }
             eprintln!(
                 "  [SCOUT] 批次 {}/{} 完成",
@@ -1234,6 +1747,9 @@ impl Coordinator {
             let review_events = self.review_events.clone();
             let metrics = self.metrics.clone();
             let agent_id_str = agent_id.to_string();
+            let task_agent_id = agent_id.clone();
+            let task_progress = ClauseReviewProgress::default();
+            let agent_progress = task_progress.clone();
             let agent_label = registry_def
                 .as_ref()
                 .map(|d| d.display_name.to_string())
@@ -1259,46 +1775,48 @@ impl Coordinator {
                         max_parallel,
                     );
 
-                    let report = crate::agents::react_loop::review_clauses_parallel_report(
-                        &clauses,
-                        {
-                            let def = def.clone();
-                            let bus = bus.clone();
-                            let graph = graph.clone();
-                            let print_lock = print_lock.clone();
-                            let trace = trace.clone();
-                            let review_events = review_events.clone();
-                            let metrics = metrics.clone();
-                            let search_cache = shared_search_cache.clone();
-                            move |llm, tools| {
-                                let config = def.to_agent_config();
-                                let mut agent = ReActLoop::new(config, llm, tools);
-                                agent = agent
-                                    .with_bus(bus.clone())
-                                    .with_graph(graph.clone())
-                                    .with_print_lock(print_lock.clone())
-                                    .with_search_cache(search_cache.clone())
-                                    .with_transcript_compression(transcript_compression);
-                                agent.trace = trace.clone();
-                                if let Some(ref events) = review_events {
-                                    agent = agent.with_review_events(events.clone());
+                    let report =
+                        crate::agents::react_loop::review_clauses_parallel_report_with_progress(
+                            &clauses,
+                            {
+                                let def = def.clone();
+                                let bus = bus.clone();
+                                let graph = graph.clone();
+                                let print_lock = print_lock.clone();
+                                let trace = trace.clone();
+                                let review_events = review_events.clone();
+                                let metrics = metrics.clone();
+                                let search_cache = shared_search_cache.clone();
+                                move |llm, tools| {
+                                    let config = def.to_agent_config();
+                                    let mut agent = ReActLoop::new(config, llm, tools);
+                                    agent = agent
+                                        .with_bus(bus.clone())
+                                        .with_graph(graph.clone())
+                                        .with_print_lock(print_lock.clone())
+                                        .with_search_cache(search_cache.clone())
+                                        .with_transcript_compression(transcript_compression);
+                                    agent.trace = trace.clone();
+                                    if let Some(ref events) = review_events {
+                                        agent = agent.with_review_events(events.clone());
+                                    }
+                                    if let Some(ref m) = metrics {
+                                        agent = agent.with_metrics(m.clone());
+                                    }
+                                    agent
                                 }
-                                if let Some(ref m) = metrics {
-                                    agent = agent.with_metrics(m.clone());
-                                }
-                                agent
-                            }
-                        },
-                        llm_factory,
-                        tools_factory,
-                        max_parallel,
-                        Some(graph_for_write.clone()),
-                        review_events.clone(),
-                        &agent_name,
-                        Some(execution_control),
-                        Some(streamed_findings),
-                    )
-                    .await;
+                            },
+                            llm_factory,
+                            tools_factory,
+                            max_parallel,
+                            Some(graph_for_write.clone()),
+                            review_events.clone(),
+                            agent_id.clone(),
+                            Some(execution_control),
+                            Some(agent_progress),
+                            Some(streamed_findings),
+                        )
+                        .await;
 
                     let findings = report.findings;
                     let failed_clauses: Vec<ClauseExecutionFailure> = report
@@ -1336,23 +1854,6 @@ impl Coordinator {
                     // 发现已由 review_clauses_parallel_report 逐条款流式发射（FindingAdded），
                     // 此处不再批量重发，避免重复；仅保留以下 SessionGraph 写入。
 
-                    // 将发现写入 SessionGraph（共享工作区）
-                    for finding in &findings {
-                        if !finding.no_risk {
-                            let law_refs = finding.legal_basis.clone();
-                            let risk_node = RiskNode {
-                                finding: finding.clone(),
-                                law_refs,
-                            };
-                            // 对每个关联的 clause 写入 has_risk 边
-                            for cid in &finding.clause_ids {
-                                graph_for_write.add_risk_with_edges(risk_node.clone(), cid);
-                            }
-                            // Note: AgentBus 广播已移至 ReActLoop 内部实时执行，
-                            // 不再在此处批量广播（避免时序问题——其他 Agent 已结束审查）
-                        }
-                    }
-
                     AgentTaskOutput {
                         findings,
                         successful_clauses: report.successful_clauses,
@@ -1375,7 +1876,10 @@ impl Coordinator {
                 }
             });
 
-            task_meta.insert(abort_handle.id(), (agent_id_str, clause_ids));
+            task_meta.insert(
+                abort_handle.id(),
+                (task_agent_id, clause_ids, task_progress),
+            );
         }
 
         // 等待所有 Agent 完成
@@ -1393,9 +1897,14 @@ impl Coordinator {
         while !join_set.is_empty() {
             match tokio::time::timeout_at(deadline, join_set.join_next_with_id()).await {
                 Ok(Some(Ok((task_id, report)))) => {
-                    let (agent_id, _) = task_meta
-                        .remove(&task_id)
-                        .unwrap_or_else(|| ("unknown-agent".to_string(), Vec::new()));
+                    let (agent_id, _, _) = task_meta.remove(&task_id).unwrap_or_else(|| {
+                        (
+                            AgentId::Dynamic("unknown-agent".to_string()),
+                            Vec::new(),
+                            ClauseReviewProgress::default(),
+                        )
+                    });
+                    let agent_id = agent_id.to_string();
                     if report.successful_clauses > 0 {
                         successful_agents += 1;
                     } else {
@@ -1414,11 +1923,25 @@ impl Coordinator {
                     failed_clauses.extend(report.failed_clauses);
                 }
                 Ok(Some(Err(e))) => {
-                    let (agent_id, clause_ids) = task_meta
-                        .remove(&e.id())
-                        .unwrap_or_else(|| ("unknown-agent".to_string(), Vec::new()));
+                    let (agent_id, clause_ids, _) =
+                        task_meta.remove(&e.id()).unwrap_or_else(|| {
+                            (
+                                AgentId::Dynamic("unknown-agent".to_string()),
+                                Vec::new(),
+                                ClauseReviewProgress::default(),
+                            )
+                        });
                     eprintln!("  [EXECUTE] Agent task panicked: {}", e);
                     let message = format!("Agent task 异常终止: {}", e);
+                    self.graph
+                        .fail_started_attempts(
+                            &agent_id,
+                            &clause_ids,
+                            ReviewAttemptErrorCode::TaskPanic,
+                            &message,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                    let agent_id = agent_id.to_string();
                     failed_agents.push(AgentExecutionFailure {
                         agent_id: agent_id.clone(),
                         message: message.clone(),
@@ -1438,9 +1961,15 @@ impl Coordinator {
                     for result in abort_and_drain_agent_tasks(&mut join_set).await {
                         match result {
                             Ok((task_id, report)) => {
-                                let (agent_id, _) = task_meta
-                                    .remove(&task_id)
-                                    .unwrap_or_else(|| ("unknown-agent".to_string(), Vec::new()));
+                                let (agent_id, _, _) =
+                                    task_meta.remove(&task_id).unwrap_or_else(|| {
+                                        (
+                                            AgentId::Dynamic("unknown-agent".to_string()),
+                                            Vec::new(),
+                                            ClauseReviewProgress::default(),
+                                        )
+                                    });
+                                let agent_id = agent_id.to_string();
                                 if report.successful_clauses > 0 {
                                     successful_agents += 1;
                                 } else {
@@ -1461,10 +1990,24 @@ impl Coordinator {
                                 // 保留 task_meta，稍后统一记录为超时取消。
                             }
                             Err(e) => {
-                                let (agent_id, clause_ids) = task_meta
-                                    .remove(&e.id())
-                                    .unwrap_or_else(|| ("unknown-agent".to_string(), Vec::new()));
+                                let (agent_id, clause_ids, _) =
+                                    task_meta.remove(&e.id()).unwrap_or_else(|| {
+                                        (
+                                            AgentId::Dynamic("unknown-agent".to_string()),
+                                            Vec::new(),
+                                            ClauseReviewProgress::default(),
+                                        )
+                                    });
                                 let message = format!("Agent task 异常终止: {}", e);
+                                self.graph
+                                    .fail_started_attempts(
+                                        &agent_id,
+                                        &clause_ids,
+                                        ReviewAttemptErrorCode::TaskPanic,
+                                        &message,
+                                    )
+                                    .map_err(anyhow::Error::msg)?;
+                                let agent_id = agent_id.to_string();
                                 failed_agents.push(AgentExecutionFailure {
                                     agent_id: agent_id.clone(),
                                     message: message.clone(),
@@ -1487,13 +2030,80 @@ impl Coordinator {
                         ),
                     );
                     execution_control.record_pipeline_timeout_if_expired();
-                    for (_task_id, (agent_id, clause_ids)) in task_meta.drain() {
+                    for (_task_id, (agent_id, clause_ids, progress)) in task_meta.drain() {
                         let message = "Agent Execute 阶段超时取消".to_string();
-                        failed_agents.push(AgentExecutionFailure {
-                            agent_id: agent_id.clone(),
-                            message: message.clone(),
-                        });
-                        failed_clauses.extend(clause_ids.into_iter().map(|clause_id| {
+                        let progress = progress.snapshot();
+                        let completed_clause_ids =
+                            progress.completed.keys().cloned().collect::<HashSet<_>>();
+                        let failed_clause_ids =
+                            progress.failed.keys().cloned().collect::<HashSet<_>>();
+                        let recovered_findings = progress
+                            .completed
+                            .into_values()
+                            .flatten()
+                            .collect::<Vec<_>>();
+
+                        for finding in recovered_findings.iter().filter(|finding| !finding.no_risk)
+                        {
+                            if let Some(ref events) = self.review_events {
+                                events.emit(&ReviewEvent::FindingAdded {
+                                    risk_id: finding.risk_id.clone(),
+                                    severity: severity_str(&finding.severity).to_string(),
+                                    is_critical: finding.is_critical,
+                                    critical_reason: finding.critical_reason.clone(),
+                                    risk_type: finding.risk_type.clone(),
+                                    agent: finding.agent.clone(),
+                                    confidence: finding.confidence as f64,
+                                    clause_ids: finding.clause_ids.clone(),
+                                    source_quote: finding.source_quote.chars().take(500).collect(),
+                                    legal_basis: finding.legal_basis.clone(),
+                                    reason: finding.reason.chars().take(500).collect(),
+                                    suggestion: finding.suggestion.clone(),
+                                    lifecycle: FindingLifecycle::Verified,
+                                    page_number: finding.page_number,
+                                    section_path: finding.section_path.clone(),
+                                    block_ids: finding.block_ids.clone(),
+                                });
+                            }
+                        }
+                        all_findings.extend(
+                            recovered_findings
+                                .into_iter()
+                                .filter(|finding| !finding.truncated),
+                        );
+
+                        for (clause_id, failure_message) in progress.failed {
+                            failed_clauses.push(ClauseExecutionFailure {
+                                agent_id: agent_id.to_string(),
+                                clause_id,
+                                message: failure_message,
+                            });
+                        }
+                        let pending_clause_ids = clause_ids
+                            .into_iter()
+                            .filter(|clause_id| {
+                                !completed_clause_ids.contains(clause_id)
+                                    && !failed_clause_ids.contains(clause_id)
+                            })
+                            .collect::<Vec<_>>();
+                        self.graph
+                            .fail_started_attempts(
+                                &agent_id,
+                                &pending_clause_ids,
+                                ReviewAttemptErrorCode::TaskCancelled,
+                                &message,
+                            )
+                            .map_err(anyhow::Error::msg)?;
+                        let agent_id = agent_id.to_string();
+                        if completed_clause_ids.is_empty() {
+                            failed_agents.push(AgentExecutionFailure {
+                                agent_id: agent_id.clone(),
+                                message: message.clone(),
+                            });
+                        } else {
+                            successful_agents += 1;
+                        }
+                        failed_clauses.extend(pending_clause_ids.into_iter().map(|clause_id| {
                             ClauseExecutionFailure {
                                 agent_id: agent_id.clone(),
                                 clause_id,
@@ -1567,6 +2177,7 @@ impl Coordinator {
         emit: &dyn Fn(&ReviewEvent),
     ) -> MergeResult {
         let total = findings.len();
+        let mut merged_findings = HashMap::new();
         // 简单去重：按稳定分类|证据|clause_ids|agent 组合去重。
         // 同一 chunk 中的不同类别不得仅因文字相似被合并。
         let mut seen: HashMap<String, RiskFinding> = HashMap::new();
@@ -1586,6 +2197,7 @@ impl Coordinator {
                         reason: "去重合并（保留置信度更高的）".to_string(),
                         merged_into: Some(f.risk_id.clone()),
                     });
+                    merged_findings.insert(existing.risk_id.clone(), f.risk_id.clone());
                     seen.insert(key, f);
                 } else {
                     // 当前 finding 被合并掉了
@@ -1594,6 +2206,7 @@ impl Coordinator {
                         reason: "去重合并（保留置信度更高的）".to_string(),
                         merged_into: Some(existing.risk_id.clone()),
                     });
+                    merged_findings.insert(f.risk_id.clone(), existing.risk_id.clone());
                 }
             } else {
                 seen.insert(key, f);
@@ -1610,7 +2223,10 @@ impl Coordinator {
             removed_count,
             risk_count
         );
-        MergeResult { retained: merged }
+        MergeResult {
+            retained: merged,
+            merged: merged_findings,
+        }
     }
 
     // ── [4b] LINK: 跨 Agent 同类型风险 linked_to 推导 ──────────
@@ -1687,6 +2303,7 @@ impl Coordinator {
         emit: &dyn Fn(&ReviewEvent),
     ) -> MergeResult {
         let total = findings.len();
+        let mut merged_findings = HashMap::new();
         let mut normalized = Vec::with_capacity(total);
         for mut finding in findings {
             risk_taxonomy::normalize_finding(&mut finding);
@@ -1764,6 +2381,7 @@ impl Coordinator {
                         ),
                         merged_into: Some(existing.risk_id.clone()),
                     });
+                    merged_findings.insert(vf.risk_id.clone(), existing.risk_id.clone());
                     merged = true;
                     break;
                 }
@@ -1811,6 +2429,7 @@ impl Coordinator {
                         reason: format!("同类别证据相似度合并 (sim={:.2})", sim),
                         merged_into: Some(existing.risk_id.clone()),
                     });
+                    merged_findings.insert(f.risk_id.clone(), existing.risk_id.clone());
                     merged = true;
                     break;
                 }
@@ -1830,7 +2449,10 @@ impl Coordinator {
             hypotheses.len(),
             risk_count
         );
-        MergeResult { retained }
+        MergeResult {
+            retained,
+            merged: merged_findings,
+        }
     }
 
     // ── [5] LEGAL VERIFY: 分组批量 + 分层法条验证 ──────────────────
@@ -2480,8 +3102,7 @@ impl Coordinator {
 
         // 高风险发现摘要
         let high_risks: Vec<&RiskNode> = snapshot
-            .risks
-            .values()
+            .agent_visible_risks()
             .filter(|r| r.finding.severity == RiskSeverity::High && !r.finding.no_risk)
             .collect();
         if !high_risks.is_empty() {
@@ -2515,12 +3136,10 @@ impl Coordinator {
         }
 
         // same_law 边
-        if !snapshot.same_law.is_empty() {
-            ctx.push_str(&format!(
-                "### 同法条关联 ({} 条边)\n\n",
-                snapshot.same_law.len()
-            ));
-            for (cid, others) in &snapshot.same_law {
+        let same_law = snapshot.agent_visible_same_law();
+        if !same_law.is_empty() {
+            ctx.push_str(&format!("### 同法条关联 ({} 条边)\n\n", same_law.len()));
+            for (cid, others) in &same_law {
                 if !others.is_empty() {
                     ctx.push_str(&format!("- {} 共享法条: {}\n", cid, others.join(", ")));
                 }
@@ -2530,8 +3149,7 @@ impl Coordinator {
 
         // Scout Hypothesis 覆盖度（已初筛维度参考）
         let hypotheses: Vec<&RiskNode> = snapshot
-            .risks
-            .values()
+            .agent_visible_risks()
             .filter(|r| r.finding.finding_role == FindingRole::Hypothesis)
             .collect();
         if !hypotheses.is_empty() {
@@ -2575,18 +3193,20 @@ impl Coordinator {
         execution_control: Arc<ReviewExecutionControl>,
     ) -> Vec<RiskFinding> {
         let snapshot = self.graph.snapshot();
+        let previous_attempt_ids = snapshot
+            .review_attempts
+            .values()
+            .filter(|attempt| attempt.agent_id == AgentId::BlindSpot)
+            .map(|attempt| attempt.attempt_id.clone())
+            .collect::<HashSet<_>>();
 
         // 识别候选条款：未审查 OR (≤1 Agent 审查且无风险发现)
-        let candidate_ids: Vec<String> = snapshot
+        let mut candidate_ids: Vec<String> = snapshot
             .chunks
             .keys()
             .filter(|cid| {
                 let reviewed = snapshot.reviewed_by.get(*cid).map(|v| v.len()).unwrap_or(0);
-                let has_risk = snapshot
-                    .has_risk
-                    .get(*cid)
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false);
+                let has_risk = snapshot.has_confirmed_risk(cid);
 
                 // 跳过 L1 格式条款和 frontmatter
                 if let Some(chunk) = snapshot.chunks.get(*cid)
@@ -2600,6 +3220,7 @@ impl Coordinator {
             })
             .cloned()
             .collect();
+        sort_blind_spot_candidate_ids(&snapshot, &mut candidate_ids);
 
         if candidate_ids.is_empty() {
             eprintln!("  [BLINDSPOT] 无候选条款（所有条款已被充分审查），跳过 ReAct 扫描");
@@ -2651,7 +3272,12 @@ impl Coordinator {
         if blind_spot_def.is_none() {
             eprintln!("  [BLINDSPOT] BlindSpotAgent 未注册，回退到 fallback");
             return if self.config.blind_spot_fallback_enabled {
-                self.blind_spot_fallback(Some(&snapshot)).await
+                let candidate_chunk_ids = candidate_clauses
+                    .iter()
+                    .map(|clause| clause.chunk_id.clone())
+                    .collect::<Vec<_>>();
+                self.blind_spot_fallback(Some(&snapshot), Some(&candidate_chunk_ids))
+                    .await
             } else {
                 Vec::new()
             };
@@ -2688,32 +3314,10 @@ impl Coordinator {
 
         let total_findings = findings.len();
         let no_risk_count = findings.iter().filter(|f| f.no_risk).count();
-        let real_findings: Vec<RiskFinding> = findings.into_iter().filter(|f| !f.no_risk).collect();
-
-        if real_findings.is_empty() {
-            if no_risk_count > 0 {
-                eprintln!(
-                    "  [BLINDSPOT] ReAct 产出 {} 条 no_risk 结论，无新增风险发现，回退到 fallback",
-                    no_risk_count
-                );
-            } else {
-                eprintln!(
-                    "  [BLINDSPOT] ReAct 无任何产出 (0 条 finding，共 {} 候选条款)，回退到 fallback",
-                    total_findings
-                );
-            }
-            return if self.config.blind_spot_fallback_enabled {
-                self.blind_spot_fallback(Some(&snapshot)).await
-            } else {
-                Vec::new()
-            };
-        }
-
-        eprintln!(
-            "  [BLINDSPOT] ReAct 完成，发现 {} 条新风险 (另有 {} 条 no_risk 结论)",
-            real_findings.len(),
-            no_risk_count
-        );
+        let mut real_findings: Vec<RiskFinding> = findings
+            .into_iter()
+            .filter(|finding| !finding.no_risk && !finding.truncated)
+            .collect();
 
         // 内部去重：同一 Agent 对同一条款的同一 risk_type 只保留 confidence 最高的
         let before_dedup = real_findings.len();
@@ -2728,7 +3332,7 @@ impl Coordinator {
                 seen.insert(key, f);
             }
         }
-        let mut real_findings: Vec<RiskFinding> = seen.into_values().collect();
+        real_findings = seen.into_values().collect();
         if real_findings.len() < before_dedup {
             eprintln!(
                 "  [BLINDSPOT] 内部去重: {} → {} 条 (移除 {} 条重复)",
@@ -2781,18 +3385,50 @@ impl Coordinator {
             }
         }
 
-        // 将发现写入 SessionGraph
-        let graph_for_write = self.graph.clone();
+        // 只检查本次扫描新建的 BlindSpot 尝试；旧会话状态不得干扰本次兜底判定。
+        let latest_snapshot = self.graph.snapshot();
+        let candidate_chunk_ids = candidate_clauses
+            .iter()
+            .map(|clause| clause.chunk_id.clone())
+            .collect::<Vec<_>>();
+        let fallback_chunk_ids = blind_spot_fallback_chunk_ids(
+            &latest_snapshot,
+            &candidate_chunk_ids,
+            &previous_attempt_ids,
+        );
+
+        let fallback_findings =
+            if self.config.blind_spot_fallback_enabled && !fallback_chunk_ids.is_empty() {
+                self.blind_spot_fallback(Some(&snapshot), Some(&fallback_chunk_ids))
+                    .await
+            } else {
+                Vec::new()
+            };
+        if real_findings.is_empty() && fallback_findings.is_empty() {
+            if no_risk_count > 0 {
+                eprintln!(
+                    "  [BLINDSPOT] ReAct 已成功收口 {} 条 no_risk 结论，无新增风险",
+                    no_risk_count
+                );
+            } else {
+                eprintln!(
+                    "  [BLINDSPOT] ReAct 无有效 finding（共 {} 条输出），且无待兜底条款",
+                    total_findings
+                );
+            }
+            return Vec::new();
+        }
+
+        eprintln!(
+            "  [BLINDSPOT] ReAct 完成，发现 {} 条新风险，静态兜底 {} 条 (另有 {} 条 no_risk 结论)",
+            real_findings.len(),
+            fallback_findings.len(),
+            no_risk_count
+        );
+        real_findings.extend(fallback_findings);
+
         let bus_for_write = self.bus.clone();
         for finding in &real_findings {
-            let law_refs = finding.legal_basis.clone();
-            let risk_node = RiskNode {
-                finding: finding.clone(),
-                law_refs,
-            };
-            for cid in &finding.clause_ids {
-                graph_for_write.add_risk_with_edges(risk_node.clone(), cid);
-            }
             if finding.severity == RiskSeverity::High {
                 bus_for_write.broadcast(
                     AgentId::BlindSpot,
@@ -2810,33 +3446,47 @@ impl Coordinator {
     /// BlindSpot 静态 fallback：确定性逻辑扫描盲点（不调用 LLM）。
     ///
     /// 当 BlindSpotAgent ReAct 失败或无产出时回退到此方法。
-    /// `snapshot` 为 pre-ReAct 快照（由调用方传入），避免 ReAct 已将本 Agent
-    /// 写入 `reviewed_by` 后导致 fallback 无法识别未充分审查的条款。
-    async fn blind_spot_fallback(&self, snapshot: Option<&GraphSnapshot>) -> Vec<RiskFinding> {
+    /// `snapshot` 为 pre-ReAct 快照（由调用方传入）；`explicit_chunk_ids` 存在时
+    /// 只扫描调用方依据最新 ReviewAttempt 判定的失败或未收口条款。
+    async fn blind_spot_fallback(
+        &self,
+        snapshot: Option<&GraphSnapshot>,
+        explicit_chunk_ids: Option<&[String]>,
+    ) -> Vec<RiskFinding> {
         let snapshot: GraphSnapshot = match snapshot {
             Some(s) => s.clone(),
             None => self.graph.snapshot(),
         };
 
         // 找出审查覆盖盲点
-        let unreviewed_chunks: Vec<&String> = snapshot
-            .chunks
-            .keys()
-            .filter(|cid| {
-                !snapshot.reviewed_by.contains_key(*cid)
-                    || snapshot
-                        .reviewed_by
-                        .get(*cid)
-                        .map(|v| v.is_empty())
-                        .unwrap_or(true)
-            })
-            .collect();
+        let unreviewed_chunks: Vec<&String> = match explicit_chunk_ids {
+            Some(chunk_ids) => chunk_ids
+                .iter()
+                .filter(|chunk_id| snapshot.chunks.contains_key(*chunk_id))
+                .collect(),
+            None => snapshot
+                .chunks
+                .keys()
+                .filter(|cid| {
+                    !snapshot.reviewed_by.contains_key(*cid)
+                        || snapshot
+                            .reviewed_by
+                            .get(*cid)
+                            .map(|v| v.is_empty())
+                            .unwrap_or(true)
+                })
+                .collect(),
+        };
 
-        let no_risk_chunks: Vec<&String> = snapshot
-            .chunks
-            .keys()
-            .filter(|cid| !snapshot.has_risk.contains_key(*cid))
-            .collect();
+        let no_risk_chunks: Vec<&String> = if explicit_chunk_ids.is_some() {
+            Vec::new()
+        } else {
+            snapshot
+                .chunks
+                .keys()
+                .filter(|cid| !snapshot.has_confirmed_risk(cid))
+                .collect()
+        };
 
         eprintln!(
             "  [BLINDSPOT] 未审查: {} 条, 无关联风险: {} 条",
@@ -2866,6 +3516,25 @@ impl Coordinator {
 
         for cid in &unreviewed_chunks {
             if let Some(chunk) = snapshot.chunks.get(*cid) {
+                let reviewed_count = snapshot
+                    .reviewed_by
+                    .get(*cid)
+                    .map(|agents| agents.len())
+                    .unwrap_or(0);
+                let reason = if reviewed_count == 0 {
+                    format!(
+                        "条款 {} 未被任何 Agent 成功完成审查，建议人工复核。章节: {}",
+                        cid,
+                        chunk.section_path.join(" > ")
+                    )
+                } else {
+                    format!(
+                        "条款 {} 已由 {} 个 Agent 完成审查，但 BlindSpot 复查未成功收口，当前覆盖不足。章节: {}",
+                        cid,
+                        reviewed_count,
+                        chunk.section_path.join(" > ")
+                    )
+                };
                 blind_findings.push(RiskFinding {
                     risk_id: format!("BLIND_{}", cid),
                     clause_ids: vec![(*cid).clone()],
@@ -2881,11 +3550,7 @@ impl Coordinator {
                     source_quote: chunk.text_preview.clone(),
                     legal_basis: Vec::new(),
                     case_refs: Vec::new(),
-                    reason: format!(
-                        "条款 {} 未被任何 Agent 审查，建议人工复核。章节: {}",
-                        cid,
-                        chunk.section_path.join(" > ")
-                    ),
+                    reason,
                     suggestion: "建议指派 Agent 重新审查或人工复核。".to_string(),
                     confidence: 0.5,
                     initial_tier: RiskTier::Medium,
@@ -2973,6 +3638,10 @@ impl Coordinator {
             "  [BLINDSPOT] 发现 {} 条盲点/潜在遗漏",
             blind_findings.len()
         );
+        if let Err(error) = self.graph.upsert_provisional_findings(&blind_findings) {
+            eprintln!("  [BLINDSPOT] 静态兜底写入 SessionGraph 失败: {}", error);
+            return Vec::new();
+        }
         blind_findings
     }
 
@@ -3134,8 +3803,7 @@ impl Coordinator {
                         ev.reason
                     ));
                     // severity 校准：只降不升——核验器判 medium 时，把 high 拉回 medium。
-                    if ev.severity.as_deref() == Some("medium")
-                        && f.severity == RiskSeverity::High
+                    if ev.severity.as_deref() == Some("medium") && f.severity == RiskSeverity::High
                     {
                         f.severity = RiskSeverity::Medium;
                         f.reason.push_str(
@@ -3203,12 +3871,9 @@ impl Coordinator {
 
     /// 启动时从 agents/dynamic_agents.json 加载活跃的动态 Agent。
     pub fn load_dynamic_agents(&mut self) -> Result<usize> {
-        let path = data_path_str("agents/dynamic_agents.json");
-        if !std::path::Path::new(&path).exists() {
+        let Some(manifest) = self.dynamic_agent_store.read_manifest()? else {
             return Ok(0);
-        }
-        let json = std::fs::read_to_string(path)?;
-        let manifest: DynamicAgentManifest = serde_json::from_str(&json)?;
+        };
 
         let mut loaded = 0;
         for def in &manifest.agents {
@@ -3237,8 +3902,8 @@ impl Coordinator {
     }
 
     /// 扫描 findings 中的 suggested_agent，写入 dynamic_agents.json。
-    fn register_dynamic_agents(&self, findings: &[RiskFinding]) -> usize {
-        let mut registered = 0;
+    fn register_dynamic_agents(&self, findings: &[RiskFinding]) -> Result<usize> {
+        let mut definitions = Vec::new();
         for f in findings {
             if let Some(suggested) = &f.suggested_agent {
                 if suggested.agent_prompt.is_empty() || suggested.section_keywords.is_empty() {
@@ -3263,15 +3928,17 @@ impl Coordinator {
                     reason: suggested.reason.clone(),
                     active: false,
                 };
-                self.append_dynamic_agent_to_file(&def);
-                eprintln!(
-                    "  [DYNAMIC] 新 Agent 建议已写入: {} (active=false, 需人工审批)",
-                    def.id
-                );
-                registered += 1;
+                definitions.push(def);
             }
         }
-        registered
+        let registered = self.dynamic_agent_store.append(&definitions)?;
+        for definition in &definitions {
+            eprintln!(
+                "  [DYNAMIC] 新 Agent 建议已写入: {} (active=false, 需人工审批)",
+                definition.id
+            );
+        }
+        Ok(registered)
     }
 
     /// 去重检查：section_keywords Jaccard 重叠度 > 0.5 视为重复。
@@ -3292,46 +3959,6 @@ impl Coordinator {
             }
         }
         false
-    }
-
-    /// 将新 Agent 追加写入 dynamic_agents.json（上限 20 个，超出淘汰最旧）。
-    fn append_dynamic_agent_to_file(&self, def: &DynamicAgentDefinition) {
-        let path = data_path_str("agents/dynamic_agents.json");
-        let mut manifest: DynamicAgentManifest = if std::path::Path::new(&path).exists() {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(DynamicAgentManifest {
-                    version: 1,
-                    agents: vec![],
-                })
-        } else {
-            DynamicAgentManifest {
-                version: 1,
-                agents: vec![],
-            }
-        };
-
-        // 去重：同名覆盖
-        manifest.agents.retain(|a| a.id != def.id);
-        manifest.agents.push(def.clone());
-
-        // 上限 20，淘汰最旧
-        if manifest.agents.len() > 20 {
-            manifest
-                .agents
-                .sort_by(|a, b| a.created_at.cmp(&b.created_at));
-            manifest.agents.remove(0); // 移除最旧
-        }
-
-        // 确保目录存在
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        if let Ok(json) = serde_json::to_string_pretty(&manifest) {
-            let _ = std::fs::write(&path, json);
-        }
     }
 
     /// 将中文 Agent 名称转为合法的 ID（去除非 ASCII，snake_case）。
@@ -3517,6 +4144,23 @@ mod tests {
 
     struct ConditionalPanicLlm;
 
+    struct ConditionalSlowFindingLlm;
+
+    struct FailingLlm;
+
+    struct SlowLlm;
+
+    struct ConditionalBlindSpotLlm {
+        successful_clause_has_finding: bool,
+    }
+
+    struct GatedBlindSpotLlm {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        released: Arc<std::sync::atomic::AtomicBool>,
+        release_notify: Arc<tokio::sync::Notify>,
+    }
+
     struct CountingLegalVerifyLlm {
         calls: Arc<AtomicUsize>,
     }
@@ -3562,6 +4206,132 @@ mod tests {
                 panic!("模拟单条条款 task 崩溃");
             }
             NoRiskLlm.chat(messages, tools, tool_choice).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for ConditionalSlowFindingLlm {
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _tool_choice: &ToolChoice,
+        ) -> Result<LlmResponse> {
+            let is_blocked = messages.iter().any(|message| match message {
+                ChatMessage::User { content } => content.contains("模拟阻塞"),
+                _ => false,
+            });
+            if is_blocked {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                unreachable!("测试应在阻塞条款返回前取消任务");
+            }
+
+            Ok(LlmResponse {
+                content: None,
+                thought: None,
+                tool_calls: vec![ToolCall {
+                    id: "test-finding".to_string(),
+                    name: "output_finding".to_string(),
+                    arguments: serde_json::json!({
+                        "findings": [make_test_finding("R_FAST", "ch_fast", "FactCheck")],
+                        "has_more": false,
+                        "coverage": [],
+                    }),
+                }],
+                usage: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for FailingLlm {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _tool_choice: &ToolChoice,
+        ) -> Result<LlmResponse> {
+            Err(anyhow::anyhow!("模拟 Scout LLM 失败"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for SlowLlm {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _tool_choice: &ToolChoice,
+        ) -> Result<LlmResponse> {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            unreachable!("测试应在 LLM 返回前取消任务")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for ConditionalBlindSpotLlm {
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _tool_choice: &ToolChoice,
+        ) -> Result<LlmResponse> {
+            let is_failed = messages.iter().any(|message| match message {
+                ChatMessage::User { content } => content.contains("模拟失败"),
+                _ => false,
+            });
+            if is_failed {
+                return Err(anyhow::anyhow!("模拟 BlindSpot 条款失败"));
+            }
+            let findings = if self.successful_clause_has_finding {
+                vec![make_test_finding("ignored", "ignored", "BlindSpotAgent")]
+            } else {
+                Vec::new()
+            };
+            Ok(LlmResponse {
+                content: None,
+                thought: None,
+                tool_calls: vec![ToolCall {
+                    id: "test-output".to_string(),
+                    name: "output_finding".to_string(),
+                    arguments: serde_json::json!({
+                        "findings": findings,
+                        "has_more": false,
+                        "coverage": [],
+                    }),
+                }],
+                usage: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for GatedBlindSpotLlm {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _tool_choice: &ToolChoice,
+        ) -> Result<LlmResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            while !self.released.load(Ordering::SeqCst) {
+                self.release_notify.notified().await;
+            }
+            Ok(LlmResponse {
+                content: None,
+                thought: None,
+                tool_calls: vec![ToolCall {
+                    id: "test-output".to_string(),
+                    name: "output_finding".to_string(),
+                    arguments: serde_json::json!({
+                        "findings": [],
+                        "has_more": false,
+                        "coverage": [],
+                    }),
+                }],
+                usage: None,
+            })
         }
     }
 
@@ -3640,6 +4410,8 @@ mod tests {
             global_execution_limiter: Arc::new(GlobalExecutionLimiter::new(
                 crate::agents::execution_control::ExecutionLimits::default(),
             )),
+            blind_spot_scan_lock: Mutex::new(()),
+            dynamic_agent_store: DynamicAgentStore::global(),
         }
     }
 
@@ -3701,8 +4473,8 @@ mod tests {
             verification_required: Vec::new(),
             hypothesized_by: Vec::new(),
             verified_by: Vec::new(),
-                    evidence_verdict: None,
-                    verifier_reason: None,
+            evidence_verdict: None,
+            verifier_reason: None,
             page_number: None,
             section_path: None,
             context: None,
@@ -3749,6 +4521,15 @@ mod tests {
             .await;
 
         assert!(result.is_err(), "Agent 崩溃时不得返回审核成功");
+        let snapshot = coordinator.graph.snapshot();
+        let attempt = snapshot
+            .review_attempts
+            .values()
+            .next()
+            .expect("已启动的审查尝试必须保留");
+        assert_eq!(attempt.status, ReviewAttemptStatus::Failed);
+        assert_eq!(attempt.error_code, Some(ReviewAttemptErrorCode::TaskPanic));
+        assert!(!snapshot.reviewed_by.contains_key("ch_panic"));
     }
 
     #[tokio::test]
@@ -3781,6 +4562,661 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_timeout_closes_started_attempt_as_cancelled() {
+        let mut config = CoordinatorConfig::default();
+        config.enabled_agents = vec![AgentId::FactCheck];
+        let mut coordinator = make_runtime_coordinator(config, Arc::new(|| Box::new(SlowLlm)));
+        let mut limits = crate::agents::execution_control::ExecutionLimits::default();
+        limits.execute_timeout = std::time::Duration::from_millis(20);
+        limits.pipeline_timeout = std::time::Duration::from_secs(1);
+        coordinator.global_execution_limiter = Arc::new(GlobalExecutionLimiter::new(limits));
+
+        let result = coordinator
+            .review(&[make_test_clause("ch_cancelled", "封面格式要求")])
+            .await;
+
+        assert!(result.is_err(), "Execute 超时后不得返回审核成功");
+        let snapshot = coordinator.graph.snapshot();
+        let attempt = snapshot
+            .review_attempts
+            .values()
+            .next()
+            .expect("取消前已启动的审查尝试必须保留");
+        assert_eq!(attempt.status, ReviewAttemptStatus::Failed);
+        assert_eq!(
+            attempt.error_code,
+            Some(ReviewAttemptErrorCode::TaskCancelled)
+        );
+        assert!(!snapshot.reviewed_by.contains_key("ch_cancelled"));
+    }
+
+    #[tokio::test]
+    async fn execute_timeout_keeps_completed_clause_result() {
+        let mut config = CoordinatorConfig::default();
+        config.enabled_agents = vec![AgentId::FactCheck];
+        config.max_parallel_clauses = 2;
+        let mut coordinator =
+            make_runtime_coordinator(config, Arc::new(|| Box::new(ConditionalSlowFindingLlm)));
+        let mut limits = crate::agents::execution_control::ExecutionLimits::default();
+        limits.execute_timeout = std::time::Duration::from_millis(50);
+        limits.pipeline_timeout = std::time::Duration::from_secs(1);
+        limits.clause_timeout = std::time::Duration::from_secs(1);
+        limits.call_timeout = std::time::Duration::from_secs(1);
+        coordinator.global_execution_limiter = Arc::new(GlobalExecutionLimiter::new(limits));
+        let clauses = vec![
+            make_test_clause("ch_fast", "封面格式要求"),
+            make_test_clause("ch_slow", "格式要求：模拟阻塞"),
+        ];
+        coordinator.preload_chunks(&clauses);
+        coordinator.preload_agents();
+        let routing = HashMap::from([(AgentId::FactCheck, clauses)]);
+        let execution_control = coordinator.global_execution_limiter.start_review(2, 1);
+
+        let output = coordinator
+            .execute_agents(&routing, execution_control)
+            .await
+            .expect("已有条款成功时应保留部分审核结果");
+
+        assert_eq!(
+            output.execution_summary.status,
+            ReviewExecutionStatus::PartialFailed
+        );
+        assert_eq!(output.execution_summary.successful_agents, 1);
+        assert_eq!(output.execution_summary.failed_clauses.len(), 1);
+        assert_eq!(
+            output.execution_summary.failed_clauses[0].clause_id,
+            "ch_slow"
+        );
+        let recovered_finding = output
+            .findings
+            .iter()
+            .find(|finding| {
+                finding
+                    .clause_ids
+                    .iter()
+                    .any(|clause_id| clause_id == "ch_fast")
+            })
+            .expect("快速条款的真实风险不得因同 Agent 其他条款超时而丢失");
+
+        let snapshot = coordinator.graph.snapshot();
+        let fast_attempt = snapshot
+            .review_attempts
+            .values()
+            .find(|attempt| attempt.chunk_id == "ch_fast")
+            .expect("快速条款必须保留完成尝试");
+        assert_eq!(fast_attempt.status, ReviewAttemptStatus::Completed);
+        assert_eq!(fast_attempt.outcome, Some(ReviewAttemptOutcome::Findings));
+        assert!(snapshot.reviewed_by.contains_key("ch_fast"));
+        assert!(snapshot.risks.contains_key(&recovered_finding.risk_id));
+        assert_eq!(snapshot.risks.len(), 1, "超时恢复不得重复写入已提交风险");
+        assert_eq!(
+            snapshot.has_risk["ch_fast"],
+            vec![recovered_finding.risk_id.clone()],
+            "同一风险与条款的关系边必须保持唯一"
+        );
+
+        let slow_attempt = snapshot
+            .review_attempts
+            .values()
+            .find(|attempt| attempt.chunk_id == "ch_slow")
+            .expect("阻塞条款必须保留失败尝试");
+        assert_eq!(slow_attempt.status, ReviewAttemptStatus::Failed);
+        assert_eq!(
+            slow_attempt.error_code,
+            Some(ReviewAttemptErrorCode::TaskCancelled)
+        );
+        assert!(!snapshot.reviewed_by.contains_key("ch_slow"));
+    }
+
+    #[tokio::test]
+    async fn blind_spot_no_risk_does_not_trigger_fallback() {
+        let mut config = CoordinatorConfig::default();
+        config.blind_spot_fallback_enabled = true;
+        let coordinator = make_runtime_coordinator(config, Arc::new(|| Box::new(NoRiskLlm)));
+        let clause = make_test_clause("ch_blind_no_risk", "投标人必须提交完整的履约方案");
+        coordinator.preload_chunks(std::slice::from_ref(&clause));
+        coordinator.preload_agents();
+        let execution_control = coordinator.global_execution_limiter.start_review(1, 1);
+
+        let findings = coordinator.blind_spot_scan(execution_control).await;
+
+        assert!(
+            findings.is_empty(),
+            "成功的 NoRisk 结论不得触发静态兜底风险"
+        );
+        let snapshot = coordinator.graph.snapshot();
+        let attempt = snapshot
+            .review_attempts
+            .values()
+            .find(|attempt| attempt.chunk_id == "ch_blind_no_risk")
+            .expect("BlindSpot 应保留审查尝试");
+        assert_eq!(attempt.status, ReviewAttemptStatus::Completed);
+        assert_eq!(attempt.outcome, Some(ReviewAttemptOutcome::NoRisk));
+    }
+
+    #[tokio::test]
+    async fn blind_spot_missing_agent_fallback_keeps_single_no_risk_candidate() {
+        let mut config = CoordinatorConfig::default();
+        config.blind_spot_fallback_enabled = true;
+        let mut registry = AgentRegistry::builtin();
+        registry.remove_for_test(&AgentId::BlindSpot);
+        let coordinator = make_test_coordinator(config, registry);
+        let clause = make_test_clause("ch_single_candidate", "投标人必须提交完整的履约方案");
+        coordinator.preload_chunks(std::slice::from_ref(&clause));
+        let attempt_id = coordinator
+            .graph
+            .start_review_attempt(AgentId::FactCheck, &clause.chunk_id)
+            .expect("应创建已有 Agent 的审查尝试");
+        coordinator
+            .graph
+            .commit_review_result(&attempt_id, ReviewAttemptOutcome::NoRisk, &[])
+            .expect("已有 Agent NoRisk 应正常完成");
+        let execution_control = coordinator.global_execution_limiter.start_review(1, 1);
+
+        let findings = coordinator.blind_spot_scan(execution_control).await;
+
+        assert_eq!(findings.len(), 1, "单个合法候选不得被提前跳过");
+        assert_eq!(findings[0].clause_ids, vec!["ch_single_candidate"]);
+        assert!(!findings[0].no_risk);
+        assert!(findings[0].reason.contains("覆盖不足"));
+        assert!(!findings[0].reason.contains("未被任何 Agent 审查"));
+    }
+
+    #[tokio::test]
+    async fn blind_spot_keeps_single_review_candidate_with_only_provisional_risk() {
+        let mut config = CoordinatorConfig::default();
+        config.blind_spot_fallback_enabled = true;
+        let mut registry = AgentRegistry::builtin();
+        registry.remove_for_test(&AgentId::BlindSpot);
+        let coordinator = make_test_coordinator(config, registry);
+        let clause = make_test_clause("ch_provisional", "投标人必须提交完整的履约方案");
+        coordinator.preload_chunks(std::slice::from_ref(&clause));
+        let attempt_id = coordinator
+            .graph
+            .start_review_attempt(AgentId::FactCheck, &clause.chunk_id)
+            .expect("应创建已有 Agent 的审查尝试");
+        coordinator
+            .graph
+            .commit_review_result(
+                &attempt_id,
+                ReviewAttemptOutcome::Findings,
+                &[make_test_finding(
+                    "R_PROVISIONAL",
+                    &clause.chunk_id,
+                    "FactCheck",
+                )],
+            )
+            .expect("provisional finding 应正常提交");
+        let execution_control = coordinator.global_execution_limiter.start_review(1, 1);
+
+        let findings = coordinator.blind_spot_scan(execution_control).await;
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "未决风险不得阻止覆盖不足条款进入补充审查"
+        );
+        assert_eq!(findings[0].clause_ids, vec!["ch_provisional"]);
+    }
+
+    #[test]
+    fn blind_spot_context_excludes_terminal_risks_and_their_same_law_edges() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let confirmed_clause = make_test_clause("ch_confirmed", "确认条款");
+        let rejected_clause = make_test_clause("ch_rejected", "驳回条款");
+        coordinator.preload_chunks(&[confirmed_clause.clone(), rejected_clause.clone()]);
+        let confirmed = make_test_finding("R_CONFIRMED", &confirmed_clause.chunk_id, "FactCheck");
+        let mut rejected = make_test_finding("R_REJECTED", &rejected_clause.chunk_id, "FactCheck");
+        rejected.risk_type = "已拒绝风险".to_string();
+        coordinator
+            .graph
+            .upsert_provisional_findings(&[confirmed.clone(), rejected])
+            .expect("应写入测试风险");
+        coordinator
+            .graph
+            .finalize_audit(
+                &[confirmed],
+                &HashMap::new(),
+                &HashMap::from([("R_REJECTED".to_string(), "证据不足".to_string())]),
+            )
+            .expect("最终裁决应成功");
+
+        let context = coordinator.build_blind_spot_context(&coordinator.graph.snapshot());
+
+        assert!(!context.contains("已拒绝风险"));
+        assert!(!context.contains("ch_confirmed 共享法条: ch_rejected"));
+        assert!(
+            !context.contains("### 同法条关联"),
+            "只有一个可见条款引用法条时不得生成空关系标题"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_blind_spot_serializes_reentrant_calls_per_coordinator() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_notify = Arc::new(tokio::sync::Notify::new());
+        let coordinator = Arc::new(make_runtime_coordinator(
+            CoordinatorConfig::default(),
+            Arc::new({
+                let calls = calls.clone();
+                let started = started.clone();
+                let released = released.clone();
+                let release_notify = release_notify.clone();
+                move || {
+                    Box::new(GatedBlindSpotLlm {
+                        calls: calls.clone(),
+                        started: started.clone(),
+                        released: released.clone(),
+                        release_notify: release_notify.clone(),
+                    })
+                }
+            }),
+        ));
+        let clause = make_test_clause("ch_reentrant", "投标人必须提交完整的履约方案");
+        coordinator.preload_chunks(std::slice::from_ref(&clause));
+        coordinator.preload_agents();
+
+        let first = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.run_blind_spot().await }
+        });
+        started.notified().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let second_invoked = Arc::new(tokio::sync::Notify::new());
+        let second = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let second_invoked = second_invoked.clone();
+            async move {
+                second_invoked.notify_one();
+                coordinator.run_blind_spot().await;
+            }
+        });
+        second_invoked.notified().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "第一次扫描释放前，第二次不得启动 BlindSpot LLM"
+        );
+        let started_attempts = coordinator
+            .graph
+            .snapshot()
+            .review_attempts
+            .values()
+            .filter(|attempt| {
+                attempt.agent_id == AgentId::BlindSpot
+                    && attempt.status == ReviewAttemptStatus::Started
+            })
+            .count();
+        assert_eq!(started_attempts, 1, "并发重入不得创建第二个审查尝试");
+
+        released.store(true, Ordering::SeqCst);
+        release_notify.notify_waiters();
+        first.await.expect("第一次扫描应完成");
+        second.await.expect("第二次扫描应在互斥锁释放后完成");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn blind_spot_missing_agent_fallback_does_not_expand_beyond_candidates() {
+        let mut config = CoordinatorConfig::default();
+        config.blind_spot_fallback_enabled = true;
+        let mut registry = AgentRegistry::builtin();
+        registry.remove_for_test(&AgentId::BlindSpot);
+        let coordinator = make_test_coordinator(config, registry);
+        let candidate = make_test_clause("ch_candidate", "投标人必须提交完整的履约方案");
+        let mut low = make_test_clause("ch_low", "封面格式要求");
+        low.tier = RiskTier::Low;
+        let mut frontmatter = make_test_clause("ch_frontmatter", "采购邀请公告");
+        frontmatter.section_path = vec!["采购公告".to_string()];
+        coordinator.preload_chunks(&[candidate.clone(), low, frontmatter]);
+        let attempt_id = coordinator
+            .graph
+            .start_review_attempt(AgentId::FactCheck, &candidate.chunk_id)
+            .expect("应创建已有 Agent 的审查尝试");
+        coordinator
+            .graph
+            .commit_review_result(&attempt_id, ReviewAttemptOutcome::NoRisk, &[])
+            .expect("已有 Agent NoRisk 应正常完成");
+        let execution_control = coordinator.global_execution_limiter.start_review(1, 1);
+
+        let findings = coordinator.blind_spot_scan(execution_control).await;
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].clause_ids, vec!["ch_candidate"]);
+        let snapshot = coordinator.graph.snapshot();
+        assert!(!snapshot.has_risk.contains_key("ch_low"));
+        assert!(!snapshot.has_risk.contains_key("ch_frontmatter"));
+    }
+
+    #[test]
+    fn blind_spot_current_attempts_ignore_old_completed_and_failed_states() {
+        let graph = SessionGraph::new();
+        let old_completed = graph
+            .start_review_attempt(AgentId::BlindSpot, "ch_current_failed")
+            .expect("应创建旧完成尝试");
+        graph
+            .commit_review_result(&old_completed, ReviewAttemptOutcome::NoRisk, &[])
+            .expect("旧尝试应完成");
+        let old_failed = graph
+            .start_review_attempt(AgentId::BlindSpot, "ch_current_completed")
+            .expect("应创建旧失败尝试");
+        graph
+            .fail_review_attempt(
+                &old_failed,
+                ReviewAttemptErrorCode::IncompleteOutput,
+                "旧失败",
+            )
+            .expect("旧尝试应失败");
+        let previous_attempt_ids = graph
+            .snapshot()
+            .review_attempts
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        let current_failed = graph
+            .start_review_attempt(AgentId::BlindSpot, "ch_current_failed")
+            .expect("应创建本次失败尝试");
+        graph
+            .fail_review_attempt(
+                &current_failed,
+                ReviewAttemptErrorCode::IncompleteOutput,
+                "本次失败",
+            )
+            .expect("本次尝试应失败");
+        let current_completed = graph
+            .start_review_attempt(AgentId::BlindSpot, "ch_current_completed")
+            .expect("应创建本次完成尝试");
+        graph
+            .commit_review_result(&current_completed, ReviewAttemptOutcome::NoRisk, &[])
+            .expect("本次尝试应完成");
+
+        let fallback_chunk_ids = blind_spot_fallback_chunk_ids(
+            &graph.snapshot(),
+            &[
+                "ch_current_failed".to_string(),
+                "ch_current_completed".to_string(),
+            ],
+            &previous_attempt_ids,
+        );
+
+        assert_eq!(fallback_chunk_ids, vec!["ch_current_failed"]);
+    }
+
+    #[tokio::test]
+    async fn blind_spot_scan_uses_only_attempts_created_by_current_run() {
+        let mut config = CoordinatorConfig::default();
+        config.blind_spot_fallback_enabled = true;
+        let coordinator = make_runtime_coordinator(
+            config,
+            Arc::new(|| {
+                Box::new(ConditionalBlindSpotLlm {
+                    successful_clause_has_finding: false,
+                })
+            }),
+        );
+        let clauses = vec![
+            make_test_clause(
+                "ch_old_completed_current_failed",
+                "投标人必须提交完整方案，模拟失败",
+            ),
+            make_test_clause(
+                "ch_old_failed_current_completed",
+                "投标人必须提交完整的履约方案",
+            ),
+        ];
+        coordinator.preload_chunks(&clauses);
+        coordinator.preload_agents();
+        let old_completed = coordinator
+            .graph
+            .start_review_attempt(AgentId::BlindSpot, "ch_old_completed_current_failed")
+            .expect("应创建旧完成尝试");
+        coordinator
+            .graph
+            .commit_review_result(&old_completed, ReviewAttemptOutcome::NoRisk, &[])
+            .expect("旧尝试应完成");
+        let old_failed = coordinator
+            .graph
+            .start_review_attempt(AgentId::BlindSpot, "ch_old_failed_current_completed")
+            .expect("应创建旧失败尝试");
+        coordinator
+            .graph
+            .fail_review_attempt(
+                &old_failed,
+                ReviewAttemptErrorCode::IncompleteOutput,
+                "旧失败",
+            )
+            .expect("旧尝试应失败");
+        let execution_control = coordinator.global_execution_limiter.start_review(2, 1);
+
+        let findings = coordinator.blind_spot_scan(execution_control).await;
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].clause_ids,
+            vec!["ch_old_completed_current_failed"]
+        );
+        assert!(findings[0].reason.contains("覆盖不足"));
+    }
+
+    #[test]
+    fn blind_spot_candidates_follow_page_range_then_chunk_id() {
+        let graph = SessionGraph::new();
+        for (chunk_id, page_start, page_end) in [
+            ("ch_page_2", 2, 3),
+            ("ch_page_1_b", 1, 2),
+            ("ch_page_1_a", 1, 2),
+            ("ch_page_1_short", 1, 1),
+        ] {
+            graph.add_chunk(ChunkNode {
+                chunk_id: chunk_id.to_string(),
+                section_path: vec!["测试".to_string()],
+                page_start,
+                page_end,
+                text_preview: "候选条款".to_string(),
+                tier: RiskTier::Medium,
+            });
+        }
+        let snapshot = graph.snapshot();
+        let mut candidate_ids = vec![
+            "ch_page_2".to_string(),
+            "ch_page_1_b".to_string(),
+            "ch_page_1_short".to_string(),
+            "ch_page_1_a".to_string(),
+        ];
+
+        sort_blind_spot_candidate_ids(&snapshot, &mut candidate_ids);
+
+        assert_eq!(
+            candidate_ids,
+            vec!["ch_page_1_short", "ch_page_1_a", "ch_page_1_b", "ch_page_2",]
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_spot_fallback_only_marks_failed_clause_after_mixed_no_risk_result() {
+        let mut config = CoordinatorConfig::default();
+        config.blind_spot_fallback_enabled = true;
+        let coordinator = make_runtime_coordinator(
+            config,
+            Arc::new(|| {
+                Box::new(ConditionalBlindSpotLlm {
+                    successful_clause_has_finding: false,
+                })
+            }),
+        );
+        let clauses = vec![
+            make_test_clause("ch_no_risk", "投标人必须提交完整的履约方案"),
+            make_test_clause("ch_failed", "投标人必须提交完整方案，模拟失败"),
+        ];
+        coordinator.preload_chunks(&clauses);
+        coordinator.preload_agents();
+        let execution_control = coordinator.global_execution_limiter.start_review(2, 1);
+
+        let findings = coordinator.blind_spot_scan(execution_control).await;
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].clause_ids, vec!["ch_failed"]);
+        assert!(!findings[0].no_risk);
+        assert!(findings[0].reason.contains("未被任何 Agent 成功完成审查"));
+        let snapshot = coordinator.graph.snapshot();
+        assert!(snapshot.has_risk.contains_key("ch_failed"));
+        assert!(!snapshot.has_risk.contains_key("ch_no_risk"));
+    }
+
+    #[tokio::test]
+    async fn blind_spot_fallback_keeps_react_finding_and_marks_failed_clause() {
+        let mut config = CoordinatorConfig::default();
+        config.blind_spot_fallback_enabled = true;
+        let coordinator = make_runtime_coordinator(
+            config,
+            Arc::new(|| {
+                Box::new(ConditionalBlindSpotLlm {
+                    successful_clause_has_finding: true,
+                })
+            }),
+        );
+        let clauses = vec![
+            make_test_clause("ch_finding", "投标人必须提交完整的履约方案"),
+            make_test_clause("ch_failed", "投标人必须提交完整方案，模拟失败"),
+        ];
+        coordinator.preload_chunks(&clauses);
+        coordinator.preload_agents();
+        let execution_control = coordinator.global_execution_limiter.start_review(2, 1);
+
+        let findings = coordinator.blind_spot_scan(execution_control).await;
+
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().any(|finding| {
+            finding.clause_ids == ["ch_finding"] && finding.risk_type != "审查盲点"
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.clause_ids == ["ch_failed"] && finding.risk_type == "审查盲点"
+        }));
+        let snapshot = coordinator.graph.snapshot();
+        assert_eq!(snapshot.risks.len(), 2);
+        assert_eq!(snapshot.has_risk["ch_finding"].len(), 1);
+        assert_eq!(snapshot.has_risk["ch_failed"].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scout_returns_no_finding_when_graph_commit_fails() {
+        let config = CoordinatorConfig::default();
+        let coordinator = make_runtime_coordinator(
+            config,
+            Arc::new(|| {
+                Box::new(ConditionalBlindSpotLlm {
+                    successful_clause_has_finding: true,
+                })
+            }),
+        );
+        coordinator.graph.add_risk_with_edges(
+            RiskNode {
+                finding: make_test_finding("R_001", "existing_chunk", "ExistingAgent"),
+                law_refs: Vec::new(),
+                state: FindingState::Provisional,
+                merged_into: None,
+                decision_reason: None,
+            },
+            "existing_chunk",
+        );
+        let clause = make_test_clause("ch_scout_commit_failed", "投标人必须提交完整方案");
+        coordinator.preload_chunks(std::slice::from_ref(&clause));
+        coordinator.preload_agents();
+
+        coordinator.scout_phase(std::slice::from_ref(&clause)).await;
+
+        let snapshot = coordinator.graph.snapshot();
+        assert!(!snapshot.has_risk.contains_key("ch_scout_commit_failed"));
+        let attempt = snapshot
+            .review_attempts
+            .values()
+            .find(|attempt| attempt.chunk_id == "ch_scout_commit_failed")
+            .expect("应保留失败尝试");
+        assert_eq!(attempt.status, ReviewAttemptStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn blind_spot_timeout_closes_started_attempt_as_cancelled() {
+        let config = CoordinatorConfig::default();
+        let mut coordinator = make_runtime_coordinator(config, Arc::new(|| Box::new(SlowLlm)));
+        let mut limits = crate::agents::execution_control::ExecutionLimits::default();
+        limits.legal_verify_timeout = std::time::Duration::from_millis(20);
+        limits.pipeline_timeout = std::time::Duration::from_secs(1);
+        limits.call_timeout = std::time::Duration::from_secs(1);
+        coordinator.global_execution_limiter = Arc::new(GlobalExecutionLimiter::new(limits));
+        let clause = make_test_clause("ch_blind_cancelled", "投标人必须提交完整的履约方案");
+        coordinator.preload_chunks(std::slice::from_ref(&clause));
+        coordinator.preload_agents();
+
+        coordinator.run_blind_spot().await;
+
+        let snapshot = coordinator.graph.snapshot();
+        let attempt = snapshot
+            .review_attempts
+            .values()
+            .find(|attempt| attempt.chunk_id == "ch_blind_cancelled")
+            .expect("取消前已启动的 BlindSpot 尝试必须保留");
+        assert_eq!(attempt.status, ReviewAttemptStatus::Failed);
+        assert_eq!(
+            attempt.error_code,
+            Some(ReviewAttemptErrorCode::TaskCancelled)
+        );
+        assert!(!snapshot.reviewed_by.contains_key("ch_blind_cancelled"));
+    }
+
+    #[tokio::test]
+    async fn scout_incomplete_output_does_not_count_as_reviewed() {
+        let config = CoordinatorConfig::default();
+        let coordinator = make_runtime_coordinator(config, Arc::new(|| Box::new(FailingLlm)));
+        let clause = make_test_clause("ch_scout_failed", "投标人必须提交完整的履约方案");
+        coordinator.preload_chunks(std::slice::from_ref(&clause));
+        coordinator.preload_agents();
+
+        coordinator.scout_phase(std::slice::from_ref(&clause)).await;
+
+        let snapshot = coordinator.graph.snapshot();
+        let attempt = snapshot
+            .review_attempts
+            .values()
+            .find(|attempt| attempt.chunk_id == "ch_scout_failed")
+            .expect("Scout 失败也必须保留审查尝试");
+        assert_eq!(attempt.status, ReviewAttemptStatus::Failed);
+        assert_eq!(
+            attempt.error_code,
+            Some(ReviewAttemptErrorCode::IncompleteOutput)
+        );
+        assert!(!snapshot.reviewed_by.contains_key("ch_scout_failed"));
+    }
+
+    #[tokio::test]
+    async fn scout_no_risk_counts_as_completed_review() {
+        let config = CoordinatorConfig::default();
+        let coordinator = make_runtime_coordinator(config, Arc::new(|| Box::new(NoRiskLlm)));
+        let clause = make_test_clause("ch_scout_no_risk", "投标人必须提交完整的履约方案");
+        coordinator.preload_chunks(std::slice::from_ref(&clause));
+        coordinator.preload_agents();
+
+        coordinator.scout_phase(std::slice::from_ref(&clause)).await;
+
+        let snapshot = coordinator.graph.snapshot();
+        let attempt = snapshot
+            .review_attempts
+            .values()
+            .find(|attempt| attempt.chunk_id == "ch_scout_no_risk")
+            .expect("Scout NoRisk 必须保留审查尝试");
+        assert_eq!(attempt.status, ReviewAttemptStatus::Completed);
+        assert_eq!(attempt.outcome, Some(ReviewAttemptOutcome::NoRisk));
+        assert!(snapshot.reviewed_by.contains_key("ch_scout_no_risk"));
+    }
+
+    #[tokio::test]
     async fn one_failed_clause_keeps_agent_result_but_marks_partial_failed() {
         let mut config = CoordinatorConfig::default();
         config.enabled_agents = vec![AgentId::FactCheck];
@@ -3806,6 +5242,21 @@ mod tests {
         assert_eq!(
             output.execution_summary.failed_clauses[0].clause_id,
             "ch_failed"
+        );
+        let failed_attempt = output
+            .graph_snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .review_attempts
+                    .values()
+                    .find(|attempt| attempt.chunk_id == "ch_failed")
+            })
+            .expect("崩溃条款必须保留失败尝试");
+        assert_eq!(failed_attempt.status, ReviewAttemptStatus::Failed);
+        assert_eq!(
+            failed_attempt.error_code,
+            Some(ReviewAttemptErrorCode::TaskPanic)
         );
     }
 
@@ -4154,6 +5605,216 @@ mod tests {
             2,
             "同一chunk中的不同风险类别不得因理由或证据文本相似而合并"
         );
+    }
+
+    #[test]
+    fn merge_findings_v3_records_removed_source_to_retained_target() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let mut retained = make_test_finding("R_RETAINED", "ch_001", "FactCheckAgent");
+        retained.confidence = 0.9;
+        retained.category_code = "LOCAL_REGISTRATION".to_string();
+        retained.risk_type = "地域注册限制".to_string();
+        retained.source_quote = "投标人须在本地注册并提供本地服务机构证明".to_string();
+        let mut removed = make_test_finding("R_REMOVED", "ch_001", "SemanticRiskAgent");
+        removed.confidence = 0.8;
+        removed.category_code = "LOCAL_REGISTRATION".to_string();
+        removed.risk_type = "地域注册限制".to_string();
+        removed.source_quote = "投标人须在本地注册并提供本地服务机构证明".to_string();
+
+        let result = coordinator.merge_findings_v3(vec![retained, removed], &|_| {});
+
+        assert_eq!(result.retained.len(), 1);
+        assert_eq!(result.retained[0].risk_id, "R_RETAINED");
+        assert_eq!(
+            result.merged,
+            HashMap::from([("R_REMOVED".to_string(), "R_RETAINED".to_string())])
+        );
+    }
+
+    #[test]
+    fn resolve_merged_findings_follows_two_round_chain_to_final_target() {
+        let final_findings = vec![make_test_finding("R_C", "ch_001", "FactCheckAgent")];
+        let history = vec![
+            HashMap::from([("R_A".to_string(), "R_B".to_string())]),
+            HashMap::from([("R_B".to_string(), "R_C".to_string())]),
+        ];
+
+        let resolved =
+            resolve_merged_findings(&history, &final_findings).expect("合并链应解析成功");
+
+        assert_eq!(
+            resolved,
+            HashMap::from([
+                ("R_A".to_string(), "R_C".to_string()),
+                ("R_B".to_string(), "R_C".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn resolve_merged_findings_omits_chain_without_final_target() {
+        let history = vec![HashMap::from([(
+            "R_PROVISIONAL".to_string(),
+            "R_NOT_FINAL".to_string(),
+        )])];
+
+        let resolved =
+            resolve_merged_findings(&history, &[]).expect("未进入最终集合的链应保持 provisional");
+
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn resolve_merged_findings_rejects_cycle() {
+        let history = vec![HashMap::from([
+            ("R_A".to_string(), "R_B".to_string()),
+            ("R_B".to_string(), "R_A".to_string()),
+        ])];
+
+        let error = resolve_merged_findings(&history, &[]).expect_err("合并链循环必须报错");
+
+        assert!(error.to_string().contains("合并关系存在循环"));
+    }
+
+    #[test]
+    fn finalize_audit_snapshot_aligns_final_fields_and_merged_target() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let clauses = vec![
+            make_test_clause("ch_target", "目标条款"),
+            make_test_clause("ch_source", "来源条款"),
+        ];
+        coordinator.preload_chunks(&clauses);
+        let mut target = make_test_finding("R_TARGET", "ch_target", "FactCheckAgent");
+        target.severity = RiskSeverity::Medium;
+        target.reason = "最终裁决理由".to_string();
+        target.legal_basis = vec!["《最终法》第2条".to_string()];
+        let source = make_test_finding("R_SOURCE", "ch_source", "SemanticRiskAgent");
+        coordinator
+            .graph
+            .upsert_provisional_findings(&[target.clone(), source])
+            .expect("测试 finding 应写入工作图");
+        let merge_history = vec![HashMap::from([(
+            "R_SOURCE".to_string(),
+            "R_TARGET".to_string(),
+        )])];
+
+        let (_, snapshot) = coordinator
+            .finalize_audit_output(std::slice::from_ref(&target), &merge_history)
+            .expect("最终化应成功");
+
+        let confirmed_ids = snapshot
+            .risks
+            .iter()
+            .filter(|(_, node)| node.state == FindingState::Confirmed)
+            .map(|(risk_id, _)| risk_id.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(confirmed_ids, HashSet::from(["R_TARGET".to_string()]));
+        let target_node = &snapshot.risks["R_TARGET"];
+        assert_eq!(target_node.finding.severity, target.severity);
+        assert_eq!(target_node.finding.reason, target.reason);
+        assert_eq!(target_node.finding.legal_basis, target.legal_basis);
+        assert_eq!(target_node.finding.clause_ids, target.clause_ids);
+        let source_node = &snapshot.risks["R_SOURCE"];
+        assert_eq!(source_node.state, FindingState::Merged);
+        assert_eq!(source_node.merged_into.as_deref(), Some("R_TARGET"));
+        assert!(snapshot.finding_transitions.iter().any(|transition| {
+            transition.risk_id == "R_SOURCE"
+                && transition.to == FindingState::Merged
+                && transition.merged_into.as_deref() == Some("R_TARGET")
+        }));
+    }
+
+    #[test]
+    fn finalize_audit_snapshot_propagates_missing_graph_finding() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let finding = make_test_finding("R_MISSING", "ch_missing", "FactCheckAgent");
+
+        let error = coordinator
+            .finalize_audit_output(&[finding], &[])
+            .expect_err("最终 finding 不在工作图中时必须失败");
+
+        assert!(error.to_string().contains("最终 finding 在工作图中不存在"));
+    }
+
+    #[test]
+    fn finalize_audit_output_rebuilds_normalized_findings_in_original_order() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let clauses = vec![
+            make_test_clause("ch_first", "第一条款"),
+            make_test_clause("ch_second", "第二条款"),
+        ];
+        coordinator.preload_chunks(&clauses);
+        let mut first = make_test_finding("R_FIRST", "ch_first", "FactCheckAgent");
+        first.clause_ids = vec!["ch_first".to_string(), "ch_first".to_string()];
+        first.legal_basis = vec!["《测试法》第1条".to_string(), "《测试法》第1条".to_string()];
+        let second = make_test_finding("R_SECOND", "ch_second", "SemanticRiskAgent");
+        coordinator
+            .graph
+            .upsert_provisional_findings(&[first.clone(), second.clone()])
+            .expect("测试 finding 应写入工作图");
+
+        let (normalized, snapshot) = coordinator
+            .finalize_audit_output(&[second, first], &[])
+            .expect("最终化应返回规范化结果");
+
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|finding| finding.risk_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["R_SECOND", "R_FIRST"],
+            "规范化后必须保持 Triage 输出顺序"
+        );
+        assert_eq!(normalized[1].clause_ids, vec!["ch_first"]);
+        assert_eq!(normalized[1].legal_basis, vec!["《测试法》第1条"]);
+        for finding in &normalized {
+            let node = &snapshot.risks[&finding.risk_id];
+            assert_eq!(node.state, FindingState::Confirmed);
+            assert_eq!(
+                serde_json::to_value(finding).expect("finding 应可序列化"),
+                serde_json::to_value(&node.finding).expect("节点 finding 应可序列化"),
+                "API finding 的全部业务字段必须与 Confirmed RiskNode 一致"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn review_returns_only_confirmed_findings_with_matching_snapshot_fields() {
+        let mut config = CoordinatorConfig::default();
+        config.enabled_agents = vec![AgentId::FactCheck];
+        config.enable_legal_verify = false;
+        let coordinator =
+            make_runtime_coordinator(config, Arc::new(|| Box::new(ConditionalSlowFindingLlm)));
+
+        let output = coordinator
+            .review(&[make_test_clause("ch_fast", "封面格式要求")])
+            .await
+            .expect("真实审核路径应完成最终化");
+        let snapshot = output.graph_snapshot.expect("审核结果必须包含最终快照");
+        let output_ids = output
+            .findings
+            .iter()
+            .map(|finding| finding.risk_id.clone())
+            .collect::<HashSet<_>>();
+        let confirmed_ids = snapshot
+            .risks
+            .iter()
+            .filter(|(_, node)| node.state == FindingState::Confirmed)
+            .map(|(risk_id, _)| risk_id.clone())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(output_ids, confirmed_ids);
+        for finding in output.findings {
+            let node = &snapshot.risks[&finding.risk_id];
+            assert_eq!(node.finding.severity, finding.severity);
+            assert_eq!(node.finding.reason, finding.reason);
+            assert_eq!(node.finding.legal_basis, finding.legal_basis);
+            assert_eq!(node.finding.clause_ids, finding.clause_ids);
+        }
     }
 
     // 精确同文跨 chunk：同一句被重叠分块、同一风险被重复审出 → 合并为 1 条，clause 取并集。
@@ -4505,10 +6166,216 @@ mod tests {
 
     // ── 动态 Agent: suggest_agent 注册 ───────────────────────
 
+    fn make_suggested_agent_finding(risk_id: &str, agent_name: &str, keyword: &str) -> RiskFinding {
+        RiskFinding {
+            suggested_agent: Some(SuggestedAgent {
+                agent_name: agent_name.to_string(),
+                agent_prompt: format!("你是{}Agent", agent_name),
+                section_keywords: vec![keyword.to_string()],
+                reason: format!("补充{}检测", agent_name),
+            }),
+            ..make_test_finding(risk_id, "ch_dynamic", "BlindSpotAgent")
+        }
+    }
+
+    fn isolated_dynamic_agent_path(test_name: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!("ai_bid_{}_{}", test_name, uuid::Uuid::new_v4()))
+            .join("dynamic_agents.json")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn independent_coordinators_preserve_concurrent_dynamic_agent_updates() {
+        let path = isolated_dynamic_agent_path("dynamic_concurrent");
+        let store = Arc::new(DynamicAgentStore::new(path.clone()));
+        let mut first =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let mut second =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        first.dynamic_agent_store = store.clone();
+        second.dynamic_agent_store = store;
+        let first_finding = make_suggested_agent_finding("R_FIRST", "First", "第一类");
+        let second_finding = make_suggested_agent_finding("R_SECOND", "Second", "第二类");
+
+        let first_task =
+            tokio::task::spawn_blocking(move || first.register_dynamic_agents(&[first_finding]));
+        let second_task =
+            tokio::task::spawn_blocking(move || second.register_dynamic_agents(&[second_finding]));
+        assert_eq!(
+            first_task
+                .await
+                .expect("首个任务不应 panic")
+                .expect("首项应写入"),
+            1
+        );
+        assert_eq!(
+            second_task
+                .await
+                .expect("第二个任务不应 panic")
+                .expect("第二项应写入"),
+            1
+        );
+
+        let json = std::fs::read_to_string(&path).expect("并发写入后文件应存在");
+        let manifest: DynamicAgentManifest =
+            serde_json::from_str(&json).expect("最终 JSON 应可解析");
+        let ids: HashSet<&str> = manifest
+            .agents
+            .iter()
+            .map(|agent| agent.id.as_str())
+            .collect();
+        assert_eq!(ids, HashSet::from(["Dynamic_First", "Dynamic_Second"]));
+        std::fs::remove_dir_all(path.parent().expect("测试路径应有父目录"))
+            .expect("应清理隔离目录");
+    }
+
+    #[test]
+    fn replacement_failure_preserves_canonical_dynamic_agent_manifest() {
+        let path = isolated_dynamic_agent_path("dynamic_replace_failure");
+        std::fs::create_dir_all(path.parent().expect("测试路径应有父目录"))
+            .expect("应创建隔离目录");
+        let original = br#"{"version":1,"agents":[]}"#;
+        std::fs::write(&path, original).expect("应写入 canonical 原内容");
+        let store = Arc::new(DynamicAgentStore::with_replacer(
+            path.clone(),
+            Arc::new(|_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "模拟替换失败",
+                ))
+            }),
+        ));
+        let mut coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        coordinator.dynamic_agent_store = store;
+        let finding = make_suggested_agent_finding("R_FAIL", "Failure", "失败类");
+
+        let error = coordinator
+            .register_dynamic_agents(&[finding])
+            .expect_err("替换失败必须上报");
+
+        assert!(error.to_string().contains("模拟替换失败"));
+        assert_eq!(std::fs::read(&path).expect("canonical 应保留"), original);
+        assert_eq!(
+            std::fs::read_dir(path.parent().expect("测试路径应有父目录"))
+                .expect("应读取隔离目录")
+                .count(),
+            1,
+            "失败后不得遗留临时文件"
+        );
+        std::fs::remove_dir_all(path.parent().expect("测试路径应有父目录"))
+            .expect("应清理隔离目录");
+    }
+
+    #[test]
+    fn rollback_failure_remains_readable_and_next_load_recovers_canonical() {
+        let path = isolated_dynamic_agent_path("dynamic_rollback_recovery");
+        std::fs::create_dir_all(path.parent().expect("测试路径应有父目录"))
+            .expect("应创建隔离目录");
+        let original = DynamicAgentManifest {
+            version: 1,
+            agents: vec![DynamicAgentDefinition {
+                id: "Dynamic_Original".into(),
+                display_name: "原清单".into(),
+                system_prompt: "保留原清单".into(),
+                default_max_turns: 8,
+                complexity: AgentComplexity::Medium,
+                section_keywords: vec!["原清单".into()],
+                tool_names: vec![],
+                created_at: "2026-01-01T00:00:00Z".into(),
+                created_by: "test".into(),
+                reason: "test".into(),
+                active: false,
+            }],
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&original).unwrap())
+            .expect("应写入 canonical 原内容");
+        let rename_calls = Arc::new(AtomicUsize::new(0));
+        let rename = Arc::new({
+            let rename_calls = rename_calls.clone();
+            move |source: &Path, target: &Path| {
+                let call = rename_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if matches!(call, 2..=4) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("模拟第 {} 次 rename 失败", call),
+                    ));
+                }
+                std::fs::rename(source, target)
+            }
+        });
+        let store = Arc::new(DynamicAgentStore::with_rename_operations(
+            path.clone(),
+            rename,
+        ));
+        let mut coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        coordinator.dynamic_agent_store = store.clone();
+        let finding = make_suggested_agent_finding("R_RECOVERY", "Recovery", "恢复类");
+
+        coordinator
+            .register_dynamic_agents(&[finding])
+            .expect_err("替换和首次回滚应失败");
+        assert!(!path.exists(), "双重失败后 canonical 暂时缺失");
+        let first_load = store
+            .read_manifest()
+            .expect("恢复 rename 失败时仍应从 backup 读取")
+            .expect("backup 中应有原清单");
+        assert_eq!(first_load.agents[0].id, "Dynamic_Original");
+        assert!(!path.exists(), "首次恢复失败应保留可重试状态");
+
+        let second_load = store
+            .read_manifest()
+            .expect("下一次恢复应成功")
+            .expect("恢复后应读到原清单");
+        assert_eq!(second_load.agents[0].id, "Dynamic_Original");
+        assert!(path.exists(), "canonical 应恢复");
+        let retry_finding = make_suggested_agent_finding("R_RECOVERY_RETRY", "Recovery", "恢复类");
+        assert_eq!(
+            coordinator
+                .register_dynamic_agents(&[retry_finding])
+                .expect("恢复后 append 应可安全重试"),
+            1
+        );
+        let recovered: DynamicAgentManifest =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("重试后 canonical 应可读"))
+                .expect("重试后 canonical JSON 应合法");
+        assert_eq!(recovered.agents.len(), 2);
+        assert_eq!(
+            std::fs::read_dir(path.parent().expect("测试路径应有父目录"))
+                .expect("应读取隔离目录")
+                .count(),
+            1,
+            "恢复成功后 backup/temp 应清理"
+        );
+        std::fs::remove_dir_all(path.parent().expect("测试路径应有父目录"))
+            .expect("应清理隔离目录");
+    }
+
+    #[test]
+    fn multiple_recovery_backups_are_rejected_deterministically() {
+        let path = isolated_dynamic_agent_path("dynamic_multiple_backups");
+        let parent = path.parent().expect("测试路径应有父目录").to_path_buf();
+        std::fs::create_dir_all(&parent).expect("应创建隔离目录");
+        let deterministic = dynamic_agent_backup_path(&path).expect("应生成确定性备份路径");
+        let legacy = parent.join(".dynamic_agents.backup-legacy");
+        std::fs::write(&deterministic, br#"{"version":1,"agents":[]}"#).expect("应写入确定性备份");
+        std::fs::write(&legacy, br#"{"version":1,"agents":[]}"#).expect("应写入遗留备份");
+        let store = DynamicAgentStore::new(path);
+
+        let error = store.read_manifest().expect_err("多个备份必须拒绝随机选择");
+
+        assert!(error.to_string().contains("发现多个动态 Agent 恢复备份"));
+        assert!(error.to_string().contains("拒绝随机选择"));
+        std::fs::remove_dir_all(parent).expect("应清理隔离目录");
+    }
+
     #[test]
     fn test_register_dynamic_agents_from_findings() {
-        let coordinator =
+        let mut coordinator =
             make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let original_path = isolated_dynamic_agent_path("dynamic_register");
+        coordinator.dynamic_agent_store = Arc::new(DynamicAgentStore::new(original_path.clone()));
 
         let finding = RiskFinding {
             suggested_agent: Some(SuggestedAgent {
@@ -4520,16 +6387,9 @@ mod tests {
             ..make_test_finding("R_001", "ch_001", "BlindSpotAgent")
         };
 
-        // 注意: register_dynamic_agents 会写入 agents/dynamic_agents.json
-        // 测试环境下我们先 backup 原文件，测试完恢复
-        let backup_path = data_path_str("agents/dynamic_agents.json.bak");
-        let original_path = data_path_str("agents/dynamic_agents.json");
-        let original_exists = std::path::Path::new(&original_path).exists();
-        if original_exists {
-            std::fs::rename(&original_path, &backup_path).ok();
-        }
-
-        let registered = coordinator.register_dynamic_agents(&[finding]);
+        let registered = coordinator
+            .register_dynamic_agents(&[finding])
+            .expect("动态 Agent 应写入");
         assert_eq!(registered, 1, "应注册 1 个动态 Agent");
 
         // 验证文件被写入
@@ -4542,10 +6402,8 @@ mod tests {
         assert_eq!(manifest.agents[0].tool_names.len(), 4);
 
         // 清理恢复
-        std::fs::remove_file(&original_path).ok();
-        if original_exists {
-            std::fs::rename(&backup_path, &original_path).ok();
-        }
+        std::fs::remove_dir_all(original_path.parent().expect("测试路径应有父目录"))
+            .expect("应清理隔离目录");
     }
 
     #[test]
@@ -4555,7 +6413,9 @@ mod tests {
 
         // 没有 suggested_agent 的 finding
         let finding = make_test_finding("R_001", "ch_001", "FactCheckAgent");
-        let registered = coordinator.register_dynamic_agents(&[finding]);
+        let registered = coordinator
+            .register_dynamic_agents(&[finding])
+            .expect("无建议时不应失败");
         assert_eq!(registered, 0);
     }
 
@@ -4574,7 +6434,9 @@ mod tests {
             ..make_test_finding("R_001", "ch_001", "BlindSpotAgent")
         };
 
-        let registered = coordinator.register_dynamic_agents(&[finding]);
+        let registered = coordinator
+            .register_dynamic_agents(&[finding])
+            .expect("空 prompt 跳过时不应失败");
         assert_eq!(registered, 0, "空 prompt 应被跳过");
     }
 
@@ -4584,12 +6446,8 @@ mod tests {
     fn test_load_dynamic_agents_file_not_exists() {
         let mut coordinator =
             make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
-
-        // 确保文件不存在（测试环境应该没有）
-        if std::path::Path::new(&data_path_str("agents/dynamic_agents.json")).exists() {
-            // 跳过此测试以免影响已存在的文件
-            return;
-        }
+        let path = isolated_dynamic_agent_path("dynamic_missing");
+        coordinator.dynamic_agent_store = Arc::new(DynamicAgentStore::new(path));
 
         let loaded = coordinator.load_dynamic_agents().expect("不应报错");
         assert_eq!(loaded, 0);
@@ -4615,26 +6473,22 @@ mod tests {
             }],
         };
 
-        let backup_path = data_path_str("agents/dynamic_agents.json.bak");
-        let original_path = data_path_str("agents/dynamic_agents.json");
-        let original_exists = std::path::Path::new(&original_path).exists();
-        if original_exists {
-            std::fs::rename(&original_path, &backup_path).ok();
-        }
+        let original_path = isolated_dynamic_agent_path("dynamic_inactive");
+        std::fs::create_dir_all(original_path.parent().expect("测试路径应有父目录"))
+            .expect("应创建隔离目录");
 
         let json = serde_json::to_string_pretty(&manifest).unwrap();
         std::fs::write(&original_path, &json).unwrap();
 
         let mut coordinator =
             make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        coordinator.dynamic_agent_store = Arc::new(DynamicAgentStore::new(original_path.clone()));
         let loaded = coordinator.load_dynamic_agents().expect("不应报错");
         assert_eq!(loaded, 0, "active=false 的 Agent 不应被加载");
 
         // 清理恢复
-        std::fs::remove_file(&original_path).ok();
-        if original_exists {
-            std::fs::rename(&backup_path, &original_path).ok();
-        }
+        std::fs::remove_dir_all(original_path.parent().expect("测试路径应有父目录"))
+            .expect("应清理隔离目录");
     }
 
     // ── is_frontmatter_section ────────────────────────────────
