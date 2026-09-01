@@ -3036,8 +3036,7 @@ impl Coordinator {
 
         // 高风险发现摘要
         let high_risks: Vec<&RiskNode> = snapshot
-            .risks
-            .values()
+            .agent_visible_risks()
             .filter(|r| r.finding.severity == RiskSeverity::High && !r.finding.no_risk)
             .collect();
         if !high_risks.is_empty() {
@@ -3071,12 +3070,10 @@ impl Coordinator {
         }
 
         // same_law 边
-        if !snapshot.same_law.is_empty() {
-            ctx.push_str(&format!(
-                "### 同法条关联 ({} 条边)\n\n",
-                snapshot.same_law.len()
-            ));
-            for (cid, others) in &snapshot.same_law {
+        let same_law = snapshot.agent_visible_same_law();
+        if !same_law.is_empty() {
+            ctx.push_str(&format!("### 同法条关联 ({} 条边)\n\n", same_law.len()));
+            for (cid, others) in &same_law {
                 if !others.is_empty() {
                     ctx.push_str(&format!("- {} 共享法条: {}\n", cid, others.join(", ")));
                 }
@@ -3086,8 +3083,7 @@ impl Coordinator {
 
         // Scout Hypothesis 覆盖度（已初筛维度参考）
         let hypotheses: Vec<&RiskNode> = snapshot
-            .risks
-            .values()
+            .agent_visible_risks()
             .filter(|r| r.finding.finding_role == FindingRole::Hypothesis)
             .collect();
         if !hypotheses.is_empty() {
@@ -3144,11 +3140,7 @@ impl Coordinator {
             .keys()
             .filter(|cid| {
                 let reviewed = snapshot.reviewed_by.get(*cid).map(|v| v.len()).unwrap_or(0);
-                let has_risk = snapshot
-                    .has_risk
-                    .get(*cid)
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false);
+                let has_risk = snapshot.has_confirmed_risk(cid);
 
                 // 跳过 L1 格式条款和 frontmatter
                 if let Some(chunk) = snapshot.chunks.get(*cid)
@@ -3425,7 +3417,7 @@ impl Coordinator {
             snapshot
                 .chunks
                 .keys()
-                .filter(|cid| !snapshot.has_risk.contains_key(*cid))
+                .filter(|cid| !snapshot.has_confirmed_risk(cid))
                 .collect()
         };
 
@@ -4427,6 +4419,76 @@ mod tests {
         assert!(!findings[0].no_risk);
         assert!(findings[0].reason.contains("覆盖不足"));
         assert!(!findings[0].reason.contains("未被任何 Agent 审查"));
+    }
+
+    #[tokio::test]
+    async fn blind_spot_keeps_single_review_candidate_with_only_provisional_risk() {
+        let mut config = CoordinatorConfig::default();
+        config.blind_spot_fallback_enabled = true;
+        let mut registry = AgentRegistry::builtin();
+        registry.remove_for_test(&AgentId::BlindSpot);
+        let coordinator = make_test_coordinator(config, registry);
+        let clause = make_test_clause("ch_provisional", "投标人必须提交完整的履约方案");
+        coordinator.preload_chunks(std::slice::from_ref(&clause));
+        let attempt_id = coordinator
+            .graph
+            .start_review_attempt(AgentId::FactCheck, &clause.chunk_id)
+            .expect("应创建已有 Agent 的审查尝试");
+        coordinator
+            .graph
+            .commit_review_result(
+                &attempt_id,
+                ReviewAttemptOutcome::Findings,
+                &[make_test_finding(
+                    "R_PROVISIONAL",
+                    &clause.chunk_id,
+                    "FactCheck",
+                )],
+            )
+            .expect("provisional finding 应正常提交");
+        let execution_control = coordinator.global_execution_limiter.start_review(1, 1);
+
+        let findings = coordinator.blind_spot_scan(execution_control).await;
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "未决风险不得阻止覆盖不足条款进入补充审查"
+        );
+        assert_eq!(findings[0].clause_ids, vec!["ch_provisional"]);
+    }
+
+    #[test]
+    fn blind_spot_context_excludes_terminal_risks_and_their_same_law_edges() {
+        let coordinator =
+            make_test_coordinator(CoordinatorConfig::default(), AgentRegistry::builtin());
+        let confirmed_clause = make_test_clause("ch_confirmed", "确认条款");
+        let rejected_clause = make_test_clause("ch_rejected", "驳回条款");
+        coordinator.preload_chunks(&[confirmed_clause.clone(), rejected_clause.clone()]);
+        let confirmed = make_test_finding("R_CONFIRMED", &confirmed_clause.chunk_id, "FactCheck");
+        let mut rejected = make_test_finding("R_REJECTED", &rejected_clause.chunk_id, "FactCheck");
+        rejected.risk_type = "已拒绝风险".to_string();
+        coordinator
+            .graph
+            .upsert_provisional_findings(&[confirmed.clone(), rejected])
+            .expect("应写入测试风险");
+        coordinator
+            .graph
+            .finalize_audit(
+                &[confirmed],
+                &HashMap::new(),
+                &HashMap::from([("R_REJECTED".to_string(), "证据不足".to_string())]),
+            )
+            .expect("最终裁决应成功");
+
+        let context = coordinator.build_blind_spot_context(&coordinator.graph.snapshot());
+
+        assert!(!context.contains("已拒绝风险"));
+        assert!(!context.contains("ch_confirmed 共享法条: ch_rejected"));
+        assert!(
+            !context.contains("### 同法条关联"),
+            "只有一个可见条款引用法条时不得生成空关系标题"
+        );
     }
 
     #[tokio::test]

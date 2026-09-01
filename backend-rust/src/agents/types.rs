@@ -12,7 +12,7 @@
 //! - [`ChatAgentConfig`] — ChatAgent 运行时配置
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use utoipa::ToSchema;
 
 // ─── 风险分级 ──────────────────────────────────────────────────
@@ -1385,7 +1385,153 @@ pub struct GraphSnapshot {
     pub chunk_versions: HashMap<String, u64>,
 }
 
+pub(crate) fn is_agent_visible_risk(risk: &RiskNode) -> bool {
+    matches!(
+        risk.state,
+        FindingState::Provisional | FindingState::Confirmed
+    )
+}
+
+pub(crate) fn agent_visible_same_law_chunks(
+    risks: &HashMap<String, RiskNode>,
+    has_risk: &HashMap<String, Vec<String>>,
+    cites: &HashMap<String, Vec<String>>,
+    cited_by: &HashMap<String, Vec<String>>,
+    chunk_id: &str,
+) -> Vec<String> {
+    let mut source_laws = BTreeSet::new();
+    for risk_id in has_risk.get(chunk_id).into_iter().flatten() {
+        let Some(risk) = risks.get(risk_id) else {
+            continue;
+        };
+        if !is_agent_visible_risk(risk) || risk.finding.finding_role == FindingRole::Hypothesis {
+            continue;
+        }
+        for law_ref in cites.get(risk_id).into_iter().flatten() {
+            if cited_by
+                .get(law_ref)
+                .is_some_and(|risk_ids| risk_ids.contains(risk_id))
+            {
+                source_laws.insert(law_ref.clone());
+            }
+        }
+    }
+    if source_laws.is_empty() {
+        return Vec::new();
+    }
+
+    let mut related_risk_ids = HashSet::new();
+    for law_ref in source_laws {
+        for risk_id in cited_by.get(&law_ref).into_iter().flatten() {
+            let cites_law = cites
+                .get(risk_id)
+                .is_some_and(|law_refs| law_refs.contains(&law_ref));
+            let is_visible = risks.get(risk_id).is_some_and(|risk| {
+                is_agent_visible_risk(risk) && risk.finding.finding_role != FindingRole::Hypothesis
+            });
+            if cites_law && is_visible {
+                related_risk_ids.insert(risk_id.clone());
+            }
+        }
+    }
+
+    let mut chunks = BTreeSet::new();
+    for (other_chunk_id, risk_ids) in has_risk {
+        if other_chunk_id != chunk_id
+            && risk_ids
+                .iter()
+                .any(|risk_id| related_risk_ids.contains(risk_id))
+        {
+            chunks.insert(other_chunk_id.clone());
+        }
+    }
+    chunks.into_iter().collect()
+}
+
+/// 基于双向事务索引构建 Agent 可见的同法条关系。
+pub(crate) fn build_agent_visible_same_law(
+    risks: &HashMap<String, RiskNode>,
+    has_risk: &HashMap<String, Vec<String>>,
+    cites: &HashMap<String, Vec<String>>,
+    cited_by: &HashMap<String, Vec<String>>,
+) -> HashMap<String, Vec<String>> {
+    let mut indexed_chunks_by_risk: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for (chunk_id, risk_ids) in has_risk {
+        for risk_id in risk_ids {
+            let is_visible = risks.get(risk_id).is_some_and(|risk| {
+                is_agent_visible_risk(risk) && risk.finding.finding_role != FindingRole::Hypothesis
+            });
+            if is_visible {
+                indexed_chunks_by_risk
+                    .entry(risk_id.clone())
+                    .or_default()
+                    .insert(chunk_id.clone());
+            }
+        }
+    }
+
+    let mut related_by_chunk: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for (law_ref, risk_ids) in cited_by {
+        let mut law_chunks = BTreeSet::new();
+        for risk_id in risk_ids {
+            if !cites
+                .get(risk_id)
+                .is_some_and(|law_refs| law_refs.contains(law_ref))
+            {
+                continue;
+            }
+            if let Some(indexed_chunks) = indexed_chunks_by_risk.get(risk_id) {
+                law_chunks.extend(indexed_chunks.iter().cloned());
+            }
+        }
+        if law_chunks.len() < 2 {
+            continue;
+        }
+
+        for chunk_id in &law_chunks {
+            let related = related_by_chunk.entry(chunk_id.clone()).or_default();
+            related.extend(
+                law_chunks
+                    .iter()
+                    .filter(|other_chunk_id| *other_chunk_id != chunk_id)
+                    .cloned(),
+            );
+        }
+    }
+
+    related_by_chunk
+        .into_iter()
+        .map(|(chunk_id, related)| (chunk_id, related.into_iter().collect()))
+        .collect()
+}
+
 impl GraphSnapshot {
+    /// 判断条款是否存在已经由 Coordinator 确认的风险。
+    ///
+    /// 完整快照会保留 provisional、merged 和 rejected 节点用于审计，
+    /// 工作态消费者不得仅凭 `has_risk` 是否非空判断风险已经成立。
+    pub fn has_confirmed_risk(&self, chunk_id: &str) -> bool {
+        self.has_risk.get(chunk_id).is_some_and(|risk_ids| {
+            risk_ids.iter().any(|risk_id| {
+                self.risks
+                    .get(risk_id)
+                    .is_some_and(|risk| risk.state == FindingState::Confirmed)
+            })
+        })
+    }
+
+    /// 返回 Agent 工作上下文允许读取的风险节点。
+    pub fn agent_visible_risks(&self) -> impl Iterator<Item = &RiskNode> {
+        self.risks
+            .values()
+            .filter(|risk| is_agent_visible_risk(risk))
+    }
+
+    /// 基于 Agent 可见风险构建同法条工作态关系，不复用全量审计边。
+    pub fn agent_visible_same_law(&self) -> HashMap<String, Vec<String>> {
+        build_agent_visible_same_law(&self.risks, &self.has_risk, &self.cites, &self.cited_by)
+    }
+
     /// 创建空的快照。
     pub fn new() -> Self {
         Self {

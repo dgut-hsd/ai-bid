@@ -81,6 +81,23 @@ fn deduplicate_strings(values: &[String]) -> Vec<String> {
     unique
 }
 
+/// 返回 Agent 工作态同法条邻接发生变化的条款。
+fn changed_agent_same_law_chunks(
+    before: &HashMap<String, Vec<String>>,
+    after: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut changed = before
+        .keys()
+        .chain(after.keys())
+        .filter(|chunk_id| before.get(*chunk_id) != after.get(*chunk_id))
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed
+}
+
 fn normalize_provisional_findings(findings: &[RiskFinding]) -> Result<Vec<RiskNode>, String> {
     let mut nodes = Vec::new();
     let mut risk_ids = HashSet::new();
@@ -277,10 +294,57 @@ impl SessionGraph {
         Ok(())
     }
 
+    fn agent_visible_same_law_in_state(state: &GraphState) -> HashMap<String, Vec<String>> {
+        build_agent_visible_same_law(&state.risks, &state.has_risk, &state.cites, &state.cited_by)
+    }
+
+    /// 合并直接变化的风险和受影响法条，并在整批事务中只扫描一次 has_risk。
+    fn indexed_chunks_for_changes_in_state(
+        state: &GraphState,
+        direct_risk_ids: &[String],
+        law_refs: &[String],
+    ) -> Vec<String> {
+        if direct_risk_ids.is_empty() && law_refs.is_empty() {
+            return Vec::new();
+        }
+        let mut related_risk_ids = direct_risk_ids.iter().cloned().collect::<HashSet<_>>();
+        for law_ref in law_refs {
+            for risk_id in state.cited_by.get(law_ref).into_iter().flatten() {
+                let cites_law = state
+                    .cites
+                    .get(risk_id)
+                    .is_some_and(|cites| cites.contains(law_ref));
+                let is_visible = state.risks.get(risk_id).is_some_and(|risk| {
+                    is_agent_visible_risk(risk)
+                        && risk.finding.finding_role != FindingRole::Hypothesis
+                });
+                if cites_law && is_visible {
+                    related_risk_ids.insert(risk_id.clone());
+                }
+            }
+        }
+        if related_risk_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut chunks = state
+            .has_risk
+            .iter()
+            .filter(|(_, risk_ids)| {
+                risk_ids
+                    .iter()
+                    .any(|risk_id| related_risk_ids.contains(risk_id))
+            })
+            .map(|(chunk_id, _)| chunk_id.clone())
+            .collect::<Vec<_>>();
+        chunks.sort();
+        chunks
+    }
+
     fn upsert_provisional_node_in_state(
         state: &mut GraphState,
         node: &RiskNode,
-    ) -> (Vec<String>, bool) {
+    ) -> (Vec<String>, Vec<String>, bool) {
         let risk_id = node.finding.risk_id.clone();
         let mut affected = Vec::new();
         let mut changed = false;
@@ -336,10 +400,15 @@ impl SessionGraph {
                 }
             }
         }
+        let affected_law_refs = if changed && !is_hypothesis {
+            node.law_refs.clone()
+        } else {
+            Vec::new()
+        };
         if changed {
             affected.extend(node.finding.clause_ids.clone());
         }
-        (deduplicate_strings(&affected), changed)
+        (deduplicate_strings(&affected), affected_law_refs, changed)
     }
 
     /// 按当前 RiskNode 全量重建风险派生索引，避免最终字段覆盖后残留旧边。
@@ -502,10 +571,22 @@ impl SessionGraph {
         Self::validate_risk_conflicts(&state, &nodes)?;
 
         let mut affected = vec![attempt_chunk.clone()];
+        let mut affected_law_refs = Vec::new();
+        let mut changed_risk_ids = Vec::new();
         for node in &nodes {
-            let (node_affected, _) = Self::upsert_provisional_node_in_state(&mut state, node);
+            let (node_affected, node_law_refs, node_changed) =
+                Self::upsert_provisional_node_in_state(&mut state, node);
             affected.extend(node_affected);
+            affected_law_refs.extend(node_law_refs);
+            if node_changed {
+                changed_risk_ids.push(node.finding.risk_id.clone());
+            }
         }
+        affected.extend(Self::indexed_chunks_for_changes_in_state(
+            &state,
+            &deduplicate_strings(&changed_risk_ids),
+            &deduplicate_strings(&affected_law_refs),
+        ));
         let finding_ids = nodes
             .iter()
             .map(|node| node.finding.risk_id.clone())
@@ -542,11 +623,17 @@ impl SessionGraph {
         Self::validate_risk_conflicts(&state, &nodes)?;
 
         let mut affected = Vec::new();
+        let mut affected_law_refs = Vec::new();
+        let mut changed_risk_ids = Vec::new();
         let mut changed = false;
         for node in &nodes {
-            let (node_affected, node_changed) =
+            let (node_affected, node_law_refs, node_changed) =
                 Self::upsert_provisional_node_in_state(&mut state, node);
             affected.extend(node_affected);
+            affected_law_refs.extend(node_law_refs);
+            if node_changed {
+                changed_risk_ids.push(node.finding.risk_id.clone());
+            }
             changed |= node_changed;
         }
         if !changed {
@@ -555,6 +642,11 @@ impl SessionGraph {
                 chunk_versions: HashMap::new(),
             });
         }
+        affected.extend(Self::indexed_chunks_for_changes_in_state(
+            &state,
+            &deduplicate_strings(&changed_risk_ids),
+            &deduplicate_strings(&affected_law_refs),
+        ));
         let affected = deduplicate_strings(&affected);
         let graph_version = bump_versions(&mut state, affected.clone());
         Ok(Self::build_graph_commit(&state, graph_version, &affected))
@@ -829,6 +921,7 @@ impl SessionGraph {
 
         let old_has_risk = state.has_risk.clone();
         let old_same_law = state.same_law.clone();
+        let old_agent_same_law = Self::agent_visible_same_law_in_state(&state);
         let decided_at = chrono::Utc::now().to_rfc3339();
         let mut new_transitions = Vec::new();
         for (risk_id, finding) in normalized_finals {
@@ -901,6 +994,7 @@ impl SessionGraph {
             .sort_by(|left, right| left.risk_id.cmp(&right.risk_id));
 
         Self::rebuild_risk_indexes(&mut state);
+        let new_agent_same_law = Self::agent_visible_same_law_in_state(&state);
         for chunk_id in old_has_risk.keys().chain(state.has_risk.keys()) {
             if old_has_risk.get(chunk_id) != state.has_risk.get(chunk_id) {
                 affected.insert(chunk_id.clone());
@@ -911,6 +1005,10 @@ impl SessionGraph {
                 affected.insert(chunk_id.clone());
             }
         }
+        affected.extend(changed_agent_same_law_chunks(
+            &old_agent_same_law,
+            &new_agent_same_law,
+        ));
         let mut affected = affected.into_iter().collect::<Vec<_>>();
         affected.sort();
         let graph_version = bump_versions(&mut state, affected.clone());
@@ -1009,28 +1107,44 @@ impl SessionGraph {
     pub fn add_risk(&self, mut risk: RiskNode) {
         // 从 RiskFinding.legal_basis 提取法条引用
         risk.law_refs = risk.finding.legal_basis.clone();
+        let risk_id = risk.finding.risk_id.clone();
         if let Ok(mut state) = self.state.write() {
-            if !Self::is_valid_legacy_risk_input(&risk)
-                || Self::is_terminal_risk(&state, &risk.finding.risk_id)
+            if !Self::is_valid_legacy_risk_input(&risk) || Self::is_terminal_risk(&state, &risk_id)
             {
                 return;
             }
+            let before = Self::agent_visible_same_law_in_state(&state);
             let chunk_ids = risk.finding.clause_ids.clone();
-            state.risks.insert(risk.finding.risk_id.clone(), risk);
-            bump_versions(&mut state, chunk_ids);
+            state.risks.insert(risk_id.clone(), risk);
+            let after = Self::agent_visible_same_law_in_state(&state);
+            let mut affected = chunk_ids;
+            affected.extend(Self::indexed_chunks_for_changes_in_state(
+                &state,
+                std::slice::from_ref(&risk_id),
+                &[],
+            ));
+            affected.extend(changed_agent_same_law_chunks(&before, &after));
+            bump_versions(&mut state, affected);
         }
     }
 
     /// 添加 has_risk 边（chunk → risk）。
     pub fn add_has_risk(&self, chunk_id: &str, risk_id: &str) {
-        if let Ok(mut state) = self.state.write()
-            && !Self::is_terminal_risk(&state, risk_id)
-            && push_unique(
+        if let Ok(mut state) = self.state.write() {
+            if Self::is_terminal_risk(&state, risk_id) {
+                return;
+            }
+            let before = Self::agent_visible_same_law_in_state(&state);
+            if !push_unique(
                 state.has_risk.entry(chunk_id.to_string()).or_default(),
                 risk_id.to_string(),
-            )
-        {
-            bump_versions(&mut state, [chunk_id.to_string()]);
+            ) {
+                return;
+            }
+            let after = Self::agent_visible_same_law_in_state(&state);
+            let mut affected = vec![chunk_id.to_string()];
+            affected.extend(changed_agent_same_law_chunks(&before, &after));
+            bump_versions(&mut state, affected);
         }
     }
 
@@ -1101,7 +1215,15 @@ impl SessionGraph {
         self.state
             .read()
             .ok()
-            .and_then(|state| state.same_law.get(chunk_id).cloned())
+            .map(|state| {
+                agent_visible_same_law_chunks(
+                    &state.risks,
+                    &state.has_risk,
+                    &state.cites,
+                    &state.cited_by,
+                    chunk_id,
+                )
+            })
             .unwrap_or_default()
     }
 
@@ -1184,6 +1306,7 @@ impl SessionGraph {
             if Self::is_terminal_risk(&state, risk_id) {
                 return;
             }
+            let before = Self::agent_visible_same_law_in_state(&state);
             let cites_changed = push_unique(
                 state.cites.entry(risk_id.to_string()).or_default(),
                 law_ref.to_string(),
@@ -1198,6 +1321,9 @@ impl SessionGraph {
                     .get(risk_id)
                     .map(|risk| risk.finding.clause_ids.clone())
                     .unwrap_or_default();
+                let after = Self::agent_visible_same_law_in_state(&state);
+                let mut affected = affected;
+                affected.extend(changed_agent_same_law_chunks(&before, &after));
                 bump_versions(&mut state, affected);
             }
         }
@@ -1213,6 +1339,7 @@ impl SessionGraph {
             {
                 return;
             }
+            let before = Self::agent_visible_same_law_in_state(&state);
             state.risks.insert(risk_id.clone(), risk);
             push_unique(
                 state.has_risk.entry(chunk_id.to_string()).or_default(),
@@ -1223,6 +1350,13 @@ impl SessionGraph {
             affected.extend(Self::derive_same_law_edges_in_state(
                 &mut state, &law_refs, chunk_id,
             ));
+            let after = Self::agent_visible_same_law_in_state(&state);
+            affected.extend(Self::indexed_chunks_for_changes_in_state(
+                &state,
+                std::slice::from_ref(&risk_id),
+                &[],
+            ));
+            affected.extend(changed_agent_same_law_chunks(&before, &after));
             bump_versions(&mut state, affected);
         }
     }
@@ -1237,6 +1371,7 @@ impl SessionGraph {
             {
                 return;
             }
+            let before = Self::agent_visible_same_law_in_state(&state);
             state.risks.insert(risk_id.clone(), risk);
             push_unique(
                 state.has_risk.entry(chunk_id.to_string()).or_default(),
@@ -1245,7 +1380,15 @@ impl SessionGraph {
             for law_ref in law_refs {
                 push_unique(state.cites.entry(risk_id.clone()).or_default(), law_ref);
             }
-            bump_versions(&mut state, [chunk_id.to_string()]);
+            let after = Self::agent_visible_same_law_in_state(&state);
+            let mut affected = vec![chunk_id.to_string()];
+            affected.extend(Self::indexed_chunks_for_changes_in_state(
+                &state,
+                std::slice::from_ref(&risk_id),
+                &[],
+            ));
+            affected.extend(changed_agent_same_law_chunks(&before, &after));
+            bump_versions(&mut state, affected);
         }
     }
 
@@ -1310,16 +1453,17 @@ impl SessionGraph {
         let risks = risk_ids
             .iter()
             .filter_map(|risk_id| state.risks.get(risk_id))
-            .filter(|risk| {
-                matches!(
-                    risk.state,
-                    FindingState::Provisional | FindingState::Confirmed
-                )
-            })
+            .filter(|risk| is_agent_visible_risk(risk))
             .map(|risk| risk.finding.clone())
             .collect();
         let linked_chunks = state.linked_to.get(chunk_id).cloned().unwrap_or_default();
-        let same_law_chunks = state.same_law.get(chunk_id).cloned().unwrap_or_default();
+        let same_law_chunks = agent_visible_same_law_chunks(
+            &state.risks,
+            &state.has_risk,
+            &state.cites,
+            &state.cited_by,
+            chunk_id,
+        );
         let contradictions = state
             .contradicts
             .get(chunk_id)
@@ -1375,21 +1519,36 @@ impl SessionGraph {
         })
     }
 
-    /// 查询引用同一法条的所有 chunk_id（通过 cited_by 反向索引 O(1) 查询）。
+    /// 查询引用同一法条的所有 chunk_id，以 cites/cited_by 和 has_risk 双向事务索引为准。
     pub fn query_same_law_chunks(&self, law_ref: &str) -> Vec<String> {
         let mut result = Vec::new();
         if let Ok(state) = self.state.read()
             && let Some(risk_ids) = state.cited_by.get(law_ref)
         {
-            for risk_id in risk_ids {
-                if let Some(risk) = state.risks.get(risk_id) {
-                    for chunk_id in &risk.finding.clause_ids {
-                        if !result.contains(chunk_id) {
-                            result.push(chunk_id.clone());
-                        }
-                    }
+            let visible_risk_ids = risk_ids
+                .iter()
+                .filter(|risk_id| {
+                    let cites_law = state
+                        .cites
+                        .get(*risk_id)
+                        .is_some_and(|law_refs| law_refs.iter().any(|item| item == law_ref));
+                    let is_visible = state.risks.get(*risk_id).is_some_and(|risk| {
+                        is_agent_visible_risk(risk)
+                            && risk.finding.finding_role != FindingRole::Hypothesis
+                    });
+                    cites_law && is_visible
+                })
+                .cloned()
+                .collect::<HashSet<_>>();
+            for (chunk_id, indexed_risk_ids) in &state.has_risk {
+                if indexed_risk_ids
+                    .iter()
+                    .any(|risk_id| visible_risk_ids.contains(risk_id))
+                {
+                    result.push(chunk_id.clone());
                 }
             }
+            result.sort();
         }
         result
     }
@@ -1838,6 +1997,190 @@ mod tests {
         });
     }
 
+    #[test]
+    fn legacy_add_has_risk_invalidates_existing_same_law_neighbor_versions() {
+        let graph = SessionGraph::new();
+        graph.add_chunks(vec![
+            make_test_chunk("ch_a"),
+            make_test_chunk("ch_b"),
+            make_test_chunk("ch_extra"),
+        ]);
+        graph.add_risk_with_edges(make_test_risk("R_A", "ch_a"), "ch_a");
+        graph.add_risk_with_edges(make_test_risk("R_B", "ch_b"), "ch_b");
+        let old_version = graph.snapshot().chunk_versions["ch_b"];
+        assert_eq!(
+            graph.query_clause_context("ch_b").same_law_chunks,
+            vec!["ch_a"]
+        );
+
+        graph.add_has_risk("ch_extra", "R_A");
+
+        let changed = graph
+            .query_clause_context_since("ch_b", Some(old_version))
+            .expect("新增 has_risk 关系必须使既有同法条邻居版本失效");
+        assert_eq!(changed.context.same_law_chunks, vec!["ch_a", "ch_extra"]);
+        assert!(changed.version > old_version);
+    }
+
+    #[test]
+    fn legacy_add_cites_invalidates_existing_same_law_neighbor_versions() {
+        let graph = SessionGraph::new();
+        graph.add_chunks(vec![make_test_chunk("ch_a"), make_test_chunk("ch_b")]);
+        let mut risk_a = make_test_risk("R_A", "ch_a");
+        risk_a.finding.legal_basis = vec!["《另一测试法》第2条".to_string()];
+        graph.add_risk_with_edges(risk_a, "ch_a");
+        graph.add_risk_with_edges(make_test_risk("R_B", "ch_b"), "ch_b");
+        let old_version = graph.snapshot().chunk_versions["ch_b"];
+        assert!(
+            graph
+                .query_clause_context("ch_b")
+                .same_law_chunks
+                .is_empty()
+        );
+
+        graph.add_cites("R_A", "《测试法》第1条");
+
+        let changed = graph
+            .query_clause_context_since("ch_b", Some(old_version))
+            .expect("新增 cites 关系必须使既有同法条邻居版本失效");
+        assert_eq!(changed.context.same_law_chunks, vec!["ch_a"]);
+        assert!(changed.version > old_version);
+    }
+
+    #[test]
+    fn provisional_upsert_invalidates_legacy_indexed_same_law_neighbors() {
+        let graph = SessionGraph::new();
+        graph.add_chunks(vec![
+            make_test_chunk("ch_a"),
+            make_test_chunk("ch_legacy"),
+            make_test_chunk("ch_b"),
+        ]);
+        graph.add_risk_with_edges(make_test_risk("R_A", "ch_a"), "ch_a");
+        graph.add_has_risk("ch_legacy", "R_A");
+        let old_version = graph.snapshot().chunk_versions["ch_legacy"];
+        assert_eq!(
+            graph.query_clause_context("ch_legacy").same_law_chunks,
+            vec!["ch_a"]
+        );
+
+        graph
+            .upsert_provisional_findings(&[make_test_risk("R_B", "ch_b").finding])
+            .expect("正常 provisional 提交应成功");
+
+        let changed = graph
+            .query_clause_context_since("ch_legacy", Some(old_version))
+            .expect("正常提交必须使兼容索引中的既有同法条邻居版本失效");
+        assert_eq!(changed.context.same_law_chunks, vec!["ch_a", "ch_b"]);
+        assert!(changed.version > old_version);
+    }
+
+    #[test]
+    fn provisional_upsert_invalidates_preindexed_direct_alias_without_law() {
+        let graph = SessionGraph::new();
+        graph.add_chunks(vec![
+            make_test_chunk("ch_primary"),
+            make_test_chunk("ch_alias"),
+        ]);
+        graph.add_has_risk("ch_alias", "R_NEW");
+        let old_version = graph.snapshot().chunk_versions["ch_alias"];
+        let mut finding = make_test_risk("R_NEW", "ch_primary").finding;
+        finding.legal_basis.clear();
+
+        graph
+            .upsert_provisional_findings(&[finding])
+            .expect("正常 provisional 提交应成功");
+
+        let changed = graph
+            .query_clause_context_since("ch_alias", Some(old_version))
+            .expect("新增风险节点必须使预建的直接索引别名版本失效");
+        assert_eq!(changed.context.risks[0].risk_id, "R_NEW");
+        assert!(changed.version > old_version);
+    }
+
+    fn assert_legacy_node_overwrite_invalidates_peer(
+        label: &str,
+        write: impl Fn(&SessionGraph, RiskNode),
+    ) {
+        let graph = SessionGraph::new();
+        graph.add_chunks(vec![make_test_chunk("ch_a"), make_test_chunk("ch_b")]);
+        graph.add_risk_with_edges(make_test_risk("R_A", "ch_a"), "ch_a");
+        graph.add_risk_with_edges(make_test_risk("R_B", "ch_b"), "ch_b");
+        let old_version = graph.snapshot().chunk_versions["ch_b"];
+        let mut hypothesis = make_test_risk("R_A", "ch_a");
+        hypothesis.finding.finding_role = FindingRole::Hypothesis;
+
+        write(&graph, hypothesis);
+
+        let changed = graph
+            .query_clause_context_since("ch_b", Some(old_version))
+            .unwrap_or_else(|| panic!("{label} 改变风险可见性后必须使邻居版本失效"));
+        assert!(changed.context.same_law_chunks.is_empty(), "{label}");
+        assert!(changed.version > old_version, "{label}");
+    }
+
+    #[test]
+    fn legacy_node_overwrites_invalidate_same_law_neighbor_versions() {
+        assert_legacy_node_overwrite_invalidates_peer("add_risk", |graph, risk| {
+            graph.add_risk(risk);
+        });
+        assert_legacy_node_overwrite_invalidates_peer("add_risk_with_edges", |graph, risk| {
+            graph.add_risk_with_edges(risk, "ch_a");
+        });
+        assert_legacy_node_overwrite_invalidates_peer("add_hypothesis", |graph, risk| {
+            graph.add_hypothesis(risk, "ch_a");
+        });
+    }
+
+    fn assert_legacy_node_overwrite_invalidates_direct_alias(
+        label: &str,
+        write: impl Fn(&SessionGraph, RiskNode),
+    ) {
+        let graph = SessionGraph::new();
+        graph.add_chunks(vec![
+            make_test_chunk("ch_primary"),
+            make_test_chunk("ch_alias"),
+        ]);
+        let mut original = make_test_risk("R_ALIAS", "ch_primary");
+        original.finding.legal_basis.clear();
+        graph.add_risk_with_edges(original, "ch_primary");
+        graph.add_has_risk("ch_alias", "R_ALIAS");
+        let old_version = graph.snapshot().chunk_versions["ch_alias"];
+        let mut replacement = make_test_risk("R_ALIAS", "ch_primary");
+        replacement.finding.legal_basis.clear();
+        replacement.finding.reason = format!("{label} 更新后的理由");
+
+        write(&graph, replacement);
+
+        let changed = graph
+            .query_clause_context_since("ch_alias", Some(old_version))
+            .unwrap_or_else(|| panic!("{label} 覆盖风险内容后必须使直接索引别名版本失效"));
+        assert_eq!(
+            changed.context.risks[0].reason,
+            format!("{label} 更新后的理由")
+        );
+        assert!(changed.version > old_version, "{label}");
+    }
+
+    #[test]
+    fn legacy_node_overwrites_invalidate_direct_alias_versions() {
+        assert_legacy_node_overwrite_invalidates_direct_alias("add_risk", |graph, risk| {
+            graph.add_risk(risk);
+        });
+        assert_legacy_node_overwrite_invalidates_direct_alias(
+            "add_risk_with_edges",
+            |graph, risk| {
+                graph.add_risk_with_edges(risk, "ch_primary");
+            },
+        );
+        assert_legacy_node_overwrite_invalidates_direct_alias(
+            "add_hypothesis",
+            |graph, mut risk| {
+                risk.finding.finding_role = FindingRole::Hypothesis;
+                graph.add_hypothesis(risk, "ch_primary");
+            },
+        );
+    }
+
     fn assert_invalid_legacy_risk_node_is_noop(write: impl Fn(&SessionGraph, RiskNode)) {
         for existing_provisional in [false, true] {
             for invalid_node in [
@@ -2048,6 +2391,165 @@ mod tests {
                 && transition.merged_into.as_deref() == Some("R_TARGET")
                 && !transition.decided_at.is_empty()
         }));
+    }
+
+    #[test]
+    fn clause_context_excludes_same_law_edges_created_by_rejected_risks() {
+        let graph = SessionGraph::new();
+        add_provisional_risk(&graph, "R_CONFIRMED", "ch_confirmed");
+        add_provisional_risk(&graph, "R_REJECTED", "ch_rejected");
+        let final_finding = make_test_risk("R_CONFIRMED", "ch_confirmed").finding;
+
+        graph
+            .finalize_audit(
+                &[final_finding],
+                &HashMap::new(),
+                &HashMap::from([("R_REJECTED".to_string(), "证据不足".to_string())]),
+            )
+            .expect("最终裁决应成功");
+
+        let snapshot = graph.snapshot();
+        assert_eq!(
+            snapshot.same_law["ch_confirmed"],
+            vec!["ch_rejected"],
+            "完整审计快照必须保留终态风险产生的历史关系"
+        );
+        assert!(
+            graph
+                .query_clause_context("ch_confirmed")
+                .same_law_chunks
+                .is_empty(),
+            "Agent 工作上下文不得暴露仅由 rejected 风险产生的同法条关系"
+        );
+        assert_eq!(
+            graph.query_same_law_chunks("《测试法》第1条"),
+            vec!["ch_confirmed"],
+            "工作态法条查询不得返回 rejected 风险关联的条款"
+        );
+        assert!(
+            graph.query_same_law_edges("ch_confirmed").is_empty(),
+            "工作态边查询不得返回仅由 rejected 风险产生的关系"
+        );
+    }
+
+    #[test]
+    fn finalization_invalidates_working_same_law_neighbor_version() {
+        let graph = SessionGraph::new();
+        add_provisional_risk(&graph, "R_A", "ch_a");
+        add_provisional_risk(&graph, "R_B", "ch_b");
+        let before = graph.snapshot();
+        let old_version = before.chunk_versions["ch_a"];
+        assert_eq!(
+            graph.query_clause_context("ch_a").same_law_chunks,
+            vec!["ch_b"]
+        );
+
+        graph
+            .finalize_audit(
+                &[],
+                &HashMap::new(),
+                &HashMap::from([("R_B".to_string(), "证据不足".to_string())]),
+            )
+            .expect("最终裁决应成功");
+
+        let changed = graph
+            .query_clause_context_since("ch_a", Some(old_version))
+            .expect("工作态邻居消失必须使相邻条款版本失效");
+        assert!(changed.context.same_law_chunks.is_empty());
+        assert!(changed.version > old_version);
+    }
+
+    #[test]
+    fn working_same_law_respects_finding_lifecycle_and_role() {
+        let graph = SessionGraph::new();
+        add_provisional_risk(&graph, "R_A", "ch_a");
+        add_provisional_risk(&graph, "R_B", "ch_b");
+        add_provisional_risk(&graph, "R_TARGET", "ch_target");
+        add_provisional_risk(&graph, "R_MERGED", "ch_merged");
+        graph.add_chunk(make_test_chunk("ch_hypothesis"));
+        let mut hypothesis = make_test_risk("R_HYPOTHESIS", "ch_hypothesis");
+        hypothesis.finding.finding_role = FindingRole::Hypothesis;
+        graph.add_hypothesis(hypothesis, "ch_hypothesis");
+
+        let provisional_view = graph.snapshot().agent_visible_same_law();
+        assert_eq!(
+            provisional_view["ch_a"],
+            vec!["ch_b", "ch_merged", "ch_target"]
+        );
+        assert!(!provisional_view.contains_key("ch_hypothesis"));
+
+        graph
+            .finalize_audit(
+                &[
+                    make_test_risk("R_A", "ch_a").finding,
+                    make_test_risk("R_B", "ch_b").finding,
+                    make_test_risk("R_TARGET", "ch_target").finding,
+                ],
+                &HashMap::from([("R_MERGED".to_string(), "R_TARGET".to_string())]),
+                &HashMap::new(),
+            )
+            .expect("最终裁决应成功");
+
+        let confirmed_view = graph.snapshot().agent_visible_same_law();
+        assert_eq!(confirmed_view["ch_a"], vec!["ch_b", "ch_target"]);
+        assert!(!confirmed_view.contains_key("ch_merged"));
+        assert!(!confirmed_view.contains_key("ch_hypothesis"));
+    }
+
+    #[test]
+    fn working_same_law_uses_transactional_clause_indexes_as_source_of_truth() {
+        let graph = SessionGraph::new();
+        graph.add_chunks(vec![
+            make_test_chunk("ch_primary"),
+            make_test_chunk("ch_unindexed"),
+            make_test_chunk("ch_peer"),
+        ]);
+        let mut multi_clause_risk = make_test_risk("R_MULTI", "ch_primary");
+        multi_clause_risk.finding.clause_ids =
+            vec!["ch_primary".to_string(), "ch_unindexed".to_string()];
+        graph.add_risk_with_edges(multi_clause_risk, "ch_primary");
+        graph.add_risk_with_edges(make_test_risk("R_PEER", "ch_peer"), "ch_peer");
+
+        let working_same_law = graph.snapshot().agent_visible_same_law();
+
+        assert_eq!(working_same_law["ch_primary"], vec!["ch_peer"]);
+        assert_eq!(working_same_law["ch_peer"], vec!["ch_primary"]);
+        assert!(!working_same_law.contains_key("ch_unindexed"));
+        assert!(
+            !graph
+                .query_same_law_chunks("《测试法》第1条")
+                .contains(&"ch_unindexed".to_string()),
+            "按法条查询也必须以 has_risk 事务索引为准"
+        );
+        assert!(
+            graph
+                .query_clause_context("ch_peer")
+                .same_law_chunks
+                .iter()
+                .all(|chunk_id| chunk_id != "ch_unindexed"),
+            "未进入 has_risk 事务索引的条款不得进入 Agent 工作上下文"
+        );
+    }
+
+    #[test]
+    fn clause_context_ignores_risks_missing_from_transactional_indexes() {
+        let graph = SessionGraph::new();
+        add_provisional_risk(&graph, "R_INDEXED", "ch_indexed");
+        graph.add_chunk(make_test_chunk("ch_orphan"));
+        let orphan = make_test_risk("R_ORPHAN", "ch_orphan");
+        graph
+            .state
+            .write()
+            .expect("测试图写锁不应中毒")
+            .risks
+            .insert("R_ORPHAN".to_string(), orphan);
+
+        let context = graph.query_clause_context("ch_indexed");
+
+        assert!(
+            context.same_law_chunks.is_empty(),
+            "未进入 has_risk/cited_by 事务索引的孤立节点不得参与工作态关系"
+        );
     }
 
     #[test]
