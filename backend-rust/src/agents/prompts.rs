@@ -39,6 +39,7 @@ pub const FACT_CHECK_SYSTEM_PROMPT: &str = r#"你是 FactCheckAgent——政府�
 
 - **validate_calculation 仅用于纯数值运算**：数值重算、百分比计算、总和计算、数值阈值比较（actual 是否满足 ≥ / ≤ / == / 区间）。它不返回法律依据，也不判断阈值本身的法律正确性。
 - 涉及**法定期限 / 投标保证金 / 履约保证金 / 评分权重 / 采购方式 / 公告期限 / 文件提供期限 / 等标期**等法规阈值判断时，本 Agent 不负责确定性法规校验；如原文信息足以对照法定阈值直接 output_finding，需核对法定基准时用 **web_search** 查询法规依据。不要用 validate_calculation 自行拼法规阈值。**涉及法规阈值判断时，优先调用对应专门 verification 工具**（verify_bid_deposit / verify_announcement_period / verify_bid_preparation_period 等），再据此判断。
+- **先查历史沉淀，再决定是否联网搜索**：识别出某种风险类型时（如地域限制、指定品牌、资质门槛、保证金过高、评分倾向性等），先用 **search_graph_knowledge** 检索 Neo4j 图库中同类风险的处置经验（历史论证理由 + 建议怎么改 + 关联法条/负面清单）。图库命中即时返回、不影响 web_search 次数；若历史经验足以支撑判定，直接据其输出，不用再联网。图库无命中时再走 web_search。**查图库不计入 web_search 的 3 次配额。**
 
 ## 工作流程
 
@@ -630,6 +631,7 @@ pub const LEGAL_VERIFY_SYSTEM_PROMPT: &str = r#"你是 LegalVerifyAgent——法
 ## 工作流程
 
 对每一条法条引用：
+0. 若该风险属于已知风险类型 → 先用 **search_graph_knowledge** 检索图库中同类风险的历史验证经验与关联法条，借鉴此前对该类风险法条引用的处理方式；图库命中即时返回，不计入 web_search 配额
 1. web_search 搜索法条原文（优先 .gov.cn 域名）
 2. 对比 RiskFinding 中的引用是否准确
 3. 验证适用性

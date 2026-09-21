@@ -1533,8 +1533,11 @@ impl ReActLoop {
                     });
                 }
 
-                // 搜索缓存逻辑（search_knowledge / web_search 共用）
-                let result = if self.is_search_tool(tool_name) {
+                // 搜索缓存逻辑（search_knowledge / web_search 共用）。
+                // ★ search_graph_knowledge / search_knowledge_base 不在此列——
+                //   它们命中注册工具（Neo4j / Qdrant），必须走 tool.execute() 真查
+                //   对应知识库，不能路由到 web_search 缓存通道。
+                let result = if tool_name == "web_search" || tool_name == "search_knowledge" {
                     self.cached_search_knowledge(&tc.arguments).await
                 } else if let Some(tool) = self.tools.get(tool_name) {
                     match tool.execute(tc.arguments.clone()).await {
@@ -1834,7 +1837,9 @@ impl ReActLoop {
                         }
 
                         // 硬性限制: web_search 按 tier 分级限制
-                        if self.is_search_tool(tool_name) {
+                        // ★ 仅 web 搜索计入配额；search_graph_knowledge /
+                        //   search_knowledge_base 查的是本地知识库，不进 web 配额。
+                        if tool_name == "web_search" || tool_name == "search_knowledge" {
                             web_search_count += 1;
 
                             // ★ 法规引用提取：检查本次搜索是否带来了新的法规引用
@@ -2210,7 +2215,12 @@ impl ReActLoop {
 
     /// 判断是否为搜索类工具（兼容新旧工具名）。
     fn is_search_tool(&self, name: &str) -> bool {
-        name == "web_search" || name == "search_knowledge" || name == "search_knowledge_base"
+        Self::is_search_tool_name(name)
+    }
+
+    /// 纯函数版搜索工具白名单（便于单测，避免为断言构造整个 ReActLoop）。
+    fn is_search_tool_name(name: &str) -> bool {
+        name == "web_search" || name == "search_knowledge" || name == "search_knowledge_base" || name == "search_graph_knowledge"
     }
 
     /// 统计搜索结果条数，兼容多种后端格式。
@@ -3756,5 +3766,28 @@ mod transcript_compression_tests {
             .to_string();
         assert_eq!(tail.chars().count(), max);
         assert_eq!(tail, "甲".repeat(max));
+    }
+}
+
+#[cfg(test)]
+mod search_tool_whitelist_tests {
+    use super::ReActLoop;
+
+    /// P0-3：`search_graph_knowledge` 必须在搜索工具白名单里，TA 协调逻辑才会吸收其结果
+    /// （搜索结果摘要、轮次上限、结果条数统计都走 is_search_tool 分支）。
+    /// 这个断言直接锁死白名单契约，防止未来给工具改名/精简列表时静默丢功能。
+    #[test]
+    fn test_is_search_tool_includes_graph_knowledge() {
+        assert!(ReActLoop::is_search_tool_name("search_graph_knowledge"));
+        assert!(ReActLoop::is_search_tool_name("search_knowledge"));
+        assert!(ReActLoop::is_search_tool_name("search_knowledge_base"));
+        assert!(ReActLoop::is_search_tool_name("web_search"));
+    }
+
+    #[test]
+    fn test_is_search_tool_rejects_non_dispatchable_tools() {
+        assert!(!ReActLoop::is_search_tool_name("output_finding"));
+        assert!(!ReActLoop::is_search_tool_name("output_verification_batch"));
+        assert!(!ReActLoop::is_search_tool_name(""));
     }
 }

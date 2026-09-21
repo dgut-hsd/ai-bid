@@ -22,7 +22,8 @@ fn main() -> Result<()> {
 
     let candidates = read_jsonl::<Candidate>(&cand_path)?;
     let existing = read_id_lines(&existing_path)?;
-    let decisions = extract_and_dedup(candidates, &existing);
+    let batch_key = cand_path.clone();
+    let decisions = extract_and_dedup(candidates, &existing, &batch_key);
     write_jsonl(&out, &decisions)?;
     let new = decisions.iter().filter(|d| d.decision == ai_bid::knowledge::types::Decision::New).count();
     println!(

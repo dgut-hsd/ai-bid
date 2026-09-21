@@ -45,6 +45,7 @@ use crate::agents::tools::{
     search_document::SearchDocumentTool,
     search_knowledge::{DashScopeSearchBackend, SearchKnowledgeTool},
     search_knowledge_base::SearchKnowledgeBaseTool,
+    search_graph_knowledge::SearchGraphKnowledgeTool,
     validate_calculation::ValidateCalculationTool,
     // V4 评审标准审查
     validate_scoring_formula::ValidateScoringFormulaTool,
@@ -1451,6 +1452,8 @@ async fn run_review_pipeline(
         if let Some(ref ec) = ec_for_tools {
             registry.register(Box::new(SearchKnowledgeBaseTool::new(ec.clone())));
         }
+        // 历史审核经验图检索（Neo4j，P0-3：让 Agent 真正用上沉淀的知识）
+        registry.register(Box::new(SearchGraphKnowledgeTool::new()));
         registry.register(Box::new(OutputFindingTool));
         // V2+ 工具（需要 chunk 数据）
         registry.register(Box::new(CompareVersionsTool {
@@ -1787,6 +1790,80 @@ async fn run_review_pipeline(
                 }
                 // 结果已落盘，清除"进行中"状态文件
                 crate::api::review_state::remove(&dir, &doc_id);
+            }
+
+            // ★ 知识沉淀（P0）：网页审核链路补齐 Neo4j + Qdrant 落库——
+            //    审核结果 → 挑精华 → 查重 → 写 Neo4j + Qdrant（后台异步，不阻塞 SSE Done）。
+            //    与 CLI 主链路（main.rs §8.5）共用 knowledge::run::run / store_experiences。
+            //    失败仅告警，不影响审核结果；AI BID_WRITE_NEO4J / AIBID_WRITE_QDRANT=0 可独立关闭。
+            {
+                let store_neo4j = std::env::var("AIBID_WRITE_NEO4J")
+                    .unwrap_or_else(|_| "1".into())
+                    != "0";
+                let store_qdrant = std::env::var("AIBID_WRITE_QDRANT")
+                    .unwrap_or_else(|_| "1".into())
+                    != "0";
+                let tenant_for_audit = tenant_id.clone();
+                let batch_key = format!("{}/{}", tenant_id, doc_id);
+                let findings_for_audit = output.findings.clone();
+                let embed_for_audit = embed_client_for_tools.clone();
+                tokio::spawn(async move {
+                    if store_neo4j || store_qdrant {
+                        match crate::knowledge::graph::Neo4jClient::connect().await {
+                            Ok(client) => {
+                                match crate::knowledge::run::run(
+                                    findings_for_audit,
+                                    &client,
+                                    &batch_key,
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => {
+                                        if store_neo4j {
+                                            println!(
+                                                "  知识沉淀(HTTP): 写入 Neo4j {} 条新风险/法条",
+                                                outcome.new_count
+                                            );
+                                        }
+                                        if store_qdrant {
+                                            if let Some(embed) = embed_for_audit {
+                                                match crate::knowledge::run::store_experiences(
+                                                    &outcome.decisions,
+                                                    &batch_key,
+                                                    &tenant_for_audit,
+                                                    embed,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(n) => println!(
+                                                        "  知识沉淀(HTTP): 写入 Qdrant {} 条经验向量",
+                                                        n
+                                                    ),
+                                                    Err(e) => eprintln!(
+                                                        "  知识沉淀警告(HTTP): 写 Qdrant 失败（不影响审核结果）: {}",
+                                                        e
+                                                    ),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "  知识沉淀警告(HTTP): 写 Neo4j 失败（不影响审核结果）: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "  知识沉淀警告(HTTP): 连接 Neo4j 失败（不影响审核结果）: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                });
             }
 
             if output.execution_summary.status

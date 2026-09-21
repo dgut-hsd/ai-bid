@@ -40,8 +40,12 @@ async fn main() -> Result<()> {
     println!("读取审核结果: {} 条发现 <- {}", findings.len(), path.display());
 
     let client = Neo4jClient::connect().await?;
-    let new_count = run(findings, &client).await?;
-    println!("整合流水线完成：新增 {} 条（已存在自动跳过）", new_count);
+    let batch_key = format!("bin/{}", path.file_stem().and_then(|s| s.to_str()).unwrap_or("pipeline"));
+    let outcome = run(findings, &client, &batch_key).await?;
+    println!(
+        "整合流水线完成：新增 {} 条（已存在自动跳过）",
+        outcome.new_count
+    );
 
     // 演示查询
     println!("\n=== 演示查询 ===");
@@ -50,21 +54,56 @@ async fn main() -> Result<()> {
         println!("查询『{}』→ {} 条风险:", kw, hits.len());
         for h in &hits {
             println!(
-                "  - [{}] {}（id: {}, 候选: {:?}）",
-                h.risk.severity, h.risk.name, h.risk.id, h.candidate_ids
+                "  - [{}] {}（id: {}, 经验 {} 条）",
+                h.risk.severity,
+                h.risk.name,
+                h.risk.id,
+                h.experiences.len()
             );
             for law in &h.laws {
+                let short = if law.short_name.is_empty() { "" } else { &law.short_name };
                 println!(
                     "      法条: {}{}",
-                    law.law_name,
+                    if short.is_empty() { &law.law_name } else { short },
                     law.article_no.as_deref().unwrap_or("")
                 );
+                if !law.summary.is_empty() {
+                    println!("        摘要: {}", trunc(&law.summary, 60));
+                }
             }
-            if !h.snippet.is_empty() {
-                let s: String = h.snippet.chars().take(60).collect();
-                println!("      摘录: {}…", s);
+            for (n, e) in h.experiences.iter().enumerate() {
+                println!(
+                    "      经验[{}]: {} | 建议: {}",
+                    n,
+                    trunc(&e.reason, 40),
+                    trunc(&e.suggestion, 40)
+                );
+            }
+            for c in &h.cases {
+                println!(
+                    "      案例: {} ({} {})",
+                    trunc(&c.title, 40),
+                    c.issuing_body,
+                    c.case_type
+                );
+            }
+            for r in &h.rules {
+                println!("      负面清单[{}]: {}", r.severity, trunc(&r.content, 60));
+            }
+            if let Some(dim) = &h.dimension {
+                println!("      维度: {}（{}）", dim.name, dim.dimension_id);
             }
         }
     }
     Ok(())
+}
+
+fn trunc(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= n {
+        s.to_string()
+    } else {
+        let t: String = chars[..n].iter().collect();
+        format!("{t}…")
+    }
 }

@@ -28,6 +28,7 @@ use ai_bid::agents::tools::search_knowledge::{
     DashScopeSearchBackend, SearchBuffer, SearchKnowledgeTool,
 };
 use ai_bid::agents::tools::search_knowledge_base::SearchKnowledgeBaseTool;
+use ai_bid::agents::tools::search_graph_knowledge::SearchGraphKnowledgeTool;
 // V2+ 工具
 use ai_bid::agents::tools::compare_versions::CompareVersionsTool;
 use ai_bid::agents::tools::detect_boilerplate::DetectBoilerplateTool;
@@ -887,6 +888,8 @@ async fn main() -> Result<()> {
             registry.register(Box::new(SearchKnowledgeBaseTool::new(
                 agent_embed.clone(),
             )));
+            // 历史审核经验图检索（Neo4j，P0-3：让 Agent 真正用上沉淀的知识）
+            registry.register(Box::new(SearchGraphKnowledgeTool::new()));
             registry.register(Box::new(OutputFindingTool));
             // V2+ 工具
             registry.register(Box::new(CompareVersionsTool {
@@ -1054,17 +1057,52 @@ async fn main() -> Result<()> {
         println!("  Graph 快照已写入: {}", snap_path);
     }
 
-    // 8.5 知识沉淀：审核结果 → 挑精华 → 查重 → 写 Neo4j（默认开启，可用 AIBID_WRITE_NEO4J=0 关闭）
-    if std::env::var("AIBID_WRITE_NEO4J").unwrap_or_else(|_| "1".into()) != "0" {
+    // 8.5 知识沉淀：审核结果 → 挑精华 → 查重 → 写 Neo4j + Qdrant（默认开启，
+    // 可用 AIBID_WRITE_NEO4J / AIBID_WRITE_QDRANT=0 独立关闭；失败不影响审核结果）
+    let batch_key = format!("cli/{}", stem);
+    let store_neo4j =
+        std::env::var("AIBID_WRITE_NEO4J").unwrap_or_else(|_| "1".into()) != "0";
+    let store_qdrant =
+        std::env::var("AIBID_WRITE_QDRANT").unwrap_or_else(|_| "1".into()) != "0";
+    if store_neo4j || store_qdrant {
         match ai_bid::knowledge::graph::Neo4jClient::connect().await {
-            Ok(client) => match ai_bid::knowledge::run::run(output.findings.clone(), &client).await {
-                Ok(written) => {
-                    println!("  知识沉淀: 写入 Neo4j {} 条新风险/法条", written);
+            Ok(client) => {
+                match ai_bid::knowledge::run::run(output.findings.clone(), &client, &batch_key)
+                    .await
+                {
+                    Ok(outcome) => {
+                        if store_neo4j {
+                            println!(
+                                "  知识沉淀: 写入 Neo4j {} 条新风险/法条",
+                                outcome.new_count
+                            );
+                        }
+                        if store_qdrant {
+                            match ai_bid::knowledge::run::store_experiences(
+                                &outcome.decisions,
+                                &batch_key,
+                                "",
+                                std::sync::Arc::clone(&agent_embed),
+                            )
+                            .await
+                            {
+                                Ok(n) => {
+                                    println!("  知识沉淀: 写入 Qdrant {} 条经验向量", n);
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "  知识沉淀警告: 写 Qdrant 失败（不影响审核结果）: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  知识沉淀警告: 写 Neo4j 失败（不影响审核结果）: {}", e);
+                    }
                 }
-                Err(e) => {
-                    eprintln!("  知识沉淀警告: 写 Neo4j 失败（不影响审核结果）: {}", e);
-                }
-            },
+            }
             Err(e) => {
                 eprintln!("  知识沉淀警告: 连接 Neo4j 失败（不影响审核结果）: {}", e);
             }
