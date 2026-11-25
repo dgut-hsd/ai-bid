@@ -2,10 +2,12 @@ import { describe, it, expect } from 'vitest';
 import {
   mapBackendFinding,
   mapBackendFindings,
+  mapBackendGraphSnapshot,
   mapFindingAddedEvent,
   isBackendFormat,
   ensureAuditIssue,
 } from './mapFinding';
+import type { BackendGraphSnapshot } from './mapFinding';
 import type { FindingAddedEvent } from '@/types/audit';
 
 // ─── 样本数据 ───
@@ -242,6 +244,217 @@ results.forEach((r) => {
 
   it('returns an empty array when given an empty array', () => {
     expect(mapBackendFindings([])).toEqual([]);
+  });
+});
+
+describe('mapBackendGraphSnapshot', () => {
+  it('maps all finding states, decision metadata, and transition history', () => {
+    const makeRisk = (
+      riskId: string,
+      state: 'provisional' | 'confirmed' | 'merged' | 'rejected',
+      metadata: { merged_into?: string; decision_reason?: string } = {},
+    ) => ({
+      finding: { ...completeBackendFinding, risk_id: riskId },
+      law_refs: [],
+      state,
+      ...metadata,
+    });
+    const payload = {
+      chunks: {},
+      risks: {
+        RISK_PROVISIONAL: makeRisk('RISK_PROVISIONAL', 'provisional'),
+        RISK_CONFIRMED: makeRisk('RISK_CONFIRMED', 'confirmed'),
+        RISK_MERGED: makeRisk('RISK_MERGED', 'merged', {
+          merged_into: 'RISK_CONFIRMED',
+          decision_reason: '与保留项重复',
+        }),
+        RISK_REJECTED: makeRisk('RISK_REJECTED', 'rejected', {
+          decision_reason: '已有明确反证',
+        }),
+      },
+      has_risk: {},
+      reviewed_by: {},
+      linked_to: {},
+      cites: {},
+      cited_by: {},
+      agents: {},
+      laws: {},
+      cases: {},
+      contradicts: {},
+      same_law: {},
+      review_attempts: {},
+      finding_transitions: [
+        {
+          risk_id: 'RISK_MERGED',
+          from: 'provisional',
+          to: 'merged',
+          reason: '与保留项重复',
+          merged_into: 'RISK_CONFIRMED',
+          decided_at: '2026-08-22T12:00:00Z',
+        },
+        {
+          risk_id: 'RISK_REJECTED',
+          from: 'provisional',
+          to: 'rejected',
+          reason: '已有明确反证',
+          decided_at: '2026-08-22T12:00:01Z',
+        },
+      ],
+    } satisfies BackendGraphSnapshot;
+
+    const result = mapBackendGraphSnapshot(payload);
+
+    expect(Object.values(result.risks).map((risk) => risk.state)).toEqual([
+      'provisional',
+      'confirmed',
+      'merged',
+      'rejected',
+    ]);
+    expect(result.risks.RISK_MERGED).toMatchObject({
+      mergedInto: 'RISK_CONFIRMED',
+      decisionReason: '与保留项重复',
+    });
+    expect(result.risks.RISK_REJECTED.decisionReason).toBe('已有明确反证');
+    expect(result.findingTransitions).toEqual([
+      {
+        riskId: 'RISK_MERGED',
+        from: 'provisional',
+        to: 'merged',
+        reason: '与保留项重复',
+        mergedInto: 'RISK_CONFIRMED',
+        decidedAt: '2026-08-22T12:00:00Z',
+      },
+      {
+        riskId: 'RISK_REJECTED',
+        from: 'provisional',
+        to: 'rejected',
+        reason: '已有明确反证',
+        mergedInto: undefined,
+        decidedAt: '2026-08-22T12:00:01Z',
+      },
+    ]);
+  });
+
+  it('maps Rust snake_case graph and review attempts to frontend camelCase', () => {
+    const result = mapBackendGraphSnapshot({
+      graph_version: 7,
+      chunk_versions: { ch_001: 3 },
+      chunks: {
+        ch_001: {
+          chunk_id: 'ch_001',
+          section_path: ['第三章'],
+          page_start: 2,
+          page_end: 3,
+          text_preview: '测试条款',
+          tier: 'L2',
+        },
+      },
+      risks: {
+        RISK_001: {
+          finding: completeBackendFinding,
+          law_refs: ['《测试法》第1条'],
+          state: 'provisional',
+        },
+      },
+      has_risk: {},
+      reviewed_by: {
+        ch_001: ['FactCheck'],
+        ch_002: [{ Dynamic: 'dynamic_technical' }],
+      },
+      linked_to: { ch_001: [{ chunk_id: 'ch_002', reason: '交叉引用' }] },
+      cites: {},
+      cited_by: {},
+      agents: {},
+      laws: {},
+      cases: {},
+      contradicts: {},
+      same_law: {},
+      review_attempts: {
+        attempt_001: {
+          attempt_id: 'attempt_001',
+          agent_id: 'FactCheckAgent',
+          chunk_id: 'ch_001',
+          status: 'completed',
+          outcome: 'no_risk',
+          finding_ids: [],
+          started_at: '2026-08-16T00:00:00Z',
+          finished_at: '2026-08-16T00:00:01Z',
+        },
+        attempt_002: {
+          attempt_id: 'attempt_002',
+          agent_id: { Dynamic: 'dynamic_technical' },
+          chunk_id: 'ch_002',
+          status: 'failed',
+          finding_ids: [],
+          error_code: 'task_cancelled',
+          error_message: '执行取消',
+          started_at: '2026-08-16T00:00:00Z',
+          finished_at: '2026-08-16T00:00:01Z',
+        },
+      },
+    });
+
+    expect(result.chunks.ch_001).toMatchObject({
+      chunkId: 'ch_001',
+      sectionPath: ['第三章'],
+      pageStart: 2,
+      pageEnd: 3,
+      textPreview: '测试条款',
+    });
+    expect(result.graphVersion).toBe(7);
+    expect(result.chunkVersions).toEqual({ ch_001: 3 });
+    expect(result.risks.RISK_001.state).toBe('provisional');
+    expect(result.reviewedBy).toEqual({
+      ch_001: ['FactCheck'],
+      ch_002: ['dynamic_technical'],
+    });
+    expect(result.linkedTo.ch_001[0]).toEqual({
+      chunkId: 'ch_002',
+      reason: '交叉引用',
+    });
+    expect(result.reviewAttempts.attempt_001).toEqual({
+      attemptId: 'attempt_001',
+      agentId: 'FactCheckAgent',
+      chunkId: 'ch_001',
+      status: 'completed',
+      outcome: 'no_risk',
+      findingIds: [],
+      errorCode: undefined,
+      errorMessage: undefined,
+      startedAt: '2026-08-16T00:00:00Z',
+      finishedAt: '2026-08-16T00:00:01Z',
+    });
+    expect(result.reviewAttempts.attempt_002.agentId).toBe('dynamic_technical');
+  });
+
+  it('defaults missing version and finding state fields for old snapshots', () => {
+    const result = mapBackendGraphSnapshot({
+      chunks: {},
+      risks: {
+        RISK_001: {
+          finding: completeBackendFinding,
+          law_refs: [],
+        },
+      },
+      has_risk: {},
+      reviewed_by: {},
+      linked_to: {},
+      cites: {},
+      cited_by: {},
+      agents: {},
+      laws: {},
+      cases: {},
+      contradicts: {},
+      same_law: {},
+      review_attempts: {},
+    });
+
+    expect(result.graphVersion).toBe(0);
+    expect(result.chunkVersions).toEqual({});
+    expect(result.risks.RISK_001.state).toBe('provisional');
+    expect(result.risks.RISK_001.mergedInto).toBeUndefined();
+    expect(result.risks.RISK_001.decisionReason).toBeUndefined();
+    expect(result.findingTransitions).toEqual([]);
   });
 });
 

@@ -407,6 +407,12 @@ impl ChatAgent {
         history: Option<Vec<ChatMessage>>,
         tx: UnboundedSender<ChatStreamEvent>,
     ) -> Result<()> {
+        // 心跳：立即推送首个事件，避免前端在首轮 RAG/LLM 返回前长时间静默（实测约 2 分钟）
+        // 导致浏览器 SSE 超时断连（Broken pipe）。
+        let _ = tx.send(ChatStreamEvent::Thinking {
+            message: "正在检索标书内容并分析您的提问…".to_string(),
+        });
+
         // P0: RAG
         let rag_context = self.build_rag_context(user_input, &selection).await;
 

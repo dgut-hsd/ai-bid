@@ -17,6 +17,11 @@ import type {
   RiskTier,
   Severity,
   FindingAddedEvent,
+  GraphSnapshot,
+  FindingState,
+  ReviewAttemptErrorCode,
+  ReviewAttemptOutcome,
+  ReviewAttemptStatus,
 } from '@/types/audit';
 
 // ─── 后端原始类型 ───
@@ -72,6 +77,89 @@ interface BackendSuggestedAgent {
   section_keywords?: string[];
   sectionKeywords?: string[];
   reason?: string;
+}
+
+interface BackendChunkNode {
+  chunk_id: string;
+  section_path: string[];
+  page_start: number;
+  page_end: number;
+  text_preview: string;
+  tier: RiskTier;
+}
+
+interface BackendRiskNode {
+  finding: BackendFinding;
+  law_refs: string[];
+  state?: FindingState;
+  merged_into?: string;
+  decision_reason?: string;
+}
+
+type BackendAgentId = string | { Dynamic: string };
+
+interface BackendAgentNode {
+  agent_id: BackendAgentId;
+  display_name: string;
+  role: string;
+}
+
+interface BackendLawNode {
+  law_id: string;
+  article_no: string;
+  title: string;
+}
+
+interface BackendCaseNode {
+  case_id: string;
+  title: string;
+  summary: string;
+}
+
+interface BackendLinkedChunk {
+  chunk_id: string;
+  reason: string;
+}
+
+interface BackendReviewAttempt {
+  attempt_id: string;
+  agent_id: BackendAgentId;
+  chunk_id: string;
+  status: ReviewAttemptStatus;
+  outcome?: ReviewAttemptOutcome;
+  finding_ids: string[];
+  error_code?: ReviewAttemptErrorCode;
+  error_message?: string;
+  started_at: string;
+  finished_at?: string;
+}
+
+interface BackendFindingTransition {
+  risk_id: string;
+  from: FindingState;
+  to: FindingState;
+  reason: string;
+  merged_into?: string;
+  decided_at: string;
+}
+
+export interface BackendGraphSnapshot {
+  graph_version?: number;
+  chunk_versions?: Record<string, number>;
+  chunks: Record<string, BackendChunkNode>;
+  risks: Record<string, BackendRiskNode>;
+  has_risk: Record<string, string[]>;
+  reviewed_by: Record<string, BackendAgentId[]>;
+  linked_to: Record<string, BackendLinkedChunk[]>;
+  cites: Record<string, string[]>;
+  cited_by: Record<string, string[]>;
+  agents: Record<string, BackendAgentNode>;
+  laws: Record<string, BackendLawNode>;
+  cases: Record<string, BackendCaseNode>;
+  contradicts: Record<string, [string, string][]>;
+  same_law: Record<string, string[]>;
+  review_attempts: Record<string, BackendReviewAttempt>;
+  finding_transitions?: BackendFindingTransition[];
 }
 
 // ─── 映射函数 ───
@@ -194,6 +282,86 @@ export const mapBackendFinding = (raw: BackendFinding): AuditIssue => {
  */
 export const mapBackendFindings = (rawList: BackendFinding[]): AuditIssue[] =>
   rawList.map(mapBackendFinding);
+
+const mapRecord = <T, R>(
+  source: Record<string, T>,
+  mapper: (value: T) => R,
+): Record<string, R> =>
+  Object.fromEntries(
+    Object.entries(source ?? {}).map(([key, value]) => [key, mapper(value)]),
+  );
+
+const mapBackendAgentId = (agentId: BackendAgentId): string =>
+  typeof agentId === 'string' ? agentId : agentId.Dynamic;
+
+/** 将 Rust GraphSnapshot 的 snake_case 字段显式转换为前端领域模型。 */
+export const mapBackendGraphSnapshot = (
+  raw: BackendGraphSnapshot,
+): GraphSnapshot => ({
+  graphVersion: raw.graph_version ?? 0,
+  chunkVersions: raw.chunk_versions ?? {},
+  chunks: mapRecord(raw.chunks, (chunk) => ({
+    chunkId: chunk.chunk_id,
+    sectionPath: chunk.section_path,
+    pageStart: chunk.page_start,
+    pageEnd: chunk.page_end,
+    textPreview: chunk.text_preview,
+    tier: chunk.tier,
+  })),
+  risks: mapRecord(raw.risks, (risk) => ({
+    finding: mapBackendFinding(risk.finding),
+    lawRefs: risk.law_refs,
+    state: risk.state ?? 'provisional',
+    mergedInto: risk.merged_into,
+    decisionReason: risk.decision_reason,
+  })),
+  hasRisk: raw.has_risk ?? {},
+  reviewedBy: mapRecord(raw.reviewed_by, (agentIds) =>
+    agentIds.map(mapBackendAgentId),
+  ),
+  linkedTo: mapRecord(raw.linked_to, (links) =>
+    links.map((link) => ({ chunkId: link.chunk_id, reason: link.reason })),
+  ),
+  cites: raw.cites ?? {},
+  citedBy: raw.cited_by ?? {},
+  agents: mapRecord(raw.agents, (agent) => ({
+    agentId: mapBackendAgentId(agent.agent_id),
+    displayName: agent.display_name,
+    role: agent.role,
+  })),
+  laws: mapRecord(raw.laws, (law) => ({
+    lawId: law.law_id,
+    articleNo: law.article_no,
+    title: law.title,
+  })),
+  cases: mapRecord(raw.cases, (caseNode) => ({
+    caseId: caseNode.case_id,
+    title: caseNode.title,
+    summary: caseNode.summary,
+  })),
+  contradicts: raw.contradicts ?? {},
+  sameLaw: raw.same_law ?? {},
+  reviewAttempts: mapRecord(raw.review_attempts, (attempt) => ({
+    attemptId: attempt.attempt_id,
+    agentId: mapBackendAgentId(attempt.agent_id),
+    chunkId: attempt.chunk_id,
+    status: attempt.status,
+    outcome: attempt.outcome,
+    findingIds: attempt.finding_ids,
+    errorCode: attempt.error_code,
+    errorMessage: attempt.error_message,
+    startedAt: attempt.started_at,
+    finishedAt: attempt.finished_at,
+  })),
+  findingTransitions: (raw.finding_transitions ?? []).map((transition) => ({
+    riskId: transition.risk_id,
+    from: transition.from,
+    to: transition.to,
+    reason: transition.reason,
+    mergedInto: transition.merged_into,
+    decidedAt: transition.decided_at,
+  })),
+});
 
 /**
  * 尝试检测一个对象是后端格式还是已转换的前端格式。
